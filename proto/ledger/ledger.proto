@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package ledger.v1;
+option go_package = "wallet-system/proto/ledger;ledgerv1";
+
+service LedgerService {
+  rpc RecordTransaction (RecordTransactionRequest) returns (RecordTransactionResponse);
+  rpc GetLedgerEntries (GetLedgerRequest) returns (GetLedgerResponse);
+}
+
+message LedgerEntry {
+  string transaction_id = 1;
+  string idempotency_key = 2;
+  string source_wallet_id = 3;
+  string destination_wallet_id = 4;
+  int64 amount = 5;
+  string currency = 6;
+  string timestamp = 7;
+  string region = 8;
+}
+
+message RecordTransactionRequest {
+  string idempotency_key = 1;
+  string source_wallet_id = 2;
+  string destination_wallet_id = 3;
+  int64 amount = 4;
+  string currency = 5;
+  string region = 6;
+}
+
+message RecordTransactionResponse {
+  string transaction_id = 1;
+  bool success = 2;
+  string error_message = 3;
+}
+
+message GetLedgerRequest {
+  string wallet_id = 1;
+}
+
+message GetLedgerResponse {
+  repeated LedgerEntry entries = 1;
+}

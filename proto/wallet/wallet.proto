@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+package wallet.v1;
+option go_package = "wallet-system/proto/wallet;walletv1";
+
+service WalletService {
+  rpc CreateWallet (CreateWalletRequest) returns (CreateWalletResponse);
+  rpc GetBalance (GetBalanceRequest) returns (GetBalanceResponse);
+  rpc TransferFunds (TransferFundsRequest) returns (TransferFundsResponse);
+  rpc HealthCheck (HealthRequest) returns (HealthResponse);
+}
+
+message Money {
+  string currency = 1;
+  int64 units = 2;
+}
+
+message CreateWalletRequest {
+  string wallet_id = 1;
+  string currency = 2;
+  int64 initial_balance = 3;
+}
+
+message CreateWalletResponse {
+  bool success = 1;
+  string message = 2;
+  string handled_by_region = 3;
+}
+
+message GetBalanceRequest {
+  string wallet_id = 1;
+}
+
+message GetBalanceResponse {
+  string wallet_id = 1;
+  repeated Money balances = 2;
+  string handled_by_region = 3;
+}
+
+message TransferFundsRequest {
+  string idempotency_key = 1;
+  string source_wallet_id = 2;
+  string destination_wallet_id = 3;
+  Money amount = 4;
+}
+
+message TransferFundsResponse {
+  string transaction_id = 1;
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    SUCCESS = 1;
+    FAILED_INSUFFICIENT_FUNDS = 2;
+    REJECTED_DUPLICATE = 3;
+    INTERNAL_ERROR = 4;
+  }
+  Status status = 2;
+  string error_message = 3;
+  string handled_by_region = 4;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+  string region = 2;
+  bool is_active = 3;
+}

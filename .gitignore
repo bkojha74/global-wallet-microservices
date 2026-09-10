@@ -1,0 +1,41 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.secret
+*.secrets
+*.key
+*.pem
+
+# Local databases and generated runtime data
+/data/
+/data/**
+*.db
+*.sqlite
+*.sqlite3
+
+# Local logs and diagnostics
+*.log
+InstallationLog.txt
+coverage.out
+coverage.html
+
+# Go build output
+/bin/
+/build/
+*.exe
+*.test
+
+# Generated protobuf and gRPC Go files
+/proto/**/*.pb.go
+
+# IDE and OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp

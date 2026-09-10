@@ -1,0 +1,82 @@
+services:
+  ledger-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: ledger-service
+    container_name: wallet_ledger_service
+    restart: always
+    environment:
+      - PORT=50052
+      - MONGO_URI=mongodb://mongodb:27017/?replicaSet=rs0&directConnection=true
+      - REGION_NAME=global-core
+    ports:
+      - "50052:50052"
+    networks:
+      - banking_net
+
+  wallet-primary:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: wallet-service
+    container_name: wallet_primary_active
+    restart: always
+    environment:
+      - PORT=50051
+      - MONGO_URI=mongodb://mongodb:27017/?replicaSet=rs0&directConnection=true
+      - LEDGER_SERVICE_ADDR=ledger-service:50052
+      - REGION_NAME=us-east-1 (Primary Active)
+      - IS_ACTIVE=true
+    ports:
+      - "50051:50051"
+    depends_on:
+      - ledger-service
+    networks:
+      - banking_net
+
+  wallet-standby:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: wallet-service
+    container_name: wallet_standby_hot_dr
+    restart: always
+    environment:
+      - PORT=50053
+      - MONGO_URI=mongodb://mongodb:27017/?replicaSet=rs0&directConnection=true
+      - LEDGER_SERVICE_ADDR=ledger-service:50052
+      - REGION_NAME=eu-west-1 (Standby Hot DR)
+      - IS_ACTIVE=false
+    ports:
+      - "50053:50053"
+    depends_on:
+      - ledger-service
+    networks:
+      - banking_net
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api-gateway
+    container_name: wallet_api_gateway
+    restart: always
+    environment:
+      - HTTP_PORT=8080
+      - PRIMARY_WALLET_ADDR=wallet-primary:50051
+      - STANDBY_WALLET_ADDR=wallet-standby:50053
+      - LEDGER_ADDR=ledger-service:50052
+    ports:
+      - "8080:8080"
+    depends_on:
+      - wallet-primary
+      - wallet-standby
+      - ledger-service
+    networks:
+      - banking_net
+
+networks:
+  banking_net:
+    name: wallet_shared_net
+    external: true

@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ledger-service
+  namespace: banking-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ledger-service
+  template:
+    metadata:
+      labels:
+        app: ledger-service
+    spec:
+      containers:
+        - name: ledger-service
+          image: wallet-system/ledger-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 50052
+          env:
+            - name: PORT
+              value: "50052"
+            - name: MONGO_URI
+              value: "mongodb://mongodb-service.banking-system.svc.cluster.local:27017/?replicaSet=rs0&directConnection=true"
+            - name: REGION_NAME
+              value: "global-k8s"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledger-service
+  namespace: banking-system
+spec:
+  type: ClusterIP
+  ports:
+    - port: 50052
+      targetPort: 50052
+  selector:
+    app: ledger-service

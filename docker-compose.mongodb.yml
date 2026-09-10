@@ -1,0 +1,50 @@
+name: wallet-mongodb
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: wallet_mongodb
+    restart: always
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --host 127.0.0.1:27017 --eval \"db.adminCommand({ ping: 1 }).ok\" | grep 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - wallet_shared_net
+
+  mongo-init:
+    image: mongo:7.0
+    container_name: wallet_mongo_init
+    restart: "no"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - wallet_shared_net
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        echo 'Waiting for MongoDB to become ready...'
+        until mongosh --quiet --host mongodb:27017 --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1; do
+          sleep 2
+        done
+        mongosh --quiet --host mongodb:27017 --eval 'try { rs.status() } catch (e) { rs.initiate({_id: "rs0", members: [{_id: 0, host: "mongodb:27017"}]}) }'
+        echo 'MongoDB Replica Set initialized successfully!'
+
+volumes:
+  mongo_data:
+    name: global-wallet-microservices_mongo_data
+    external: true
+
+networks:
+  wallet_shared_net:
+    name: wallet_shared_net
+    external: true

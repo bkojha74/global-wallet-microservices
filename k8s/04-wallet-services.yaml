@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wallet-primary
+  namespace: banking-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: wallet-service
+      tier: primary
+  template:
+    metadata:
+      labels:
+        app: wallet-service
+        tier: primary
+    spec:
+      containers:
+        - name: wallet-primary
+          image: wallet-system/wallet-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 50051
+          env:
+            - name: PORT
+              value: "50051"
+            - name: MONGO_URI
+              value: "mongodb://mongodb-service.banking-system.svc.cluster.local:27017/?replicaSet=rs0&directConnection=true"
+            - name: LEDGER_SERVICE_ADDR
+              value: "ledger-service:50052"
+            - name: REGION_NAME
+              value: "k8s-region-us-east-1 (Primary)"
+            - name: IS_ACTIVE
+              value: "true"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wallet-primary-service
+  namespace: banking-system
+spec:
+  type: ClusterIP
+  ports:
+    - port: 50051
+      targetPort: 50051
+  selector:
+    app: wallet-service
+    tier: primary
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wallet-standby
+  namespace: banking-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wallet-service
+      tier: standby
+  template:
+    metadata:
+      labels:
+        app: wallet-service
+        tier: standby
+    spec:
+      containers:
+        - name: wallet-standby
+          image: wallet-system/wallet-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 50053
+          env:
+            - name: PORT
+              value: "50053"
+            - name: MONGO_URI
+              value: "mongodb://mongodb-service.banking-system.svc.cluster.local:27017/?replicaSet=rs0&directConnection=true"
+            - name: LEDGER_SERVICE_ADDR
+              value: "ledger-service:50052"
+            - name: REGION_NAME
+              value: "k8s-region-eu-west-1 (Standby)"
+            - name: IS_ACTIVE
+              value: "false"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wallet-standby-service
+  namespace: banking-system
+spec:
+  type: ClusterIP
+  ports:
+    - port: 50053
+      targetPort: 50053
+  selector:
+    app: wallet-service
+    tier: standby
