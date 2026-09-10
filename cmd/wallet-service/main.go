@@ -21,6 +21,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/writeconcern"
 
 	"wallet-system/pkg/db"
+	"wallet-system/pkg/observability"
 	ledgerv1 "wallet-system/proto/ledger"
 	walletv1 "wallet-system/proto/wallet"
 )
@@ -31,6 +32,23 @@ type server struct {
 	ledgerClient ledgerv1.LedgerServiceClient
 	region       string
 	isActive     bool
+	logger       observability.Logger
+}
+
+func (s *server) emit(ctx context.Context, eventType, level, message string, attributes map[string]any) {
+	if s.logger == nil {
+		return
+	}
+	correlation := observability.FromContext(ctx)
+	s.logger.Emit(ctx, observability.Event{
+		Level:          level,
+		EventType:      eventType,
+		Message:        message,
+		AssociationID:  correlation.AssociationID,
+		TransactionID:  correlation.TransactionID,
+		IdempotencyKey: correlation.IdempotencyKey,
+		Attributes:     attributes,
+	})
 }
 
 type WalletModel struct {
@@ -59,6 +77,9 @@ func (s *server) HealthCheck(ctx context.Context, req *walletv1.HealthRequest) (
 }
 
 func (s *server) CreateWallet(ctx context.Context, req *walletv1.CreateWalletRequest) (*walletv1.CreateWalletResponse, error) {
+	correlation := observability.FromIncomingContext(ctx)
+	ctx = observability.WithCorrelation(ctx, correlation)
+	s.emit(ctx, "wallet.create.request_received", "INFO", "Create wallet request received", map[string]any{"wallet_id": req.WalletId})
 	log.Printf("[WALLET] CreateWallet proto received: wallet_id=%s currency=%s initial_balance=%d region=%s", req.WalletId, req.Currency, req.InitialBalance, s.region)
 	col := s.mongoClient.Database("banking_db").Collection("wallets")
 
@@ -86,6 +107,9 @@ func (s *server) CreateWallet(ctx context.Context, req *walletv1.CreateWalletReq
 }
 
 func (s *server) GetBalance(ctx context.Context, req *walletv1.GetBalanceRequest) (*walletv1.GetBalanceResponse, error) {
+	correlation := observability.FromIncomingContext(ctx)
+	ctx = observability.WithCorrelation(ctx, correlation)
+	s.emit(ctx, "wallet.balance.request_received", "INFO", "Get balance request received", map[string]any{"wallet_id": req.WalletId})
 	log.Printf("[WALLET] GetBalance proto received: wallet_id=%s region=%s", req.WalletId, s.region)
 	col := s.mongoClient.Database("banking_db").Collection("wallets")
 
@@ -112,6 +136,12 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "transfer request is required")
 	}
+	correlation := observability.FromIncomingContext(ctx)
+	if correlation.IdempotencyKey == "" {
+		correlation.IdempotencyKey = req.IdempotencyKey
+	}
+	ctx = observability.WithCorrelation(ctx, correlation)
+	s.emit(ctx, "wallet.transfer.request_received", "INFO", "Transfer request received", map[string]any{"source_wallet_id": req.SourceWalletId, "destination_wallet_id": req.DestinationWalletId})
 	traceID := req.IdempotencyKey
 	log.Printf("[WALLET-TX] trace_id=%s step=wallet_proto_request_received source=%s destination=%s amount=%d currency=%s region=%s", traceID, req.SourceWalletId, req.DestinationWalletId, req.Amount.GetUnits(), req.Amount.GetCurrency(), s.region)
 	if req.IdempotencyKey == "" || req.SourceWalletId == "" || req.DestinationWalletId == "" || req.Amount == nil || req.Amount.Currency == "" || req.Amount.Units <= 0 {
@@ -155,6 +185,7 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 			finalTxnID = existingIdemp.TransactionID
 			txnStatus = walletv1.TransferFundsResponse_REJECTED_DUPLICATE
 			txnErrMsg = "Transaction already processed"
+			s.emit(ctx, "wallet.transfer.duplicate", "INFO", "Duplicate transfer detected", map[string]any{"transaction_id": finalTxnID})
 			return nil, nil
 		}
 
@@ -201,7 +232,8 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 
 		// 4. Inter-service gRPC call to Ledger Service for immutable audit record
 		log.Printf("[WALLET-TX] trace_id=%s step=ledger_grpc_request", traceID)
-		ledgerResp, err := s.ledgerClient.RecordTransaction(sessCtx, &ledgerv1.RecordTransactionRequest{
+		ledgerCtx := observability.WithOutgoingMetadata(sessCtx, correlation)
+		ledgerResp, err := s.ledgerClient.RecordTransaction(ledgerCtx, &ledgerv1.RecordTransactionRequest{
 			IdempotencyKey:      req.IdempotencyKey,
 			SourceWalletId:      req.SourceWalletId,
 			DestinationWalletId: req.DestinationWalletId,
@@ -214,6 +246,8 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 			return nil, fmt.Errorf("failed to record ledger transaction: %v", err)
 		}
 		finalTxnID = ledgerResp.TransactionId
+		correlation.TransactionID = finalTxnID
+		ctx = observability.WithCorrelation(ctx, correlation)
 		log.Printf("[WALLET-TX] trace_id=%s step=ledger_grpc_response transaction_id=%s", traceID, finalTxnID)
 
 		// 5. Store Idempotency Key mapping
@@ -245,6 +279,7 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 	}
 
 	log.Printf("[WALLET-TX] trace_id=%s step=wallet_proto_response_created status=%s transaction_id=%s", traceID, txnStatus.String(), finalTxnID)
+	s.emit(ctx, "wallet.transfer.completed", "INFO", "Transfer response created", map[string]any{"status": txnStatus.String(), "transaction_id": finalTxnID})
 	log.Printf("[WALLET-TX] SUCCESS: TX=%s | %s -> %s (%d %s) [Region: %s]",
 		finalTxnID, req.SourceWalletId, req.DestinationWalletId, req.Amount.Units, req.Amount.Currency, s.region)
 
@@ -273,6 +308,10 @@ func main() {
 		region = "us-east-1"
 	}
 	isActive, _ := strconv.ParseBool(os.Getenv("IS_ACTIVE"))
+	environment := os.Getenv("ENVIRONMENT")
+	if environment == "" {
+		environment = "local"
+	}
 
 	log.Printf("[WALLET-SERVICE] Starting in Region: %s (Active: %t) on port %s...", region, isActive, port)
 
@@ -303,6 +342,7 @@ func main() {
 		ledgerClient: ledgerClient,
 		region:       region,
 		isActive:     isActive,
+		logger:       observability.NewStructuredLogger("wallet-service", environment, region, os.Stdout),
 	}
 	walletv1.RegisterWalletServiceServer(grpcServer, srv)
 

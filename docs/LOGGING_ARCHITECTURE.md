@@ -15,6 +15,16 @@ The design must provide:
 
 This document is the proposed design. Implementation should follow after the event contract and operational choices are approved.
 
+## Phase 1 status
+
+Phase 1 is implemented in the current codebase:
+
+- `pkg/observability` contains the versioned event envelope, structured console logger, in-memory test logger, and correlation context helpers.
+- The API gateway creates or preserves `X-Association-ID` and propagates `x-association-id`, `x-transaction-id`, and `x-idempotency-key` through outgoing gRPC metadata.
+- Wallet and ledger services recover the metadata from incoming gRPC contexts and emit structured boundary events.
+- Existing human-readable logs remain enabled for local troubleshooting.
+- RabbitMQ, durable local spooling, and the standalone logging consumer are intentionally deferred to Phases 2 and 3.
+
 ## 2. Recommended decisions
 
 | Area | Decision |

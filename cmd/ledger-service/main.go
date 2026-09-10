@@ -17,6 +17,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 
 	"wallet-system/pkg/db"
+	"wallet-system/pkg/observability"
 	ledgerv1 "wallet-system/proto/ledger"
 )
 
@@ -24,6 +25,23 @@ type server struct {
 	ledgerv1.UnimplementedLedgerServiceServer
 	mongoClient *mongo.Client
 	region      string
+	logger      observability.Logger
+}
+
+func (s *server) emit(ctx context.Context, eventType, level, message string, attributes map[string]any) {
+	if s.logger == nil {
+		return
+	}
+	correlation := observability.FromContext(ctx)
+	s.logger.Emit(ctx, observability.Event{
+		Level:          level,
+		EventType:      eventType,
+		Message:        message,
+		AssociationID:  correlation.AssociationID,
+		TransactionID:  correlation.TransactionID,
+		IdempotencyKey: correlation.IdempotencyKey,
+		Attributes:     attributes,
+	})
 }
 
 type LedgerDocument struct {
@@ -38,6 +56,12 @@ type LedgerDocument struct {
 }
 
 func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTransactionRequest) (*ledgerv1.RecordTransactionResponse, error) {
+	correlation := observability.FromIncomingContext(ctx)
+	if correlation.IdempotencyKey == "" {
+		correlation.IdempotencyKey = req.IdempotencyKey
+	}
+	ctx = observability.WithCorrelation(ctx, correlation)
+	s.emit(ctx, "ledger.record.request_received", "INFO", "Record transaction request received", map[string]any{"source_wallet_id": req.SourceWalletId, "destination_wallet_id": req.DestinationWalletId})
 	log.Printf("[LEDGER] proto request received: trace_id=%s source=%s destination=%s amount=%d currency=%s region=%s", req.IdempotencyKey, req.SourceWalletId, req.DestinationWalletId, req.Amount, req.Currency, req.Region)
 	if req.IdempotencyKey == "" || req.Amount <= 0 {
 		log.Printf("[LEDGER] trace_id=%s step=validation_failed", req.IdempotencyKey)
@@ -78,6 +102,9 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 		}, nil
 	}
 	log.Printf("[LEDGER] trace_id=%s step=ledger_document_persisted transaction_id=%s", req.IdempotencyKey, doc.ID.Hex())
+	correlation.TransactionID = doc.ID.Hex()
+	ctx = observability.WithCorrelation(ctx, correlation)
+	s.emit(ctx, "ledger.transaction.persisted", "INFO", "Ledger transaction persisted", map[string]any{"transaction_id": doc.ID.Hex()})
 
 	log.Printf("[LEDGER] Audit entry recorded: TX=%s | %s -> %s (%d %s) [Region: %s]",
 		doc.ID.Hex(), req.SourceWalletId, req.DestinationWalletId, req.Amount, req.Currency, s.region)
@@ -125,6 +152,13 @@ func (s *server) GetLedgerEntries(ctx context.Context, req *ledgerv1.GetLedgerRe
 	return &ledgerv1.GetLedgerResponse{Entries: entries}, nil
 }
 
+func environmentName() string {
+	if environment := os.Getenv("ENVIRONMENT"); environment != "" {
+		return environment
+	}
+	return "local"
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -157,6 +191,7 @@ func main() {
 	srv := &server{
 		mongoClient: client,
 		region:      region,
+		logger:      observability.NewStructuredLogger("ledger-service", environmentName(), region, os.Stdout),
 	}
 	ledgerv1.RegisterLedgerServiceServer(grpcServer, srv)
 
