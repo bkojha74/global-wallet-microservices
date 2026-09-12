@@ -3,10 +3,22 @@ package observability
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
+	"os"
 	"sync"
 	"time"
+)
+
+// Level constants — must be used instead of raw string literals (GAP-02)
+const (
+	LevelAudit = "AUDIT"
+	LevelError = "ERROR"
+	LevelWarn  = "WARN"
+	LevelInfo  = "INFO"
+	LevelDebug = "DEBUG"
 )
 
 type Event struct {
@@ -14,6 +26,7 @@ type Event struct {
 	EventID        string         `json:"event_id"`
 	OccurredAt     time.Time      `json:"occurred_at"`
 	Service        string         `json:"service"`
+	InstanceID     string         `json:"instance_id,omitempty"`
 	Environment    string         `json:"environment"`
 	Region         string         `json:"region,omitempty"`
 	Level          string         `json:"level"`
@@ -28,6 +41,49 @@ type Event struct {
 	Attributes     map[string]any `json:"attributes,omitempty"`
 }
 
+// ResolveInstanceID returns INSTANCE_ID from environment or falls back to os.Hostname(). (GAP-01)
+func ResolveInstanceID() string {
+	if id := os.Getenv("INSTANCE_ID"); id != "" {
+		return id
+	}
+	if host, err := os.Hostname(); err == nil && host != "" {
+		return host
+	}
+	return "unknown-instance"
+}
+
+// ValidateEvent checks all required fields in the event envelope (GAP-09).
+func ValidateEvent(e Event) error {
+	if e.SchemaVersion <= 0 {
+		return errors.New("schema_version must be greater than 0")
+	}
+	if e.EventID == "" {
+		return errors.New("event_id is required")
+	}
+	if e.OccurredAt.IsZero() {
+		return errors.New("occurred_at is required")
+	}
+	if e.Service == "" {
+		return errors.New("service is required")
+	}
+	if e.Environment == "" {
+		return errors.New("environment is required")
+	}
+	switch e.Level {
+	case LevelAudit, LevelError, LevelWarn, LevelInfo, LevelDebug:
+		// valid level
+	default:
+		return fmt.Errorf("invalid level %q: must be AUDIT, ERROR, WARN, INFO, or DEBUG", e.Level)
+	}
+	if e.EventType == "" {
+		return errors.New("event_type is required")
+	}
+	if e.AssociationID == "" {
+		return errors.New("association_id is required")
+	}
+	return nil
+}
+
 type Logger interface {
 	Emit(context.Context, Event)
 	Sync(context.Context) error
@@ -40,15 +96,24 @@ type StructuredLogger struct {
 	service     string
 	environment string
 	region      string
+	instanceID  string
 	standard    *log.Logger
 }
 
 func NewStructuredLogger(service, environment, region string, writer io.Writer) *StructuredLogger {
+	return NewStructuredLoggerWithInstance(service, environment, region, ResolveInstanceID(), writer)
+}
+
+func NewStructuredLoggerWithInstance(service, environment, region, instanceID string, writer io.Writer) *StructuredLogger {
+	if instanceID == "" {
+		instanceID = ResolveInstanceID()
+	}
 	return &StructuredLogger{
 		writer:      writer,
 		service:     service,
 		environment: environment,
 		region:      region,
+		instanceID:  instanceID,
 		standard:    log.New(writer, "", 0),
 	}
 }
@@ -66,6 +131,9 @@ func (l *StructuredLogger) Emit(ctx context.Context, event Event) {
 	}
 	if event.Service == "" {
 		event.Service = l.service
+	}
+	if event.InstanceID == "" {
+		event.InstanceID = l.instanceID
 	}
 	if event.Environment == "" {
 		event.Environment = l.environment
@@ -120,6 +188,9 @@ func (l *MemoryLogger) Emit(ctx context.Context, event Event) {
 	if event.IdempotencyKey == "" {
 		event.IdempotencyKey = correlation.IdempotencyKey
 	}
+	if event.InstanceID == "" {
+		event.InstanceID = ResolveInstanceID()
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.events = append(l.events, event)
@@ -144,3 +215,4 @@ func (l *MemoryLogger) Close(context.Context) error {
 func NoopLogger() Logger {
 	return NewStructuredLogger("", "", "", io.Discard)
 }
+
