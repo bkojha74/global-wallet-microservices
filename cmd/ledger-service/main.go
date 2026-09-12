@@ -17,6 +17,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 
 	"wallet-system/pkg/db"
+	"wallet-system/pkg/observability"
 	ledgerv1 "wallet-system/proto/ledger"
 )
 
@@ -24,6 +25,33 @@ type server struct {
 	ledgerv1.UnimplementedLedgerServiceServer
 	mongoClient *mongo.Client
 	region      string
+	logger      observability.Logger
+}
+
+func (s *server) emit(ctx context.Context, eventType, level, message string, attributes map[string]any) {
+	s.emitFull(ctx, eventType, level, message, 0, nil, attributes)
+}
+
+func (s *server) emitTerminal(ctx context.Context, eventType, level, message string, durationMS int64, success bool, attributes map[string]any) {
+	s.emitFull(ctx, eventType, level, message, durationMS, &success, attributes)
+}
+
+func (s *server) emitFull(ctx context.Context, eventType, level, message string, durationMS int64, success *bool, attributes map[string]any) {
+	if s.logger == nil {
+		return
+	}
+	correlation := observability.FromContext(ctx)
+	s.logger.Emit(ctx, observability.Event{
+		Level:          level,
+		EventType:      eventType,
+		Message:        message,
+		AssociationID:  correlation.AssociationID,
+		TransactionID:  correlation.TransactionID,
+		IdempotencyKey: correlation.IdempotencyKey,
+		DurationMS:     durationMS,
+		Success:        success,
+		Attributes:     observability.RedactAttributes(attributes),
+	})
 }
 
 type LedgerDocument struct {
@@ -38,9 +66,18 @@ type LedgerDocument struct {
 }
 
 func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTransactionRequest) (*ledgerv1.RecordTransactionResponse, error) {
+	startTime := time.Now()
+	correlation := observability.FromIncomingContext(ctx)
+	if correlation.IdempotencyKey == "" {
+		correlation.IdempotencyKey = req.IdempotencyKey
+	}
+	ctx = observability.WithCorrelation(ctx, correlation)
+	s.emit(ctx, "ledger.record.request_received", observability.LevelInfo, "Record transaction request received", map[string]any{"source_wallet_id": req.SourceWalletId, "destination_wallet_id": req.DestinationWalletId})
 	log.Printf("[LEDGER] proto request received: trace_id=%s source=%s destination=%s amount=%d currency=%s region=%s", req.IdempotencyKey, req.SourceWalletId, req.DestinationWalletId, req.Amount, req.Currency, req.Region)
 	if req.IdempotencyKey == "" || req.Amount <= 0 {
 		log.Printf("[LEDGER] trace_id=%s step=validation_failed", req.IdempotencyKey)
+		durationMS := time.Since(startTime).Milliseconds()
+		s.emitTerminal(ctx, "ledger.record.failed", observability.LevelError, "Validation failed", durationMS, false, map[string]any{"reason": "invalid_payload"})
 		return nil, status.Errorf(codes.InvalidArgument, "invalid ledger transaction payload")
 	}
 
@@ -52,6 +89,8 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 	err := col.FindOne(ctx, bson.M{"idempotency_key": req.IdempotencyKey}).Decode(&existing)
 	if err == nil {
 		log.Printf("[LEDGER] Duplicate transaction detected for key: %s, returning existing ID: %s", req.IdempotencyKey, existing.ID.Hex())
+		durationMS := time.Since(startTime).Milliseconds()
+		s.emitTerminal(ctx, "ledger.transaction.duplicate", observability.LevelInfo, "Duplicate ledger transaction detected", durationMS, true, map[string]any{"transaction_id": existing.ID.Hex()})
 		return &ledgerv1.RecordTransactionResponse{
 			TransactionId: existing.ID.Hex(),
 			Success:       true,
@@ -70,14 +109,27 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 	}
 
 	_, err = col.InsertOne(ctx, doc)
+	durationMS := time.Since(startTime).Milliseconds()
 	if err != nil {
 		log.Printf("[LEDGER] Error persisting audit record: %v", err)
+		s.emitTerminal(ctx, "ledger.record.failed", observability.LevelError, "Failed to persist ledger record", durationMS, false, map[string]any{"error": err.Error()})
 		return &ledgerv1.RecordTransactionResponse{
 			Success:      false,
 			ErrorMessage: err.Error(),
 		}, nil
 	}
 	log.Printf("[LEDGER] trace_id=%s step=ledger_document_persisted transaction_id=%s", req.IdempotencyKey, doc.ID.Hex())
+	correlation.TransactionID = doc.ID.Hex()
+	ctx = observability.WithCorrelation(ctx, correlation)
+
+	// Step 8: ledger.transaction.persisted (AUDIT)
+	s.emitTerminal(ctx, "ledger.transaction.persisted", observability.LevelAudit, "Ledger transaction persisted", durationMS, true, map[string]any{
+		"transaction_id": doc.ID.Hex(),
+		"source":         req.SourceWalletId,
+		"dest":           req.DestinationWalletId,
+		"amount":         req.Amount,
+		"currency":       req.Currency,
+	})
 
 	log.Printf("[LEDGER] Audit entry recorded: TX=%s | %s -> %s (%d %s) [Region: %s]",
 		doc.ID.Hex(), req.SourceWalletId, req.DestinationWalletId, req.Amount, req.Currency, s.region)
@@ -125,15 +177,19 @@ func (s *server) GetLedgerEntries(ctx context.Context, req *ledgerv1.GetLedgerRe
 	return &ledgerv1.GetLedgerResponse{Entries: entries}, nil
 }
 
+func environmentName() string {
+	if environment := os.Getenv("ENVIRONMENT"); environment != "" {
+		return environment
+	}
+	return "local"
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "50052"
 	}
-	mongoURI := os.Getenv("MONGO_URI")
-	if mongoURI == "" {
-		mongoURI = "mongodb://mongodb:27017/?replicaSet=rs0&directConnection=true"
-	}
+	mongoURI := db.DefaultMongoURI()
 	region := os.Getenv("REGION_NAME")
 	if region == "" {
 		region = "us-east-1"
@@ -157,6 +213,7 @@ func main() {
 	srv := &server{
 		mongoClient: client,
 		region:      region,
+		logger:      observability.LoggerFromEnvironment("ledger-service", environmentName(), region, os.Stdout),
 	}
 	ledgerv1.RegisterLedgerServiceServer(grpcServer, srv)
 

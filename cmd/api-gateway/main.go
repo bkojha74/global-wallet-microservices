@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
+	"wallet-system/pkg/observability"
 	ledgerv1 "wallet-system/proto/ledger"
 	walletv1 "wallet-system/proto/wallet"
 )
@@ -28,6 +30,33 @@ type Gateway struct {
 	ledgerClient   ledgerv1.LedgerServiceClient
 	primaryAddress string
 	standbyAddress string
+	logger         observability.Logger
+}
+
+func (g *Gateway) emit(ctx context.Context, eventType, level, message string, attributes map[string]any) {
+	g.emitFull(ctx, eventType, level, message, 0, nil, attributes)
+}
+
+func (g *Gateway) emitTerminal(ctx context.Context, eventType, level, message string, durationMS int64, success bool, attributes map[string]any) {
+	g.emitFull(ctx, eventType, level, message, durationMS, &success, attributes)
+}
+
+func (g *Gateway) emitFull(ctx context.Context, eventType, level, message string, durationMS int64, success *bool, attributes map[string]any) {
+	if g.logger == nil {
+		return
+	}
+	correlation := observability.FromContext(ctx)
+	g.logger.Emit(ctx, observability.Event{
+		Level:          level,
+		EventType:      eventType,
+		Message:        message,
+		AssociationID:  correlation.AssociationID,
+		TransactionID:  correlation.TransactionID,
+		IdempotencyKey: correlation.IdempotencyKey,
+		DurationMS:     durationMS,
+		Success:        success,
+		Attributes:     observability.RedactAttributes(attributes),
+	})
 }
 
 func logProto(traceID, step string, message proto.Message) {
@@ -64,7 +93,10 @@ func (g *Gateway) handleCreateWallet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	traceID := fmt.Sprintf("create-wallet-%d", time.Now().UnixNano())
+	correlation := observability.FromHTTPRequest(r)
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	traceID := correlation.AssociationID
+	g.emit(ctx, "api.request.received", observability.LevelInfo, "HTTP request received", map[string]any{"operation": "create_wallet"})
 	body, err := readClientJSON(traceID, r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -87,9 +119,10 @@ func (g *Gateway) handleCreateWallet(w http.ResponseWriter, r *http.Request) {
 
 	client, target := g.getActiveWalletClient()
 	log.Printf("[TRACE] trace_id=%s step=wallet_grpc_request target=%s", traceID, target)
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
+	ctx = observability.WithOutgoingMetadata(ctx, correlation)
 	resp, err := client.CreateWallet(ctx, protoReq)
 	if err != nil {
 		log.Printf("[TRACE] trace_id=%s step=wallet_grpc_response error=%v", traceID, err)
@@ -97,6 +130,7 @@ func (g *Gateway) handleCreateWallet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logProto(traceID, "wallet_proto_response_received", resp)
+	g.emit(ctx, "api.response.sent", observability.LevelInfo, "Wallet creation response sent", map[string]any{"operation": "create_wallet", "routed_target": target})
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":        resp.Success,
@@ -117,16 +151,20 @@ func (g *Gateway) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Missing 'id' query parameter", http.StatusBadRequest)
 		return
 	}
-	traceID := fmt.Sprintf("get-balance-%d", time.Now().UnixNano())
+	correlation := observability.FromHTTPRequest(r)
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	traceID := correlation.AssociationID
+	g.emit(ctx, "api.request.received", observability.LevelInfo, "HTTP request received", map[string]any{"operation": "get_balance"})
 	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=get_balance wallet_id=%s", traceID, walletID)
 	protoReq := &walletv1.GetBalanceRequest{WalletId: walletID}
 	logProto(traceID, "http_json_to_wallet_proto_request", protoReq)
 
 	client, target := g.getActiveWalletClient()
 	log.Printf("[TRACE] trace_id=%s step=wallet_grpc_request target=%s", traceID, target)
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
+	ctx = observability.WithOutgoingMetadata(ctx, correlation)
 	resp, err := client.GetBalance(ctx, protoReq)
 	if err != nil {
 		log.Printf("[TRACE] trace_id=%s step=wallet_grpc_response error=%v", traceID, err)
@@ -134,6 +172,7 @@ func (g *Gateway) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logProto(traceID, "wallet_proto_response_received", resp)
+	g.emit(ctx, "api.response.sent", observability.LevelInfo, "Balance response sent", map[string]any{"operation": "get_balance", "routed_target": target})
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"wallet_id":      resp.WalletId,
@@ -144,12 +183,14 @@ func (g *Gateway) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	traceID := fmt.Sprintf("transfer-%d", time.Now().UnixNano())
+	correlation := observability.FromHTTPRequest(r)
+	traceID := correlation.AssociationID
 	body, err := readClientJSON(traceID, r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -169,8 +210,18 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.IdempotencyKey != "" {
-		traceID = req.IdempotencyKey
+		correlation.IdempotencyKey = req.IdempotencyKey
 	}
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	// Step 1: api.request.received (INFO)
+	g.emit(ctx, "api.request.received", observability.LevelInfo, "HTTP transfer request received", map[string]any{
+		"operation":     "transfer",
+		"source_wallet": req.SourceWallet,
+		"dest_wallet":   req.DestWallet,
+		"amount":        req.Amount,
+		"currency":      req.Currency,
+	})
+	traceID = correlation.AssociationID
 	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=transfer source=%s destination=%s amount=%d currency=%s", traceID, req.SourceWallet, req.DestWallet, req.Amount, req.Currency)
 	protoReq := &walletv1.TransferFundsRequest{
 		IdempotencyKey:      req.IdempotencyKey,
@@ -181,17 +232,44 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	logProto(traceID, "http_json_to_wallet_proto_request", protoReq)
 
 	client, target := g.getActiveWalletClient()
+
+	// Step 2: api.wallet_proto.request_created (DEBUG)
+	g.emit(ctx, "api.wallet_proto.request_created", observability.LevelDebug, "Wallet protobuf request created", map[string]any{
+		"operation":       "transfer",
+		"target":          target,
+		"idempotency_key": req.IdempotencyKey,
+	})
+
 	log.Printf("[TRACE] trace_id=%s step=wallet_grpc_request target=%s", traceID, target)
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
+	ctx = observability.WithOutgoingMetadata(ctx, correlation)
 	resp, err := client.TransferFunds(ctx, protoReq)
+	durationMS := time.Since(startTime).Milliseconds()
 	if err != nil {
 		log.Printf("[TRACE] trace_id=%s step=wallet_grpc_response error=%v", traceID, err)
+		g.emitTerminal(ctx, "api.response.sent", observability.LevelError, "Transfer gRPC failure", durationMS, false, map[string]any{
+			"operation": "transfer",
+			"error":     err.Error(),
+		})
 		http.Error(w, fmt.Sprintf("Transfer gRPC failure: %v", err), http.StatusInternalServerError)
 		return
 	}
 	logProto(traceID, "wallet_proto_response_received", resp)
+	if resp.TransactionId != "" {
+		correlation.TransactionID = resp.TransactionId
+		ctx = observability.WithCorrelation(ctx, correlation)
+	}
+
+	// Step 12: api.response.sent (INFO)
+	isSuccess := resp.Status == walletv1.TransferFundsResponse_SUCCESS
+	g.emitTerminal(ctx, "api.response.sent", observability.LevelInfo, "Transfer response sent", durationMS, isSuccess, map[string]any{
+		"operation":      "transfer",
+		"routed_target":  target,
+		"status":         resp.Status.String(),
+		"transaction_id": resp.TransactionId,
+	})
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"transaction_id": resp.TransactionId,
@@ -209,9 +287,12 @@ func (g *Gateway) handleLedger(w http.ResponseWriter, r *http.Request) {
 	}
 
 	walletID := r.URL.Query().Get("wallet_id")
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	correlation := observability.FromHTTPRequest(r)
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
+	ctx = observability.WithOutgoingMetadata(ctx, correlation)
 	resp, err := g.ledgerClient.GetLedgerEntries(ctx, &ledgerv1.GetLedgerRequest{WalletId: walletID})
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Ledger query failure: %v", err), http.StatusInternalServerError)
@@ -222,9 +303,12 @@ func (g *Gateway) handleLedger(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *Gateway) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	correlation := observability.FromHTTPRequest(r)
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
+	ctx = observability.WithOutgoingMetadata(ctx, correlation)
 	pHealth, _ := g.primaryClient.HealthCheck(ctx, &walletv1.HealthRequest{})
 	sHealth, _ := g.standbyClient.HealthCheck(ctx, &walletv1.HealthRequest{})
 
@@ -287,18 +371,35 @@ func main() {
 	}
 	primaryAddr := os.Getenv("PRIMARY_WALLET_ADDR")
 	if primaryAddr == "" {
-		primaryAddr = "wallet-primary:50051"
+		if _, err := net.LookupHost("wallet-primary"); err == nil {
+			primaryAddr = "wallet-primary:50051"
+		} else {
+			primaryAddr = "127.0.0.1:50051"
+		}
 	}
 	standbyAddr := os.Getenv("STANDBY_WALLET_ADDR")
 	if standbyAddr == "" {
-		standbyAddr = "wallet-standby:50053"
+		if _, err := net.LookupHost("wallet-standby"); err == nil {
+			standbyAddr = "wallet-standby:50053"
+		} else {
+			standbyAddr = "127.0.0.1:50053"
+		}
 	}
 	ledgerAddr := os.Getenv("LEDGER_ADDR")
 	if ledgerAddr == "" {
-		ledgerAddr = "ledger-service:50052"
+		if _, err := net.LookupHost("ledger-service"); err == nil {
+			ledgerAddr = "ledger-service:50052"
+		} else {
+			ledgerAddr = "127.0.0.1:50052"
+		}
 	}
 
 	log.Println("[API-GATEWAY] Establishing gRPC connections...")
+	environment := os.Getenv("ENVIRONMENT")
+	if environment == "" {
+		environment = "local"
+	}
+	logger := observability.LoggerFromEnvironment("api-gateway", environment, "", os.Stdout)
 
 	pConn, err := grpc.NewClient(primaryAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -325,6 +426,7 @@ func main() {
 		ledgerClient:   ledgerv1.NewLedgerServiceClient(lConn),
 		primaryAddress: primaryAddr,
 		standbyAddress: standbyAddr,
+		logger:         logger,
 	}
 
 	http.HandleFunc("/api/v1/wallets", func(w http.ResponseWriter, r *http.Request) {

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
 	walletv1 "wallet-system/proto/wallet"
 )
@@ -17,6 +18,7 @@ import (
 type fakeWalletClient struct {
 	createWalletRequest   *walletv1.CreateWalletRequest
 	transferFundsRequest  *walletv1.TransferFundsRequest
+	transferContext       context.Context
 	createWalletResponse  *walletv1.CreateWalletResponse
 	transferFundsResponse *walletv1.TransferFundsResponse
 	createWalletError     error
@@ -32,8 +34,9 @@ func (f *fakeWalletClient) GetBalance(context.Context, *walletv1.GetBalanceReque
 	return nil, errors.New("GetBalance not implemented in fake")
 }
 
-func (f *fakeWalletClient) TransferFunds(_ context.Context, req *walletv1.TransferFundsRequest, _ ...grpc.CallOption) (*walletv1.TransferFundsResponse, error) {
+func (f *fakeWalletClient) TransferFunds(ctx context.Context, req *walletv1.TransferFundsRequest, _ ...grpc.CallOption) (*walletv1.TransferFundsResponse, error) {
 	f.transferFundsRequest = req
+	f.transferContext = ctx
 	return f.transferFundsResponse, f.transferFundsError
 }
 
@@ -97,6 +100,12 @@ func TestHandleTransferConvertsJSONToProtoAndResponseToJSON(t *testing.T) {
 	}
 	if protoRequest.IdempotencyKey != "key-1" || protoRequest.SourceWalletId != "alice" || protoRequest.DestinationWalletId != "bob" || protoRequest.Amount.Currency != "USD" || protoRequest.Amount.Units != 25 {
 		t.Fatalf("unexpected protobuf request: %+v", protoRequest)
+	}
+	metadataValues, ok := metadata.FromOutgoingContext(client.transferContext)
+	associationValues := metadataValues.Get("x-association-id")
+	idempotencyValues := metadataValues.Get("x-idempotency-key")
+	if !ok || len(associationValues) != 1 || associationValues[0] == "" || len(idempotencyValues) != 1 || idempotencyValues[0] != "key-1" {
+		t.Fatalf("expected correlation metadata, got %v", metadataValues)
 	}
 
 	var body map[string]interface{}

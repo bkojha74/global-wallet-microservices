@@ -4,12 +4,26 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
+	"os"
 	"time"
 
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 )
+
+// DefaultMongoURI returns MONGO_URI from env if set.
+// If unset, it checks if "mongodb" resolves (inside Docker). If not, it falls back to 127.0.0.1:27017 for native host execution.
+func DefaultMongoURI() string {
+	if uri := os.Getenv("MONGO_URI"); uri != "" {
+		return uri
+	}
+	if _, err := net.LookupHost("mongodb"); err == nil {
+		return "mongodb://mongodb:27017/?replicaSet=rs0&directConnection=true"
+	}
+	return "mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true"
+}
 
 // ConnectWithRetry connects to MongoDB with exponential backoff to handle replica set initialization
 func ConnectWithRetry(ctx context.Context, uri string, maxRetries int) (*mongo.Client, error) {

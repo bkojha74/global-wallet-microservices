@@ -12,6 +12,10 @@ To call `WalletService.TransferFunds` directly with BloomRPC, see the [BloomRPC 
 
 This repository includes a GitHub Actions workflow for formatting, unit tests, and race tests. See [SECURITY.md](SECURITY.md) for the boundary between this demonstration setup and a production deployment.
 
+The proposed centralized asynchronous logging design is documented in [docs/LOGGING_ARCHITECTURE.md](docs/LOGGING_ARCHITECTURE.md).
+
+Phase 1 observability is implemented: services emit structured local events and propagate association, transaction, and idempotency correlation through gRPC. RabbitMQ transport and durable fallback are planned for the next phases.
+
 ## Architecture Highlights
 - **Inter-Service Communication**: Binary gRPC (Protobuf v3) between API Gateway, Wallet Service, and Ledger Service.
 - **Persistence & Atomicity**: MongoDB Multi-Document Transactions with `writeconcern.Majority()` and `readconcern.Snapshot()`.
