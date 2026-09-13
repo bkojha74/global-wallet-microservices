@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
@@ -157,45 +158,180 @@ func normalizeEvent(ctx context.Context, event Event, service, environment, regi
 }
 
 type RabbitPublisher struct {
-	mu       sync.Mutex
-	url      string
-	exchange string
-	conn     *amqp.Connection
-	channel  *amqp.Channel
+	mu           sync.RWMutex
+	url          string
+	exchange     string
+	conn         *amqp.Connection
+	channel      *amqp.Channel
+	stop         chan struct{}
+	stopped      chan struct{}
+	connected    bool
+	reconnectSig chan struct{}
 }
 
 func NewRabbitPublisher(url, exchange string) *RabbitPublisher {
 	if exchange == "" {
 		exchange = DefaultLoggingExchange
 	}
-	return &RabbitPublisher{url: url, exchange: exchange}
+	p := &RabbitPublisher{
+		url:          url,
+		exchange:     exchange,
+		stop:         make(chan struct{}),
+		stopped:      make(chan struct{}),
+		reconnectSig: make(chan struct{}, 1),
+	}
+	go p.reconnectLoop()
+	return p
+}
+
+func (p *RabbitPublisher) IsConnected() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.connected && p.conn != nil && !p.conn.IsClosed() && p.channel != nil && !p.channel.IsClosed()
+}
+
+func (p *RabbitPublisher) reconnectLoop() {
+	defer close(p.stopped)
+
+	baseInterval := 500 * time.Millisecond
+	maxInterval := 30 * time.Second
+	multiplier := 2.0
+	currentInterval := baseInterval
+	consecutiveFailures := 0
+
+	for {
+		err := p.connect()
+		if err == nil {
+			consecutiveFailures = 0
+			currentInterval = baseInterval
+
+			closeChan := make(chan *amqp.Error, 1)
+			p.conn.NotifyClose(closeChan)
+
+			select {
+			case closeErr, ok := <-closeChan:
+				p.mu.Lock()
+				p.connected = false
+				p.resetConnectionLocked()
+				p.mu.Unlock()
+				if ok && closeErr != nil {
+					log.Printf("[LOGGING-PUBLISHER] RabbitMQ connection closed: %v. Reconnecting...", closeErr)
+				}
+			case <-p.reconnectSig:
+				p.mu.Lock()
+				p.connected = false
+				p.resetConnectionLocked()
+				p.mu.Unlock()
+			case <-p.stop:
+				return
+			}
+		} else {
+			consecutiveFailures++
+			// Jitter ±20%: factor in range [0.8, 1.2]
+			jitterFactor := 0.8 + (rand.Float64() * 0.4)
+			sleepDuration := time.Duration(float64(currentInterval) * jitterFactor)
+
+			if consecutiveFailures%10 == 0 || consecutiveFailures == 1 {
+				log.Printf("[LOGGING-PUBLISHER] RabbitMQ connection attempt failed (%d consecutive): %v. Retrying in %v...", consecutiveFailures, err, sleepDuration)
+			}
+
+			select {
+			case <-time.After(sleepDuration):
+			case <-p.reconnectSig:
+			case <-p.stop:
+				return
+			}
+
+			currentInterval = time.Duration(float64(currentInterval) * multiplier)
+			if currentInterval > maxInterval {
+				currentInterval = maxInterval
+			}
+		}
+	}
+}
+
+func (p *RabbitPublisher) connect() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.resetConnectionLocked()
+
+	conn, err := amqp.Dial(p.url)
+	if err != nil {
+		return err
+	}
+	channel, err := conn.Channel()
+	if err != nil {
+		_ = conn.Close()
+		return err
+	}
+	if err := channel.Confirm(false); err != nil {
+		_ = channel.Close()
+		_ = conn.Close()
+		return err
+	}
+	// Publisher declares only the topic exchange (GAP-04)
+	if err := channel.ExchangeDeclare(p.exchange, DefaultLoggingExchangeType, true, false, false, false, nil); err != nil {
+		_ = channel.Close()
+		_ = conn.Close()
+		return err
+	}
+
+	p.conn = conn
+	p.channel = channel
+	p.connected = true
+	return nil
 }
 
 func (p *RabbitPublisher) Publish(ctx context.Context, event Event) error {
+	p.mu.RLock()
+	if !p.connected || p.channel == nil || p.channel.IsClosed() {
+		p.mu.RUnlock()
+		select {
+		case p.reconnectSig <- struct{}{}:
+		default:
+		}
+		return fmt.Errorf("rabbitmq publisher is not connected")
+	}
+	channel := p.channel
+	exchange := p.exchange
+	p.mu.RUnlock()
+
 	payload, err := json.Marshal(event)
 	if err != nil {
 		return err
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if err := p.ensureConnection(); err != nil {
-		return err
-	}
-	confirmations := p.channel.NotifyPublish(make(chan amqp.Confirmation, 1))
+
+	confirmations := channel.NotifyPublish(make(chan amqp.Confirmation, 1))
 	key := fmt.Sprintf("%s.%s.%s", event.Environment, event.Service, event.Level)
-	if err := p.channel.PublishWithContext(ctx, p.exchange, key, false, false, amqp.Publishing{
+	if err := channel.PublishWithContext(ctx, exchange, key, false, false, amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
 		MessageId:    event.EventID,
 		Body:         payload,
 	}); err != nil {
-		p.resetConnection()
+		p.mu.Lock()
+		p.connected = false
+		p.resetConnectionLocked()
+		p.mu.Unlock()
+		select {
+		case p.reconnectSig <- struct{}{}:
+		default:
+		}
 		return err
 	}
+
 	select {
 	case confirmation := <-confirmations:
 		if !confirmation.Ack {
-			p.resetConnection()
+			p.mu.Lock()
+			p.connected = false
+			p.resetConnectionLocked()
+			p.mu.Unlock()
+			select {
+			case p.reconnectSig <- struct{}{}:
+			default:
+			}
 			return fmt.Errorf("rabbitmq publish was negatively acknowledged")
 		}
 		return nil
@@ -204,36 +340,7 @@ func (p *RabbitPublisher) Publish(ctx context.Context, event Event) error {
 	}
 }
 
-func (p *RabbitPublisher) ensureConnection() error {
-	if p.channel != nil && !p.channel.IsClosed() {
-		return nil
-	}
-	p.resetConnection()
-	conn, err := amqp.Dial(p.url)
-	if err != nil {
-		return err
-	}
-	channel, err := conn.Channel()
-	if err != nil {
-		conn.Close()
-		return err
-	}
-	if err := channel.Confirm(false); err != nil {
-		channel.Close()
-		conn.Close()
-		return err
-	}
-	if err := channel.ExchangeDeclare(p.exchange, DefaultLoggingExchangeType, true, false, false, false, nil); err != nil {
-		channel.Close()
-		conn.Close()
-		return err
-	}
-	p.conn = conn
-	p.channel = channel
-	return nil
-}
-
-func (p *RabbitPublisher) resetConnection() {
+func (p *RabbitPublisher) resetConnectionLocked() {
 	if p.channel != nil {
 		_ = p.channel.Close()
 	}
@@ -242,12 +349,18 @@ func (p *RabbitPublisher) resetConnection() {
 	}
 	p.channel = nil
 	p.conn = nil
+	p.connected = false
 }
 
 func (p *RabbitPublisher) Close() error {
+	close(p.stop)
+	select {
+	case <-p.stopped:
+	case <-time.After(2 * time.Second):
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.resetConnection()
+	p.resetConnectionLocked()
 	return nil
 }
 

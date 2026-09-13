@@ -1,0 +1,31 @@
+name: wallet-rabbitmq
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: wallet_rabbitmq
+    restart: always
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - wallet_shared_net
+
+volumes:
+  rabbitmq_data:
+    name: wallet_rabbitmq_data
+
+networks:
+  wallet_shared_net:
+    name: wallet_shared_net
+    external: true
