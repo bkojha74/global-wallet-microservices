@@ -11,6 +11,9 @@ services:
       - MONGO_URI=mongodb://mongodb:27017/?replicaSet=rs0&directConnection=true
       - REGION_NAME=global-core
       - INSTANCE_ID=ledger-service-1
+      - ENVIRONMENT=local
+      - LOGGING_RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - LOGGING_SPOOL_PATH=data/logging/ledger-service.jsonl
     ports:
       - "50052:50052"
     networks:
@@ -30,6 +33,9 @@ services:
       - REGION_NAME=us-east-1 (Primary Active)
       - IS_ACTIVE=true
       - INSTANCE_ID=wallet-primary
+      - ENVIRONMENT=local
+      - LOGGING_RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - LOGGING_SPOOL_PATH=data/logging/wallet-primary.jsonl
     ports:
       - "50051:50051"
     depends_on:
@@ -51,6 +57,9 @@ services:
       - REGION_NAME=eu-west-1 (Standby Hot DR)
       - IS_ACTIVE=false
       - INSTANCE_ID=wallet-standby
+      - ENVIRONMENT=local
+      - LOGGING_RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - LOGGING_SPOOL_PATH=data/logging/wallet-standby.jsonl
     ports:
       - "50053:50053"
     depends_on:
@@ -71,6 +80,9 @@ services:
       - STANDBY_WALLET_ADDR=wallet-standby:50053
       - LEDGER_ADDR=ledger-service:50052
       - INSTANCE_ID=api-gateway-1
+      - ENVIRONMENT=local
+      - LOGGING_RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - LOGGING_SPOOL_PATH=data/logging/api-gateway.jsonl
     ports:
       - "8080:8080"
     depends_on:
