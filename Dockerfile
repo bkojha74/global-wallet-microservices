@@ -25,7 +25,7 @@ RUN go mod tidy
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/wallet-service ./cmd/wallet-service
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/ledger-service ./cmd/ledger-service
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/api-gateway ./cmd/api-gateway
-
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/logging-service ./cmd/logging-service
 # Stage 2: Wallet Service Minimal Runtime
 FROM alpine:3.20 AS wallet-service
 RUN apk add --no-cache ca-certificates curl
@@ -49,3 +49,11 @@ WORKDIR /app
 COPY --from=builder /bin/api-gateway /app/api-gateway
 EXPOSE 8080
 ENTRYPOINT ["/app/api-gateway"]
+
+# Stage 5: Logging Service Minimal Runtime
+FROM alpine:3.20 AS logging-service
+RUN apk add --no-cache ca-certificates curl
+WORKDIR /app
+COPY --from=builder /bin/logging-service /app/logging-service
+EXPOSE 8090 9090
+ENTRYPOINT ["/app/logging-service"]

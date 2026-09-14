@@ -1,4 +1,4 @@
-﻿# Centralized Asynchronous Logging — Implementation Guide & Tracker
+# Centralized Asynchronous Logging — Implementation Guide & Tracker
 
 > **Companion Architecture Document:** [LOGGING_ARCHITECTURE.md](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/docs/LOGGING_ARCHITECTURE.md) (Design Status: Frozen v1.0)  
 > **Repository:** `global-wallet-microservices`  
@@ -12,7 +12,7 @@
 |---|---|---|:---:|:---:|
 | **Phase 1** | Contract, Shared SDK & Service Instrumentation | `pkg/observability`, Gateway, Wallet, Ledger | **COMPLETE (100%)** | 2026-09-13 |
 | **Phase 2** | Broker Setup, Reconnect Worker, Spool Hardening | `docker-compose.rabbitmq.yml`, `FileSpool`, `RabbitPublisher` | **COMPLETE (100%)** | 2026-09-14 |
-| **Phase 3** | Standalone Logging Service & Dedicated Store | `cmd/logging-service`, `docker-compose.logging.yml`, `logging_db` | **PLANNED** | — |
+| **Phase 3** | Standalone Logging Service & Dedicated Store | `cmd/logging-service`, `docker-compose.logging.yml`, `logging_db` | **COMPLETE (100%)** | 2026-09-14 |
 | **Phase 4** | Query API & End-to-End Operational Tracing | `cmd/logging-service` Query Endpoints, CLI Verification | **PLANNED** | — |
 | **Phase 5** | Production Hardening, Outbox, & Retention | Transactional Outbox, TLS, Retention TTL, Dashboards | **PLANNED** | — |
 
@@ -564,6 +564,11 @@ go run ./cmd/wallet-service
 $env:LOGGING_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 $env:INSTANCE_ID = "api-gateway-local"
 go run ./cmd/api-gateway
+
+# Terminal 4: Logging Service
+$env:MONGO_URI = "mongodb://127.0.0.1:27017"
+$env:RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
+go run ./cmd/logging-service
 ```
 
 > Application services remain **fully functional** even if RabbitMQ is not yet running.
@@ -587,24 +592,24 @@ go run ./cmd/api-gateway
 
 ### 4.2 Phase 3 Task Checklist
 
-- [ ] **Task 3.1: Service Skeleton & Compose File**
+- [x] **Task 3.1: Service Skeleton & Compose File**
   - Create `cmd/logging-service/main.go`
   - Create `docker-compose.logging.yml`
   - Port allocation: `8090` (HTTP API / Health), `9090` (Metrics)
 
-- [ ] **Task 3.2: Topology Declaration Ownership (`GAP-04`)**
+- [x] **Task 3.2: Topology Declaration Ownership (`GAP-04`)**
   - Declare topic exchange: `wallet.logs.v1`
   - Declare queue: `wallet.logging.v1` with binding `#`
   - Declare DLX: `wallet.logs.dlx.v1`
   - Declare DLQ: `wallet.logging.dead.v1`
 
-- [ ] **Task 3.3: Ingestion Consumer & Idempotency**
+- [x] **Task 3.3: Ingestion Consumer & Idempotency**
   - RabbitMQ consumer with prefetch count (e.g. 50).
   - Manual acknowledgement (`Ack`) only AFTER storage confirmation.
   - Reject / Dead-letter (`Nack(requeue=false)`) on schema validation errors.
   - Bounded retry with exponential backoff on transient DB errors.
 
-- [ ] **Task 3.4: Dedicated `logging_db` Store & Schema**
+- [x] **Task 3.4: Dedicated `logging_db` Store & Schema**
   - Target database: `logging_db`, Collection: `events`
   - Define `LogRepository` interface (`Save`, `Find`, `Health`)
   - Create required indexes:
@@ -614,15 +619,15 @@ go run ./cmd/api-gateway
     - `{ "occurred_at": 1 }`
     - `{ "service": 1, "level": 1, "occurred_at": -1 }`
 
-- [ ] **Task 3.5: Health & Readiness Probes**
+- [x] **Task 3.5: Health & Readiness Probes**
   - `/healthz`: Liveness probe (process up)
   - `/readyz`: Readiness probe (broker connected + storage healthy)
   - `/metrics`: Prometheus consumer lag, ingestion throughput, DLQ counter
 
 ### 4.3 Phase 3 Definition of Done (DoD)
-- [ ] Events published by microservices are successfully ingested into `logging_db.events`.
-- [ ] Duplicate event delivery does not create duplicate database records.
-- [ ] Corrupted events are routed to DLQ without crashing the consumer.
+- [x] Events published by microservices are successfully ingested into `logging_db.events`.
+- [x] Duplicate event delivery does not create duplicate database records.
+- [x] Corrupted events are routed to DLQ without crashing the consumer.
 
 ---
 

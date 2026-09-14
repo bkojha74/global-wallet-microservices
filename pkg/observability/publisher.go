@@ -394,7 +394,6 @@ func (p *RabbitPublisher) Publish(ctx context.Context, event Event) error {
 		return err
 	}
 
-	confirmations := channel.NotifyPublish(make(chan amqp.Confirmation, 1))
 	key := fmt.Sprintf("%s.%s.%s", event.Environment, event.Service, event.Level)
 	if err := channel.PublishWithContext(ctx, exchange, key, false, false, amqp.Publishing{
 		ContentType:  "application/json",
@@ -413,23 +412,7 @@ func (p *RabbitPublisher) Publish(ctx context.Context, event Event) error {
 		return err
 	}
 
-	select {
-	case confirmation := <-confirmations:
-		if !confirmation.Ack {
-			p.mu.Lock()
-			p.connected = false
-			p.resetConnectionLocked()
-			p.mu.Unlock()
-			select {
-			case p.reconnectSig <- struct{}{}:
-			default:
-			}
-			return fmt.Errorf("rabbitmq publish was negatively acknowledged")
-		}
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return nil
 }
 
 func (p *RabbitPublisher) resetConnectionLocked() {

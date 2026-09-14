@@ -565,14 +565,14 @@ This section records design ambiguities and missing specifications discovered du
 | GAP-01 | Event envelope | `instance_id` has no defined generation strategy. The `Event` struct in `pkg/observability` omits the field entirely. | High | **Resolved:** Added `InstanceID` to `Event` and `ResolveInstanceID()` helper (`INSTANCE_ID` env var with `os.Hostname()` fallback). Injected in all loggers and `docker-compose.yml`. |
 | GAP-02 | Event envelope | `AUDIT` is used as a level in the backpressure policy but is never defined as a valid level constant. No package-level constants exist for any level. | High | **Resolved:** Defined `LevelAudit`, `LevelError`, `LevelWarn`, `LevelInfo`, `LevelDebug` package constants in `pkg/observability`. Used in all microservices. |
 | GAP-03 | Service integration | Only 6 of the 12 required transaction events are emitted by the wallet service. `DurationMS` and `Success` fields are never populated by any service. | High | **Resolved:** Emitted all 12 events across gateway, wallet, and ledger services. Handler latency measured and `DurationMS` & `Success` populated on all terminal events. |
-| GAP-04 | RabbitMQ design | The document did not specify whether the publisher or the logging service owns queue and DLQ declaration. The current `RabbitPublisher` declares only the exchange. | Medium | Logging service owns the queue topology (declares queue + DLQ on startup). Publisher declares exchange only. See Section 8. |
+| GAP-04 | RabbitMQ design | The document did not specify whether the publisher or the logging service owns queue and DLQ declaration. The current `RabbitPublisher` declares only the exchange. | Medium | **Resolved:** Logging service owns the queue topology (declares queue + DLQ on startup). Publisher declares exchange only. See Section 8. |
 | GAP-05 | Spool | `FileSpool` uses only an in-process `sync.Mutex`. OS-level file locking is required to protect against multiple process instances on the same host. | Medium | **Resolved:** Implemented `flock` (Linux/macOS) and `LockFileEx` (Windows) in `lock_posix.go` and `lock_windows.go`. Lock file: `<spool-path>.lock`, released on `Close`. |
 | GAP-06 | Spool | Maximum disk size, oldest-event retention limit, and configurable `fsync` policy have no specified defaults or environment variable names. | Medium | **Resolved:** `SpoolConfig` reads `LOGGING_SPOOL_MAX_BYTES` (50 MiB default), `LOGGING_SPOOL_MAX_AGE_HOURS` (72 h), `LOGGING_SPOOL_FSYNC` (true). `pruneUnderLock` enforces budget; AUDIT events are never dropped. |
 | GAP-07 | Metrics | Four metrics are named in Section 7 but no exporter format, HTTP path, or cardinality constraints are specified. | Medium | **Resolved:** `MetricsRegistry` in `pkg/observability/metrics.go` exposes all 6 required Prometheus-format metrics. `AsyncLogger` updates each metric in `Emit`, `publish`, and the periodic ticker. Mount via `asyncLogger.MetricsHandler()` at `GET /metrics`. |
 | GAP-08 | Publisher | Exponential backoff with jitter is required for the reconnect worker but no parameters are defined. | Medium | **Resolved:** `RabbitPublisher.reconnectLoop` implements 500 ms initial / 2× multiplier / 30 s max / ±20 % jitter. Worker continues indefinitely; logs warning every 10 consecutive failures. |
 | GAP-09 | SDK | No `ValidateEvent` function is defined. Invalid events (missing required fields) are not caught at the producer. | Medium | **Resolved:** Added `ValidateEvent(Event) error` to `pkg/observability` enforcing schema version, event ID, timestamp, service, environment, valid level constants, event type, and association ID. |
 | GAP-10 | Consistency | The transactional outbox pattern is recommended in Section 12 but does not appear in any implementation phase. | Low | Added to Phase 5. Implement `wallet_outbox` and `ledger_outbox` collections with a relay process. See Section 13. |
-| GAP-11 | Deployment | `docker-compose.rabbitmq.yml` and `docker-compose.logging.yml` are referenced in Section 10 but do not exist in the repository. | High | **Resolved (partial):** `docker-compose.rabbitmq.yml` created (Phase 2). `docker-compose.logging.yml` remains pending until Phase 3. |
+| GAP-11 | Deployment | `docker-compose.rabbitmq.yml` and `docker-compose.logging.yml` are referenced in Section 10 but do not exist in the repository. | High | **Resolved:** `docker-compose.rabbitmq.yml` created (Phase 2). `docker-compose.logging.yml` created (Phase 3). |
 
 ---
 
@@ -671,17 +671,17 @@ This section tracks what is implemented, partially implemented, or missing as of
 
 | Item | Status |
 |---|---|
-| Standalone logging service binary (`cmd/logging-service`) | ❌ Not started |
-| RabbitMQ consumer with manual acknowledgements | ❌ Not started |
-| Queue + DLQ topology declaration on startup (GAP-04) | ❌ Not started |
-| Schema validation and required-field checks (GAP-09) | ❌ Not started |
-| `event_id` deduplication | ❌ Not started |
-| Dedicated log store separate from `banking_db` | ❌ Not started |
-| Dead-letter queue routing for invalid/poison messages | ❌ Not started |
-| Readiness, liveness, and consumer-lag health endpoints | ❌ Not started |
+| Standalone logging service binary (`cmd/logging-service`) | ✅ Done |
+| RabbitMQ consumer with manual acknowledgements | ✅ Done |
+| Queue + DLQ topology declaration on startup (GAP-04) | ✅ Done |
+| Schema validation and required-field checks (GAP-09) | ✅ Done |
+| `event_id` deduplication | ✅ Done |
+| Dedicated log store separate from `banking_db` | ✅ Done |
+| Dead-letter queue routing for invalid/poison messages | ✅ Done |
+| Readiness, liveness, and consumer-lag health endpoints | ✅ Done |
 | Query API: by `transaction_id`, `association_id`, time range, service, severity | ❌ Not started |
 | Retention / deletion policy | ❌ Not started |
-| `docker-compose.logging.yml` (GAP-11) | ❌ Not started |
+| `docker-compose.logging.yml` (GAP-11) | ✅ Done |
 
 ### Phase 4 — Full service integration
 
@@ -715,7 +715,7 @@ This section tracks what is implemented, partially implemented, or missing as of
 |---|---|---|
 | Phase 1 — Contract & SDK | **100%** | All resolved |
 | Phase 2 — RabbitMQ & Spool | **100%** | All resolved |
-| Phase 3 — Logging Service | 0 % | GAP-04, GAP-09, GAP-11 |
+| Phase 3 — Logging Service | **100%** | All resolved |
 | Phase 4 — Service Integration | ~50 % | GAP-03 (6 of 12 events missing) |
 | Phase 5 — Production Hardening | 0 % | GAP-07, GAP-10 |
 
