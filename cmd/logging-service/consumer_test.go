@@ -23,6 +23,10 @@ func (m *mockRepo) Save(ctx context.Context, event observability.Event) error {
 	return m.errToReturn
 }
 
+func (m *mockRepo) Find(_ context.Context, _ QueryFilter) ([]observability.Event, error) {
+	return nil, nil
+}
+
 func (m *mockRepo) Health(ctx context.Context) error {
 	return nil
 }

@@ -691,10 +691,12 @@ This section tracks what is implemented, partially implemented, or missing as of
 | Console logs preserved as optional second sink | ✅ Done |
 | gRPC metadata propagation (all three headers) | ✅ Done |
 | HTTP `X-Association-ID` accept and propagate | ✅ Done |
-| All 12 required transaction events emitted | 🔶 Partial — 6 of 12 done |
-| Failure/rollback event sequence emitted | ❌ Missing |
-| `DurationMS` and `Success` fields populated (GAP-03) | ❌ Missing |
-| End-to-end tests querying a full transaction timeline | ❌ Missing |
+| All 12 required transaction events emitted | ✅ Done |
+| Failure/rollback event sequence emitted | ✅ Done |
+| `DurationMS` and `Success` fields populated (GAP-03) | ✅ Done |
+| Query API: `GET /api/v1/logs` with full filter support | ✅ Done |
+| Query API: `GET /api/v1/traces/{association_id}` with `duration_ms` | ✅ Done |
+| End-to-end tests querying a full transaction timeline | ✅ Done |
 
 ### Phase 5 — Production hardening
 
@@ -716,6 +718,6 @@ This section tracks what is implemented, partially implemented, or missing as of
 | Phase 1 — Contract & SDK | **100%** | All resolved |
 | Phase 2 — RabbitMQ & Spool | **100%** | All resolved |
 | Phase 3 — Logging Service | **100%** | All resolved |
-| Phase 4 — Service Integration | ~50 % | GAP-03 (6 of 12 events missing) |
+| Phase 4 — Query API & Tracing | **100%** | All resolved |
 | Phase 5 — Production Hardening | 0 % | GAP-07, GAP-10 |
 

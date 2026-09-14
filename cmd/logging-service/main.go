@@ -75,6 +75,9 @@ func main() {
 		w.Write([]byte("Ready"))
 	})
 
+	// Phase 4: Query API endpoints
+	registerQueryRoutes(mux, repo)
+
 	server := &http.Server{
 		Addr:    ":" + httpPort,
 		Handler: mux,
