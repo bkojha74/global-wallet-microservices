@@ -34,7 +34,7 @@ type server struct {
 	isActive     bool
 	logger       observability.Logger
 	// Phase 5 (GAP-10): outbox writes AUDIT events inside the MongoDB transaction.
-	outbox       *observability.MongoOutbox   // nil when outbox is disabled
+	outbox *observability.MongoOutbox // nil when outbox is disabled
 }
 
 func (s *server) emit(ctx context.Context, eventType, level, message string, attributes map[string]any) {

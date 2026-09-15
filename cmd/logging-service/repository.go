@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"time"
 
-	"wallet-system/pkg/observability"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"wallet-system/pkg/observability"
 )
 
 // QueryFilter holds optional filter criteria for log queries.

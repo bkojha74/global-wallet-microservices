@@ -108,11 +108,11 @@ func (o *MongoOutbox) EnsureIndexes(ctx context.Context) error {
 // them to RabbitMQ via the provided EventPublisher, then marks them published.
 // Failed entries are retried up to MaxAttempts times before being marked failed.
 type OutboxRelay struct {
-	col         *mongo.Collection
-	publisher   EventPublisher
+	col          *mongo.Collection
+	publisher    EventPublisher
 	pollInterval time.Duration
-	batchSize   int64
-	maxAttempts int
+	batchSize    int64
+	maxAttempts  int
 }
 
 // NewOutboxRelay creates an OutboxRelay for the given MongoDB collection.
