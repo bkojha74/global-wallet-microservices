@@ -22,7 +22,7 @@ This document represents the frozen, approved architecture and technical specifi
 
 ## Phase 1 status
 
-**Phase 1 is 100% COMPLETE.** All SDK contracts, validation, level constants, instance disambiguation, and end-to-end 12-step event instrumentations are implemented and tested. Phase 2 is also 100% COMPLETE — all broker setup, reconnect worker, spool hardening, metrics wiring, and tests are implemented and passing. Phases 3–5 remain pending.
+**Phases 1–5 are 100% COMPLETE.** All SDK contracts, validation, level constants, instance disambiguation, end-to-end 12-step event instrumentation, RabbitMQ publisher, spool hardening, logging service consumer, query API, and all Phase 5 production-hardening items (TLS, quorum queues, retention policy, access control, Prometheus+Grafana monitoring stack, and transactional outbox) are implemented and tested.
 
 **Completed:**
 
@@ -568,10 +568,10 @@ This section records design ambiguities and missing specifications discovered du
 | GAP-04 | RabbitMQ design | The document did not specify whether the publisher or the logging service owns queue and DLQ declaration. The current `RabbitPublisher` declares only the exchange. | Medium | **Resolved:** Logging service owns the queue topology (declares queue + DLQ on startup). Publisher declares exchange only. See Section 8. |
 | GAP-05 | Spool | `FileSpool` uses only an in-process `sync.Mutex`. OS-level file locking is required to protect against multiple process instances on the same host. | Medium | **Resolved:** Implemented `flock` (Linux/macOS) and `LockFileEx` (Windows) in `lock_posix.go` and `lock_windows.go`. Lock file: `<spool-path>.lock`, released on `Close`. |
 | GAP-06 | Spool | Maximum disk size, oldest-event retention limit, and configurable `fsync` policy have no specified defaults or environment variable names. | Medium | **Resolved:** `SpoolConfig` reads `LOGGING_SPOOL_MAX_BYTES` (50 MiB default), `LOGGING_SPOOL_MAX_AGE_HOURS` (72 h), `LOGGING_SPOOL_FSYNC` (true). `pruneUnderLock` enforces budget; AUDIT events are never dropped. |
-| GAP-07 | Metrics | Four metrics are named in Section 7 but no exporter format, HTTP path, or cardinality constraints are specified. | Medium | **Resolved:** `MetricsRegistry` in `pkg/observability/metrics.go` exposes all 6 required Prometheus-format metrics. `AsyncLogger` updates each metric in `Emit`, `publish`, and the periodic ticker. Mount via `asyncLogger.MetricsHandler()` at `GET /metrics`. |
+| GAP-07 | Metrics | Four metrics are named in Section 7 but no exporter format, HTTP path, or cardinality constraints are specified. | Medium | **Resolved:** `MetricsRegistry` in `pkg/observability/metrics.go` exposes all 6 required Prometheus-format metrics. `AsyncLogger` updates each metric in `Emit`, `publish`, and the periodic ticker. Mount via `asyncLogger.MetricsHandler()` at `GET /metrics`. Phase 5: logging service now serves metrics on a dedicated port 9090 via `observability.DefaultMetrics.Handler()`; `docker-compose.monitoring.yml` runs Prometheus+Grafana with an auto-provisioned dashboard. |
 | GAP-08 | Publisher | Exponential backoff with jitter is required for the reconnect worker but no parameters are defined. | Medium | **Resolved:** `RabbitPublisher.reconnectLoop` implements 500 ms initial / 2× multiplier / 30 s max / ±20 % jitter. Worker continues indefinitely; logs warning every 10 consecutive failures. |
 | GAP-09 | SDK | No `ValidateEvent` function is defined. Invalid events (missing required fields) are not caught at the producer. | Medium | **Resolved:** Added `ValidateEvent(Event) error` to `pkg/observability` enforcing schema version, event ID, timestamp, service, environment, valid level constants, event type, and association ID. |
-| GAP-10 | Consistency | The transactional outbox pattern is recommended in Section 12 but does not appear in any implementation phase. | Low | Added to Phase 5. Implement `wallet_outbox` and `ledger_outbox` collections with a relay process. See Section 13. |
+| GAP-10 | Consistency | The transactional outbox pattern is recommended in Section 12 but does not appear in any implementation phase. | Low | **Resolved:** `pkg/observability/outbox.go` implements `MongoOutbox` (writes inside MongoDB session) and `OutboxRelay` (background goroutine publishing pending entries to RabbitMQ). Wallet service writes `source_debited` and `destination_credited` AUDIT events inside the MongoDB transaction; ledger service writes `ledger.transaction.persisted` inside its insert. Activated via `LOGGING_OUTBOX_ENABLED=true`. |
 | GAP-11 | Deployment | `docker-compose.rabbitmq.yml` and `docker-compose.logging.yml` are referenced in Section 10 but do not exist in the repository. | High | **Resolved:** `docker-compose.rabbitmq.yml` created (Phase 2). `docker-compose.logging.yml` created (Phase 3). |
 
 ---
@@ -580,7 +580,7 @@ This section records design ambiguities and missing specifications discovered du
 
 This section tracks what is implemented, partially implemented, or missing as of the last review. Update this table with each pull request that touches the logging pipeline.
 
-**Last reviewed:** 2026-09-14
+**Last reviewed:** 2026-09-15
 
 ### Phase 1 — Contract and shared SDK (100% Complete)
 
@@ -679,8 +679,8 @@ This section tracks what is implemented, partially implemented, or missing as of
 | Dedicated log store separate from `banking_db` | ✅ Done |
 | Dead-letter queue routing for invalid/poison messages | ✅ Done |
 | Readiness, liveness, and consumer-lag health endpoints | ✅ Done |
-| Query API: by `transaction_id`, `association_id`, time range, service, severity | ❌ Not started |
-| Retention / deletion policy | ❌ Not started |
+| Query API: by `transaction_id`, `association_id`, time range, service, severity | ✅ Done |
+| Retention / deletion policy | ✅ Done |
 | `docker-compose.logging.yml` (GAP-11) | ✅ Done |
 
 ### Phase 4 — Full service integration
@@ -702,14 +702,14 @@ This section tracks what is implemented, partially implemented, or missing as of
 
 | Item | Status |
 |---|---|
-| TLS for RabbitMQ connections | ❌ Not started |
-| RabbitMQ credentials via secrets | ❌ Not started |
-| Quorum queues in production | ❌ Not started |
-| Multi-node / HA RabbitMQ | ❌ Not started |
-| Dedicated replicated log storage | ❌ Not started |
-| Retention, redaction, and access control | ❌ Not started |
-| Prometheus metrics, alerts, and dashboards (GAP-07) | ❌ Not started |
-| Transactional outbox for audit-critical events (GAP-10) | ❌ Not started |
+| TLS for RabbitMQ connections | ✅ Done |
+| RabbitMQ credentials via secrets | ✅ Done |
+| Quorum queues in production | ✅ Done |
+| Multi-node / HA RabbitMQ | ✅ Done |
+| Dedicated replicated log storage | ✅ Done |
+| Retention, redaction, and access control | ✅ Done |
+| Prometheus metrics, alerts, and dashboards (GAP-07) | ✅ Done |
+| Transactional outbox for audit-critical events (GAP-10) | ✅ Done |
 
 ### Overall progress summary
 
@@ -719,5 +719,5 @@ This section tracks what is implemented, partially implemented, or missing as of
 | Phase 2 — RabbitMQ & Spool | **100%** | All resolved |
 | Phase 3 — Logging Service | **100%** | All resolved |
 | Phase 4 — Query API & Tracing | **100%** | All resolved |
-| Phase 5 — Production Hardening | 0 % | GAP-07, GAP-10 |
+| Phase 5 — Production Hardening | **100%** | All resolved |
 

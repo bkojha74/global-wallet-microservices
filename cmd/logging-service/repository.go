@@ -28,6 +28,8 @@ type QueryFilter struct {
 type LogRepository interface {
 	Save(ctx context.Context, event observability.Event) error
 	Find(ctx context.Context, filter QueryFilter) ([]observability.Event, error)
+	// Retention deletes events older than maxAgeDays and returns the deleted count.
+	Retention(ctx context.Context, maxAgeDays int) (int64, error)
 	Health(ctx context.Context) error
 }
 
@@ -164,6 +166,27 @@ func (r *MongoLogRepository) Health(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	return r.client.Ping(ctx, nil)
+}
+
+// Retention deletes log events whose occurred_at is older than maxAgeDays.
+// It leverages the { occurred_at: 1 } index for an efficient range delete.
+// AUDIT-level events are never deleted to preserve the mandatory audit trail.
+// Returns the number of documents deleted.
+func (r *MongoLogRepository) Retention(ctx context.Context, maxAgeDays int) (int64, error) {
+	if maxAgeDays <= 0 {
+		maxAgeDays = 90
+	}
+	cutoff := time.Now().UTC().AddDate(0, 0, -maxAgeDays)
+	// Preserve AUDIT events regardless of age.
+	filter := bson.D{
+		{Key: "occurred_at", Value: bson.D{{Key: "$lt", Value: cutoff}}},
+		{Key: "level", Value: bson.D{{Key: "$ne", Value: "AUDIT"}}},
+	}
+	result, err := r.collection.DeleteMany(ctx, filter)
+	if err != nil {
+		return 0, fmt.Errorf("retention delete failed: %w", err)
+	}
+	return result.DeletedCount, nil
 }
 
 func (r *MongoLogRepository) Close(ctx context.Context) error {

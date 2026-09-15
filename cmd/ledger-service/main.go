@@ -26,6 +26,8 @@ type server struct {
 	mongoClient *mongo.Client
 	region      string
 	logger      observability.Logger
+	// Phase 5 (GAP-10): outbox for ledger AUDIT events.
+	outbox      *observability.MongoOutbox // nil when outbox is disabled
 }
 
 func (s *server) emit(ctx context.Context, eventType, level, message string, attributes map[string]any) {
@@ -123,13 +125,35 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 	ctx = observability.WithCorrelation(ctx, correlation)
 
 	// Step 8: ledger.transaction.persisted (AUDIT)
-	s.emitTerminal(ctx, "ledger.transaction.persisted", observability.LevelAudit, "Ledger transaction persisted", durationMS, true, map[string]any{
-		"transaction_id": doc.ID.Hex(),
-		"source":         req.SourceWalletId,
-		"dest":           req.DestinationWalletId,
-		"amount":         req.Amount,
-		"currency":       req.Currency,
-	})
+	auditEvt := observability.Event{
+		SchemaVersion:  1,
+		EventID:        observability.NewAssociationID(),
+		OccurredAt:     time.Now().UTC(),
+		Service:        "ledger-service",
+		Environment:    environmentName(),
+		Region:         s.region,
+		Level:          observability.LevelAudit,
+		EventType:      "ledger.transaction.persisted",
+		Message:        "Ledger transaction persisted",
+		AssociationID:  correlation.AssociationID,
+		TransactionID:  doc.ID.Hex(),
+		IdempotencyKey: correlation.IdempotencyKey,
+		DurationMS:     durationMS,
+		Attributes: map[string]any{
+			"transaction_id": doc.ID.Hex(),
+			"source":         req.SourceWalletId,
+			"dest":           req.DestinationWalletId,
+			"amount":         req.Amount,
+			"currency":       req.Currency,
+		},
+	}
+	s.emitTerminal(ctx, auditEvt.EventType, auditEvt.Level, auditEvt.Message, durationMS, true, auditEvt.Attributes)
+	if s.outbox != nil {
+		if err := s.outbox.Append(ctx, auditEvt); err != nil {
+			log.Printf("[LEDGER] outbox append (transaction.persisted) failed: %v", err)
+			return nil, status.Errorf(codes.Internal, "failed to append to outbox: %v", err)
+		}
+	}
 
 	log.Printf("[LEDGER] Audit entry recorded: TX=%s | %s -> %s (%d %s) [Region: %s]",
 		doc.ID.Hex(), req.SourceWalletId, req.DestinationWalletId, req.Amount, req.Currency, s.region)
@@ -210,12 +234,40 @@ func main() {
 	}
 
 	grpcServer := grpc.NewServer()
+
+	// Phase 5 (GAP-10): initialise transactional outbox when enabled.
+	var ledgerOutbox *observability.MongoOutbox
+	var outboxPublisher *observability.RabbitPublisher
+	if observability.OutboxEnabled() {
+		rabbitURL := os.Getenv("LOGGING_RABBITMQ_URL")
+		if rabbitURL == "" {
+			log.Println("[LEDGER-SERVICE] LOGGING_OUTBOX_ENABLED=true but LOGGING_RABBITMQ_URL is not set — outbox disabled")
+		} else {
+			log.Println("[LEDGER-SERVICE] Transactional outbox ENABLED")
+			ledgerOutbox = observability.NewMongoOutbox(client.Database("banking_db"), "ledger_outbox")
+			idxCtx, idxCancel := context.WithTimeout(ctx, 10*time.Second)
+			if err := ledgerOutbox.EnsureIndexes(idxCtx); err != nil {
+				log.Printf("[LEDGER-SERVICE] outbox index creation warning: %v", err)
+			}
+			idxCancel()
+			tlsCfg, _ := observability.TLSConfigFromEnv()
+			outboxPublisher = observability.NewRabbitPublisherWithTLS(rabbitURL, "", tlsCfg)
+			relay := observability.NewOutboxRelay(client.Database("banking_db"), "ledger_outbox", outboxPublisher)
+			relay.Start(ctx)
+		}
+	}
+
 	srv := &server{
 		mongoClient: client,
 		region:      region,
 		logger:      observability.LoggerFromEnvironment("ledger-service", environmentName(), region, os.Stdout),
+		outbox:      ledgerOutbox,
 	}
 	ledgerv1.RegisterLedgerServiceServer(grpcServer, srv)
+
+	if outboxPublisher != nil {
+		defer outboxPublisher.Close()
+	}
 
 	log.Printf("[LEDGER-SERVICE] gRPC listening on :%s", port)
 	if err := grpcServer.Serve(lis); err != nil {

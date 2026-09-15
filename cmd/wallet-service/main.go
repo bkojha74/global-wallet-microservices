@@ -33,6 +33,8 @@ type server struct {
 	region       string
 	isActive     bool
 	logger       observability.Logger
+	// Phase 5 (GAP-10): outbox writes AUDIT events inside the MongoDB transaction.
+	outbox       *observability.MongoOutbox   // nil when outbox is disabled
 }
 
 func (s *server) emit(ctx context.Context, eventType, level, message string, attributes map[string]any) {
@@ -260,11 +262,32 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 		log.Printf("[WALLET-TX] trace_id=%s step=source_wallet_debited modified_count=%d", traceID, resSource.ModifiedCount)
 
 		// Step 5: wallet.transfer.source_debited (AUDIT)
-		s.emit(ctx, "wallet.transfer.source_debited", observability.LevelAudit, "Source wallet debited", map[string]any{
-			"source_wallet": req.SourceWalletId,
-			"debit_amount":  req.Amount.Units,
-			"currency":      req.Amount.Currency,
-		})
+		auditDebitEvt := observability.Event{
+			SchemaVersion:  1,
+			EventID:        observability.NewAssociationID(),
+			OccurredAt:     time.Now().UTC(),
+			Service:        "wallet-service",
+			Environment:    environmentName(),
+			Region:         s.region,
+			Level:          observability.LevelAudit,
+			EventType:      "wallet.transfer.source_debited",
+			Message:        "Source wallet debited",
+			AssociationID:  correlation.AssociationID,
+			TransactionID:  correlation.TransactionID,
+			IdempotencyKey: correlation.IdempotencyKey,
+			Attributes: observability.RedactAttributes(map[string]any{
+				"source_wallet": req.SourceWalletId,
+				"debit_amount":  req.Amount.Units,
+				"currency":      req.Amount.Currency,
+			}),
+		}
+		s.emit(ctx, auditDebitEvt.EventType, auditDebitEvt.Level, auditDebitEvt.Message, auditDebitEvt.Attributes)
+		if s.outbox != nil {
+			if err := s.outbox.Append(sessCtx, auditDebitEvt); err != nil {
+				log.Printf("[WALLET-TX] outbox append (source_debited) failed: %v", err)
+				return nil, fmt.Errorf("outbox append (source_debited) failed: %w", err)
+			}
+		}
 
 		// 3. Atomic credit to destination wallet
 		filterDest := bson.M{
@@ -287,11 +310,32 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 		log.Printf("[WALLET-TX] trace_id=%s step=destination_wallet_credited modified_count=%d", traceID, resDest.ModifiedCount)
 
 		// Step 6: wallet.transfer.destination_credited (AUDIT)
-		s.emit(ctx, "wallet.transfer.destination_credited", observability.LevelAudit, "Destination wallet credited", map[string]any{
-			"dest_wallet":   req.DestinationWalletId,
-			"credit_amount": req.Amount.Units,
-			"currency":      req.Amount.Currency,
-		})
+		auditCreditEvt := observability.Event{
+			SchemaVersion:  1,
+			EventID:        observability.NewAssociationID(),
+			OccurredAt:     time.Now().UTC(),
+			Service:        "wallet-service",
+			Environment:    environmentName(),
+			Region:         s.region,
+			Level:          observability.LevelAudit,
+			EventType:      "wallet.transfer.destination_credited",
+			Message:        "Destination wallet credited",
+			AssociationID:  correlation.AssociationID,
+			TransactionID:  correlation.TransactionID,
+			IdempotencyKey: correlation.IdempotencyKey,
+			Attributes: observability.RedactAttributes(map[string]any{
+				"dest_wallet":   req.DestinationWalletId,
+				"credit_amount": req.Amount.Units,
+				"currency":      req.Amount.Currency,
+			}),
+		}
+		s.emit(ctx, auditCreditEvt.EventType, auditCreditEvt.Level, auditCreditEvt.Message, auditCreditEvt.Attributes)
+		if s.outbox != nil {
+			if err := s.outbox.Append(sessCtx, auditCreditEvt); err != nil {
+				log.Printf("[WALLET-TX] outbox append (destination_credited) failed: %v", err)
+				return nil, fmt.Errorf("outbox append (destination_credited) failed: %w", err)
+			}
+		}
 
 		// 4. Inter-service gRPC call to Ledger Service for immutable audit record
 		log.Printf("[WALLET-TX] trace_id=%s step=ledger_grpc_request", traceID)
@@ -447,17 +491,52 @@ func main() {
 	}
 
 	grpcServer := grpc.NewServer()
+
+	// Phase 5 (GAP-10): initialise transactional outbox when enabled.
+	var walletOutbox *observability.MongoOutbox
+	var outboxPublisher *observability.RabbitPublisher
+	if observability.OutboxEnabled() {
+		rabbitURL := os.Getenv("LOGGING_RABBITMQ_URL")
+		if rabbitURL == "" {
+			log.Println("[WALLET-SERVICE] LOGGING_OUTBOX_ENABLED=true but LOGGING_RABBITMQ_URL is not set — outbox disabled")
+		} else {
+			log.Println("[WALLET-SERVICE] Transactional outbox ENABLED")
+			walletOutbox = observability.NewMongoOutbox(client.Database("banking_db"), "wallet_outbox")
+			idxCtx, idxCancel := context.WithTimeout(ctx, 10*time.Second)
+			if err := walletOutbox.EnsureIndexes(idxCtx); err != nil {
+				log.Printf("[WALLET-SERVICE] outbox index creation warning: %v", err)
+			}
+			idxCancel()
+			tlsCfg, _ := observability.TLSConfigFromEnv()
+			outboxPublisher = observability.NewRabbitPublisherWithTLS(rabbitURL, "", tlsCfg)
+			relay := observability.NewOutboxRelay(client.Database("banking_db"), "wallet_outbox", outboxPublisher)
+			relay.Start(ctx)
+		}
+	}
+
 	srv := &server{
 		mongoClient:  client,
 		ledgerClient: ledgerClient,
 		region:       region,
 		isActive:     isActive,
 		logger:       observability.LoggerFromEnvironment("wallet-service", environment, region, os.Stdout),
+		outbox:       walletOutbox,
 	}
 	walletv1.RegisterWalletServiceServer(grpcServer, srv)
+
+	if outboxPublisher != nil {
+		defer outboxPublisher.Close()
+	}
 
 	log.Printf("[WALLET-SERVICE] Listening for gRPC requests on :%s", port)
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("Failed to serve: %v", err)
 	}
+}
+
+func environmentName() string {
+	if environment := os.Getenv("ENVIRONMENT"); environment != "" {
+		return environment
+	}
+	return "development"
 }

@@ -2,6 +2,8 @@ package observability
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -245,10 +247,14 @@ func normalizeEvent(ctx context.Context, event Event, service, environment, regi
 // It runs a reconnect loop with exponential backoff and ±20% jitter (GAP-08).
 // The publisher declares only the topic exchange; the logging service owns
 // the queue and DLQ topology (GAP-04).
+//
+// TLS: set tlsCfg to a non-nil *tls.Config to dial over TLS (Phase 5).
+// Build one with TLSConfigFromEnv() or supply your own.
 type RabbitPublisher struct {
 	mu           sync.RWMutex
 	url          string
 	exchange     string
+	tlsCfg       *tls.Config // nil → plaintext; non-nil → TLS
 	conn         *amqp.Connection
 	channel      *amqp.Channel
 	stop         chan struct{}
@@ -257,13 +263,21 @@ type RabbitPublisher struct {
 	reconnectSig chan struct{}
 }
 
+// NewRabbitPublisher creates a plaintext AMQP publisher.
 func NewRabbitPublisher(url, exchange string) *RabbitPublisher {
+	return NewRabbitPublisherWithTLS(url, exchange, nil)
+}
+
+// NewRabbitPublisherWithTLS creates an AMQP publisher that dials with TLS when
+// tlsCfg is non-nil. Pass nil for plaintext connections.
+func NewRabbitPublisherWithTLS(url, exchange string, tlsCfg *tls.Config) *RabbitPublisher {
 	if exchange == "" {
 		exchange = DefaultLoggingExchange
 	}
 	p := &RabbitPublisher{
 		url:          url,
 		exchange:     exchange,
+		tlsCfg:       tlsCfg,
 		stop:         make(chan struct{}),
 		stopped:      make(chan struct{}),
 		reconnectSig: make(chan struct{}, 1),
@@ -347,7 +361,13 @@ func (p *RabbitPublisher) connect() error {
 
 	p.resetConnectionLocked()
 
-	conn, err := amqp.Dial(p.url)
+	var conn *amqp.Connection
+	var err error
+	if p.tlsCfg != nil {
+		conn, err = amqp.DialTLS(p.url, p.tlsCfg)
+	} else {
+		conn, err = amqp.Dial(p.url)
+	}
 	if err != nil {
 		return err
 	}
@@ -441,11 +461,43 @@ func (p *RabbitPublisher) Close() error {
 
 // ─── Factory ─────────────────────────────────────────────────────────────────
 
+// TLSConfigFromEnv builds a *tls.Config from the environment variables
+// LOGGING_RABBITMQ_TLS_CERT, LOGGING_RABBITMQ_TLS_KEY, and LOGGING_RABBITMQ_TLS_CA.
+// Returns nil when any of the three variables is absent (plaintext mode).
+// The returned config requires mutual TLS when all three are set.
+func TLSConfigFromEnv() (*tls.Config, error) {
+	certFile := os.Getenv("LOGGING_RABBITMQ_TLS_CERT")
+	keyFile := os.Getenv("LOGGING_RABBITMQ_TLS_KEY")
+	caFile := os.Getenv("LOGGING_RABBITMQ_TLS_CA")
+	if certFile == "" || keyFile == "" || caFile == "" {
+		return nil, nil // plaintext mode
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("TLS: failed to load client cert/key (%s/%s): %w", certFile, keyFile, err)
+	}
+	caPEM, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("TLS: failed to read CA cert (%s): %w", caFile, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("TLS: failed to parse CA cert from %s", caFile)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      pool,
+		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
+
 // LoggerFromEnvironment creates the appropriate Logger implementation based on
 // the LOGGING_RABBITMQ_URL environment variable:
 //   - If set: returns an AsyncLogger publishing to RabbitMQ with local spool fallback.
 //   - If absent: returns a StructuredLogger writing JSON to writer (local mode).
 //
+// TLS (Phase 5): set LOGGING_RABBITMQ_TLS_CERT, LOGGING_RABBITMQ_TLS_KEY, and
+// LOGGING_RABBITMQ_TLS_CA to enable mutual TLS for the RabbitMQ connection.
 // All services should call this at startup and use the returned Logger everywhere.
 func LoggerFromEnvironment(service, environment, region string, writer io.Writer) Logger {
 	instanceID := ResolveInstanceID()
@@ -458,9 +510,19 @@ func LoggerFromEnvironment(service, environment, region string, writer io.Writer
 		spoolPath = filepath.Join("data", "logging", fmt.Sprintf("%s-%s.jsonl", service, instanceID))
 	}
 	exchange := os.Getenv("LOGGING_RABBITMQ_EXCHANGE")
+
+	// Phase 5: build TLS config from env vars; nil means plaintext (safe default).
+	tlsCfg, err := TLSConfigFromEnv()
+	if err != nil {
+		log.Printf("[LOGGING-SDK] TLS configuration error: %v — falling back to plaintext", err)
+		tlsCfg = nil
+	} else if tlsCfg != nil {
+		log.Printf("[LOGGING-SDK] TLS enabled for RabbitMQ connection")
+	}
+
 	return NewAsyncLoggerFull(
 		service, environment, region, instanceID,
-		NewRabbitPublisher(url, exchange),
+		NewRabbitPublisherWithTLS(url, exchange, tlsCfg),
 		NewFileSpool(spoolPath),
 		256,
 		writer,

@@ -104,14 +104,21 @@ func (m *MetricsRegistry) Handler() http.Handler {
 
 		var b strings.Builder
 
-		// 1. logging_queue_depth — current in-memory channel depth (Gauge)
+		// 1. logging_events_emitted_total (Counter)
+		b.WriteString("# HELP logging_events_emitted_total Total events successfully emitted.\n")
+		b.WriteString("# TYPE logging_events_emitted_total counter\n")
+		for _, k := range sortedKeys(m.eventsEmitted) {
+			fmt.Fprintf(&b, "logging_events_emitted_total{%s} %d\n", k, m.eventsEmitted[k])
+		}
+
+		// 2. logging_queue_depth — current in-memory channel depth (Gauge)
 		b.WriteString("# HELP logging_queue_depth Current number of events waiting in the in-memory channel.\n")
 		b.WriteString("# TYPE logging_queue_depth gauge\n")
 		for _, k := range sortedKeys(m.queueDepth) {
 			fmt.Fprintf(&b, "logging_queue_depth{%s} %d\n", k, m.queueDepth[k])
 		}
 
-		// 2. logging_spool_bytes — current spool file size (Gauge)
+		// 3. logging_spool_bytes — current spool file size (Gauge)
 		b.WriteString("# HELP logging_spool_bytes Current size of the local spool file in bytes.\n")
 		b.WriteString("# TYPE logging_spool_bytes gauge\n")
 		for _, k := range sortedKeys(m.spoolBytes) {

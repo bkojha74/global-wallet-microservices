@@ -68,6 +68,8 @@ func (s *stubRepo) Find(_ context.Context, filter QueryFilter) ([]observability.
 
 func (s *stubRepo) Health(_ context.Context) error { return nil }
 
+func (s *stubRepo) Retention(_ context.Context, _ int) (int64, error) { return 0, nil }
+
 // makeEvent is a helper that builds a minimal valid event.
 func makeEvent(assocID, txID, service, level string, occurredAt time.Time) observability.Event {
 	b := true

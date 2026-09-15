@@ -27,6 +27,8 @@ func (m *mockRepo) Find(_ context.Context, _ QueryFilter) ([]observability.Event
 	return nil, nil
 }
 
+func (m *mockRepo) Retention(_ context.Context, _ int) (int64, error) { return 0, nil }
+
 func (m *mockRepo) Health(ctx context.Context) error {
 	return nil
 }

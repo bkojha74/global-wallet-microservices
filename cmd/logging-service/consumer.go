@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"wallet-system/pkg/observability"
@@ -12,16 +13,26 @@ import (
 )
 
 const (
-	exchangeName    = "wallet.logs.v1"
-	queueName       = "wallet.logging.ingest.v1"
-	dlxName         = "wallet.logs.dlx.v1"
-	dlqName         = "wallet.logging.dead.v1"
-	routingKey      = "#" // Match all topics
-	prefetchCount   = 50
-	maxRetries      = 3
+	exchangeName  = "wallet.logs.v1"
+	queueName     = "wallet.logging.ingest.v1"
+	dlxName       = "wallet.logs.dlx.v1"
+	dlqName       = "wallet.logging.dead.v1"
+	routingKey    = "#" // Match all topics
+	prefetchCount = 50
+	maxRetries    = 3
 )
 
 var retryBackoff = 2 * time.Second
+
+// queueTypeArgs returns the amqp.Table needed to declare a queue of the correct
+// type. Use LOGGING_QUEUE_TYPE=quorum for production; leave blank for local dev.
+func queueTypeArgs() amqp.Table {
+	if os.Getenv("LOGGING_QUEUE_TYPE") == "quorum" {
+		log.Println("[LOGGING-SERVICE] Queue type: quorum (production mode)")
+		return amqp.Table{"x-queue-type": "quorum"}
+	}
+	return nil // classic queue — default
+}
 
 type Consumer struct {
 	conn *amqp.Connection
@@ -55,13 +66,14 @@ func NewConsumer(amqpURI string, repo LogRepository) (*Consumer, error) {
 		return nil, fmt.Errorf("failed to declare DLX: %w", err)
 	}
 
+	queueArgs := queueTypeArgs()
 	_, err = ch.QueueDeclare(
 		dlqName,
-		true,  // durable
-		false, // delete when unused
-		false, // exclusive
-		false, // no-wait
-		nil,   // arguments
+		true,      // durable
+		false,     // delete when unused
+		false,     // exclusive
+		false,     // no-wait
+		queueArgs, // x-queue-type: quorum when LOGGING_QUEUE_TYPE=quorum
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to declare DLQ: %w", err)
@@ -92,16 +104,20 @@ func NewConsumer(amqpURI string, repo LogRepository) (*Consumer, error) {
 		return nil, fmt.Errorf("failed to declare main exchange: %w", err)
 	}
 
-	args := amqp.Table{
+	// Merge DLX routing with optional quorum type args.
+	mainQueueArgs := amqp.Table{
 		"x-dead-letter-exchange": dlxName,
+	}
+	if os.Getenv("LOGGING_QUEUE_TYPE") == "quorum" {
+		mainQueueArgs["x-queue-type"] = "quorum"
 	}
 	_, err = ch.QueueDeclare(
 		queueName,
-		true,  // durable
-		false, // delete when unused
-		false, // exclusive
-		false, // no-wait
-		args,  // arguments
+		true,          // durable
+		false,         // delete when unused
+		false,         // exclusive
+		false,         // no-wait
+		mainQueueArgs, // DLX + optional quorum type
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to declare main queue: %w", err)
