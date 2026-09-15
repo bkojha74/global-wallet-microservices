@@ -22,23 +22,23 @@ const (
 )
 
 type Event struct {
-	SchemaVersion  int            `json:"schema_version"`
-	EventID        string         `json:"event_id"`
-	OccurredAt     time.Time      `json:"occurred_at"`
-	Service        string         `json:"service"`
-	InstanceID     string         `json:"instance_id,omitempty"`
-	Environment    string         `json:"environment"`
-	Region         string         `json:"region,omitempty"`
-	Level          string         `json:"level"`
-	EventType      string         `json:"event_type"`
-	Message        string         `json:"message,omitempty"`
-	AssociationID  string         `json:"association_id"`
-	TransactionID  string         `json:"transaction_id,omitempty"`
-	IdempotencyKey string         `json:"idempotency_key,omitempty"`
-	ParentEventID  string         `json:"parent_event_id,omitempty"`
-	DurationMS     int64          `json:"duration_ms,omitempty"`
-	Success        *bool          `json:"success,omitempty"`
-	Attributes     map[string]any `json:"attributes,omitempty"`
+	SchemaVersion  int            `json:"schema_version" bson:"schema_version"`
+	EventID        string         `json:"event_id" bson:"event_id"`
+	OccurredAt     time.Time      `json:"occurred_at" bson:"occurred_at"`
+	Service        string         `json:"service" bson:"service"`
+	InstanceID     string         `json:"instance_id,omitempty" bson:"instance_id,omitempty"`
+	Environment    string         `json:"environment" bson:"environment"`
+	Region         string         `json:"region,omitempty" bson:"region,omitempty"`
+	Level          string         `json:"level" bson:"level"`
+	EventType      string         `json:"event_type" bson:"event_type"`
+	Message        string         `json:"message,omitempty" bson:"message,omitempty"`
+	AssociationID  string         `json:"association_id" bson:"association_id"`
+	TransactionID  string         `json:"transaction_id,omitempty" bson:"transaction_id,omitempty"`
+	IdempotencyKey string         `json:"idempotency_key,omitempty" bson:"idempotency_key,omitempty"`
+	ParentEventID  string         `json:"parent_event_id,omitempty" bson:"parent_event_id,omitempty"`
+	DurationMS     int64          `json:"duration_ms,omitempty" bson:"duration_ms,omitempty"`
+	Success        *bool          `json:"success,omitempty" bson:"success,omitempty"`
+	Attributes     map[string]any `json:"attributes,omitempty" bson:"attributes,omitempty"`
 }
 
 // ResolveInstanceID returns INSTANCE_ID from environment or falls back to os.Hostname(). (GAP-01)

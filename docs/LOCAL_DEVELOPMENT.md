@@ -144,7 +144,7 @@ Use `mongodb://mongodb:27017/?replicaSet=rs0&directConnection=true` from contain
 
 Use this workflow when only MongoDB should run in Docker. Do not start the application Compose file; it would also start Docker versions of the ledger, wallet, and gateway services.
 
-### 1. Start only MongoDB
+### 1. Start MongoDB and RabbitMQ
 
 From the repository root:
 
@@ -155,10 +155,12 @@ if ($LASTEXITCODE -ne 0) { docker network create wallet_shared_net }
 docker volume inspect global-wallet-microservices_mongo_data *> $null
 if ($LASTEXITCODE -ne 0) { docker volume create global-wallet-microservices_mongo_data }
 docker compose -f docker-compose.mongodb.yml up -d
+docker compose -f docker-compose.rabbitmq.yml up -d
 docker compose -f docker-compose.mongodb.yml ps
+docker compose -f docker-compose.rabbitmq.yml ps
 ```
 
-Wait until `wallet_mongodb` shows `healthy`. Verify the replica set:
+Wait until both `wallet_mongodb` and `wallet_rabbitmq` show `healthy`. Verify the replica set:
 
 ```powershell
 mongosh.exe --host 127.0.0.1:27017 --quiet --eval "rs.status().members.map(m => ({name: m.name, stateStr: m.stateStr, health: m.health}))"
@@ -175,6 +177,7 @@ Set-Location "C:\workarea\personal\After-equifax\global-wallet-microservices"
 $env:PORT = "50052"
 $env:MONGO_URI = "mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true"
 $env:REGION_NAME = "global-core"
+$env:LOGGING_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 go run .\cmd\ledger-service
 ```
 
@@ -195,6 +198,7 @@ $env:MONGO_URI = "mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=tru
 $env:LEDGER_SERVICE_ADDR = "127.0.0.1:50052"
 $env:REGION_NAME = "us-east-1-primary"
 $env:IS_ACTIVE = "true"
+$env:LOGGING_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 go run .\cmd\wallet-service
 ```
 
@@ -215,6 +219,7 @@ $env:MONGO_URI = "mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=tru
 $env:LEDGER_SERVICE_ADDR = "127.0.0.1:50052"
 $env:REGION_NAME = "eu-west-1-standby"
 $env:IS_ACTIVE = "false"
+$env:LOGGING_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 go run .\cmd\wallet-service
 ```
 
@@ -234,6 +239,7 @@ $env:HTTP_PORT = "8080"
 $env:PRIMARY_WALLET_ADDR = "127.0.0.1:50051"
 $env:STANDBY_WALLET_ADDR = "127.0.0.1:50053"
 $env:LEDGER_ADDR = "127.0.0.1:50052"
+$env:LOGGING_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 go run .\cmd\api-gateway
 ```
 
@@ -243,7 +249,24 @@ Wait for:
 [API-GATEWAY] HTTP REST Gateway listening on :8080
 ```
 
-### 6. Verify the native application
+### 6. Start the logging service
+
+Open a fifth PowerShell window:
+
+```powershell
+Set-Location "C:\workarea\personal\After-equifax\global-wallet-microservices"
+$env:MONGO_URI = "mongodb://127.0.0.1:27017"
+$env:RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
+go run .\cmd\logging-service
+```
+
+Wait for:
+
+```text
+[LOGGING-SERVICE] Starting RabbitMQ consumer...
+```
+
+### 7. Verify the native application
 
 The gateway is now available at `http://127.0.0.1:8080`:
 
@@ -351,6 +374,7 @@ Set-Location "C:\workarea\personal\After-equifax\global-wallet-microservices"
 $env:PORT = "50052"
 $env:MONGO_URI = "mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true"
 $env:REGION_NAME = "global-core"
+$env:LOGGING_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 go run .\cmd\ledger-service
 ```
 
@@ -369,6 +393,7 @@ $env:MONGO_URI = "mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=tru
 $env:LEDGER_SERVICE_ADDR = "127.0.0.1:50052"
 $env:REGION_NAME = "us-east-1-primary"
 $env:IS_ACTIVE = "true"
+$env:LOGGING_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 go run .\cmd\wallet-service
 ```
 
@@ -389,6 +414,7 @@ $env:MONGO_URI = "mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=tru
 $env:LEDGER_SERVICE_ADDR = "127.0.0.1:50052"
 $env:REGION_NAME = "eu-west-1-standby"
 $env:IS_ACTIVE = "false"
+$env:LOGGING_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 go run .\cmd\wallet-service
 ```
 
@@ -402,6 +428,7 @@ $env:HTTP_PORT = "8080"
 $env:PRIMARY_WALLET_ADDR = "127.0.0.1:50051"
 $env:STANDBY_WALLET_ADDR = "127.0.0.1:50053"
 $env:LEDGER_ADDR = "127.0.0.1:50052"
+$env:LOGGING_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 go run .\cmd\api-gateway
 ```
 
@@ -409,6 +436,23 @@ Wait for:
 
 ```text
 [API-GATEWAY] HTTP REST Gateway listening on :8080
+```
+
+### 4.5 Logging service
+
+Run the logging service in a fifth PowerShell window:
+
+```powershell
+Set-Location "C:\workarea\personal\After-equifax\global-wallet-microservices"
+$env:MONGO_URI = "mongodb://127.0.0.1:27017"
+$env:RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
+go run .\cmd\logging-service
+```
+
+Wait for:
+
+```text
+[LOGGING-SERVICE] Starting RabbitMQ consumer...
 ```
 
 The gateway selects the primary wallet service initially. The failover endpoint toggles between ports `50051` and `50053` in memory.

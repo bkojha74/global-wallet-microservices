@@ -443,6 +443,9 @@ func main() {
 	http.HandleFunc("/api/v1/cluster/status", gw.handleClusterStatus)
 	http.HandleFunc("/api/v1/cluster/failover", gw.handleFailover)
 
+	// Expose Prometheus metrics (GAP-07)
+	http.Handle("/metrics", observability.DefaultMetrics.Handler())
+
 	log.Printf("[API-GATEWAY] HTTP REST Gateway listening on :%s", httpPort)
 	if err := http.ListenAndServe(":"+httpPort, nil); err != nil {
 		log.Fatalf("Gateway server failure: %v", err)
