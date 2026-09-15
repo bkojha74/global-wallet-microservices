@@ -1,0 +1,32 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # ── Logging service ─────────────────────────────────────────────────────────
+  # Running natively on the host. Reachable from Docker via host.docker.internal.
+  # Exposes all 6 Phase-5 GAP-07 SDK metrics on :9090/metrics.
+  - job_name: "logging-service"
+    static_configs:
+      - targets: ["host.docker.internal:9090"]
+    metrics_path: /metrics
+
+  # ── RabbitMQ ─────────────────────────────────────────────────────────────────
+  # Running in Docker — use container name directly.
+  # Served natively by the rabbitmq_prometheus plugin (enabled_plugins).
+  - job_name: "rabbitmq"
+    static_configs:
+      - targets: ["wallet_rabbitmq:15692"]
+    metrics_path: /metrics
+
+  # ── Prometheus self-monitoring ────────────────────────────────────────────────
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # ── API Gateway ───────────────────────────────────────────────────────────────
+  # Scrape the API Gateway running natively on the host port 8080.
+  - job_name: "api-gateway"
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+    metrics_path: /metrics
