@@ -215,4 +215,3 @@ func (l *MemoryLogger) Close(context.Context) error {
 func NoopLogger() Logger {
 	return NewStructuredLogger("", "", "", io.Discard)
 }
-

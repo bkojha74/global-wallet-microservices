@@ -27,7 +27,7 @@ type server struct {
 	region      string
 	logger      observability.Logger
 	// Phase 5 (GAP-10): outbox for ledger AUDIT events.
-	outbox      *observability.MongoOutbox // nil when outbox is disabled
+	outbox *observability.MongoOutbox // nil when outbox is disabled
 }
 
 func (s *server) emit(ctx context.Context, eventType, level, message string, attributes map[string]any) {

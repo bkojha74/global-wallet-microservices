@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"wallet-system/pkg/observability"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"wallet-system/pkg/observability"
 )
 
 type mockRepo struct {
