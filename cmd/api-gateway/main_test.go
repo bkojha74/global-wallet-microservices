@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 
+	ledgerv1 "wallet-system/proto/ledger"
 	walletv1 "wallet-system/proto/wallet"
 )
 
@@ -42,6 +43,77 @@ func (f *fakeWalletClient) TransferFunds(ctx context.Context, req *walletv1.Tran
 
 func (f *fakeWalletClient) HealthCheck(context.Context, *walletv1.HealthRequest, ...grpc.CallOption) (*walletv1.HealthResponse, error) {
 	return nil, errors.New("HealthCheck not implemented in fake")
+}
+
+type fakeLedgerClient struct {
+	getLedgerRequest  *ledgerv1.GetLedgerRequest
+	getLedgerResponse *ledgerv1.GetLedgerResponse
+	getLedgerError    error
+}
+
+func (f *fakeLedgerClient) RecordTransaction(context.Context, *ledgerv1.RecordTransactionRequest, ...grpc.CallOption) (*ledgerv1.RecordTransactionResponse, error) {
+	return nil, errors.New("RecordTransaction not implemented in fake")
+}
+
+func (f *fakeLedgerClient) GetLedgerEntries(_ context.Context, req *ledgerv1.GetLedgerRequest, _ ...grpc.CallOption) (*ledgerv1.GetLedgerResponse, error) {
+	f.getLedgerRequest = req
+	return f.getLedgerResponse, f.getLedgerError
+}
+
+func TestHandleTransferRejectsInvalidCurrency(t *testing.T) {
+	gateway := &Gateway{}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/transfers", strings.NewReader(`{"idempotency_key":"k1","source_wallet_id":"alice","destination_wallet_id":"bob","amount":10,"currency":"FAKE"}`))
+	response := httptest.NewRecorder()
+
+	gateway.handleTransfer(response, req)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400 for fake currency, got %d", response.Code)
+	}
+}
+
+func TestHandleCreateWalletRejectsInvalidCurrency(t *testing.T) {
+	gateway := &Gateway{}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/wallets", strings.NewReader(`{"wallet_id":"alice","currency":"FAKE","initial_balance":100}`))
+	response := httptest.NewRecorder()
+
+	gateway.handleCreateWallet(response, req)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400 for fake currency, got %d", response.Code)
+	}
+}
+
+func TestHandleLedgerPaginatedResponse(t *testing.T) {
+	ledgerClient := &fakeLedgerClient{
+		getLedgerResponse: &ledgerv1.GetLedgerResponse{
+			Entries: []*ledgerv1.LedgerEntry{
+				{TransactionId: "tx-1", IdempotencyKey: "k1", Amount: 50, Currency: "USD"},
+			},
+			NextPageToken: "next-token-abc",
+			TotalCount:    10,
+		},
+	}
+	gateway := &Gateway{ledgerClient: ledgerClient}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/ledger?wallet_id=alice&limit=5&page_token=page1", nil)
+	response := httptest.NewRecorder()
+
+	gateway.handleLedger(response, req)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", response.Code)
+	}
+	if ledgerClient.getLedgerRequest.WalletId != "alice" || ledgerClient.getLedgerRequest.Limit != 5 || ledgerClient.getLedgerRequest.PageToken != "page1" {
+		t.Fatalf("unexpected ledger request parameters: %+v", ledgerClient.getLedgerRequest)
+	}
+
+	var body map[string]interface{}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("failed to decode response JSON: %v", err)
+	}
+	if body["wallet_id"] != "alice" || body["next_page_token"] != "next-token-abc" || body["total_count"] != float64(10) {
+		t.Fatalf("unexpected response JSON: %+v", body)
+	}
 }
 
 func TestHandleCreateWalletConvertsJSONToProto(t *testing.T) {

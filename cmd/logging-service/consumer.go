@@ -35,21 +35,35 @@ func queueTypeArgs() amqp.Table {
 }
 
 type Consumer struct {
-	conn *amqp.Connection
-	ch   *amqp.Channel
-	repo LogRepository
+	amqpURI string
+	conn    *amqp.Connection
+	ch      *amqp.Channel
+	repo    LogRepository
 }
 
 func NewConsumer(amqpURI string, repo LogRepository) (*Consumer, error) {
-	conn, err := amqp.Dial(amqpURI)
+	c := &Consumer{
+		amqpURI: amqpURI,
+		repo:    repo,
+	}
+	if err := c.connect(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func (c *Consumer) connect() error {
+	c.cleanup()
+
+	conn, err := amqp.Dial(c.amqpURI)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to RabbitMQ: %w", err)
+		return fmt.Errorf("failed to connect to RabbitMQ: %w", err)
 	}
 
 	ch, err := conn.Channel()
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("failed to open a channel: %w", err)
+		return fmt.Errorf("failed to open a channel: %w", err)
 	}
 
 	// 1. Declare DLX and DLQ
@@ -63,7 +77,9 @@ func NewConsumer(amqpURI string, repo LogRepository) (*Consumer, error) {
 		nil,      // arguments
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to declare DLX: %w", err)
+		ch.Close()
+		conn.Close()
+		return fmt.Errorf("failed to declare DLX: %w", err)
 	}
 
 	queueArgs := queueTypeArgs()
@@ -76,7 +92,9 @@ func NewConsumer(amqpURI string, repo LogRepository) (*Consumer, error) {
 		queueArgs, // x-queue-type: quorum when LOGGING_QUEUE_TYPE=quorum
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to declare DLQ: %w", err)
+		ch.Close()
+		conn.Close()
+		return fmt.Errorf("failed to declare DLQ: %w", err)
 	}
 
 	err = ch.QueueBind(
@@ -87,7 +105,9 @@ func NewConsumer(amqpURI string, repo LogRepository) (*Consumer, error) {
 		nil,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to bind DLQ: %w", err)
+		ch.Close()
+		conn.Close()
+		return fmt.Errorf("failed to bind DLQ: %w", err)
 	}
 
 	// 2. Declare Main Exchange and Queue
@@ -101,7 +121,9 @@ func NewConsumer(amqpURI string, repo LogRepository) (*Consumer, error) {
 		nil,     // arguments
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to declare main exchange: %w", err)
+		ch.Close()
+		conn.Close()
+		return fmt.Errorf("failed to declare main exchange: %w", err)
 	}
 
 	// Merge DLX routing with optional quorum type args.
@@ -120,7 +142,9 @@ func NewConsumer(amqpURI string, repo LogRepository) (*Consumer, error) {
 		mainQueueArgs, // DLX + optional quorum type
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to declare main queue: %w", err)
+		ch.Close()
+		conn.Close()
+		return fmt.Errorf("failed to declare main queue: %w", err)
 	}
 
 	err = ch.QueueBind(
@@ -131,7 +155,9 @@ func NewConsumer(amqpURI string, repo LogRepository) (*Consumer, error) {
 		nil,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to bind main queue: %w", err)
+		ch.Close()
+		conn.Close()
+		return fmt.Errorf("failed to bind main queue: %w", err)
 	}
 
 	// 3. Set QoS
@@ -141,30 +167,96 @@ func NewConsumer(amqpURI string, repo LogRepository) (*Consumer, error) {
 		false,         // global
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to set QoS: %w", err)
+		ch.Close()
+		conn.Close()
+		return fmt.Errorf("failed to set QoS: %w", err)
 	}
 
-	return &Consumer{
-		conn: conn,
-		ch:   ch,
-		repo: repo,
-	}, nil
+	c.conn = conn
+	c.ch = ch
+	return nil
+}
+
+func (c *Consumer) cleanup() {
+	if c.ch != nil {
+		_ = c.ch.Close()
+		c.ch = nil
+	}
+	if c.conn != nil {
+		_ = c.conn.Close()
+		c.conn = nil
+	}
 }
 
 func (c *Consumer) Start(ctx context.Context) error {
-	msgs, err := c.ch.Consume(
-		queueName,
-		"logging-service", // consumer
-		false,             // auto-ack
-		false,             // exclusive
-		false,             // no-local
-		false,             // no-wait
-		nil,               // args
-	)
-	if err != nil {
-		return fmt.Errorf("failed to register a consumer: %w", err)
-	}
+	backoff := 1 * time.Second
+	const maxBackoff = 30 * time.Second
 
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[LOGGING-SERVICE] Context cancelled, stopping consumer")
+			return nil
+		default:
+		}
+
+		if c.conn == nil || c.conn.IsClosed() || c.ch == nil || c.ch.IsClosed() {
+			log.Println("[LOGGING-SERVICE] Reconnecting to RabbitMQ...")
+			if err := c.connect(); err != nil {
+				log.Printf("[WARN] RabbitMQ reconnect failed: %v. Retrying in %v...", err, backoff)
+				select {
+				case <-time.After(backoff):
+					backoff = backoff * 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+					continue
+				case <-ctx.Done():
+					return nil
+				}
+			}
+			backoff = 1 * time.Second
+			log.Println("[LOGGING-SERVICE] Successfully reconnected to RabbitMQ.")
+		}
+
+		msgs, err := c.ch.Consume(
+			queueName,
+			"logging-service", // consumer
+			false,             // auto-ack
+			false,             // exclusive
+			false,             // no-local
+			false,             // no-wait
+			nil,               // args
+		)
+		if err != nil {
+			log.Printf("[WARN] Failed to register consumer: %v. Reconnecting in %v...", err, backoff)
+			c.cleanup()
+			select {
+			case <-time.After(backoff):
+				backoff = backoff * 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				continue
+			case <-ctx.Done():
+				return nil
+			}
+		}
+
+		log.Println("[LOGGING-SERVICE] RabbitMQ consumer listening for incoming events...")
+
+		consumeErr := c.consumeLoop(ctx, msgs)
+		if ctx.Err() != nil {
+			return nil
+		}
+
+		log.Printf("[WARN] RabbitMQ consumer channel closed: %v. Initiating automatic reconnect...", consumeErr)
+		c.cleanup()
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func (c *Consumer) consumeLoop(ctx context.Context, msgs <-chan amqp.Delivery) error {
 	for {
 		select {
 		case msg, ok := <-msgs:
@@ -173,7 +265,6 @@ func (c *Consumer) Start(ctx context.Context) error {
 			}
 			c.processMessage(ctx, msg)
 		case <-ctx.Done():
-			log.Println("Context done, stopping consumer")
 			return nil
 		}
 	}

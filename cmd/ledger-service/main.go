@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"time"
 
 	"google.golang.org/grpc"
@@ -15,6 +17,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 
 	"wallet-system/pkg/db"
 	"wallet-system/pkg/observability"
@@ -76,11 +79,17 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 	ctx = observability.WithCorrelation(ctx, correlation)
 	s.emit(ctx, "ledger.record.request_received", observability.LevelInfo, "Record transaction request received", map[string]any{"source_wallet_id": req.SourceWalletId, "destination_wallet_id": req.DestinationWalletId})
 	log.Printf("[LEDGER] proto request received: trace_id=%s source=%s destination=%s amount=%d currency=%s region=%s", req.IdempotencyKey, req.SourceWalletId, req.DestinationWalletId, req.Amount, req.Currency, req.Region)
-	if req.IdempotencyKey == "" || req.Amount <= 0 {
-		log.Printf("[LEDGER] trace_id=%s step=validation_failed", req.IdempotencyKey)
+	if req.IdempotencyKey == "" {
+		log.Printf("[LEDGER] trace_id=%s step=validation_failed reason=missing_idempotency_key", req.IdempotencyKey)
 		durationMS := time.Since(startTime).Milliseconds()
-		s.emitTerminal(ctx, "ledger.record.failed", observability.LevelError, "Validation failed", durationMS, false, map[string]any{"reason": "invalid_payload"})
-		return nil, status.Errorf(codes.InvalidArgument, "invalid ledger transaction payload")
+		s.emitTerminal(ctx, "ledger.record.failed", observability.LevelError, "Validation failed", durationMS, false, map[string]any{"reason": "missing_idempotency_key"})
+		return nil, status.Errorf(codes.InvalidArgument, "idempotency_key is required")
+	}
+	if err := db.ValidateAmount(req.Amount, req.Currency); err != nil {
+		log.Printf("[LEDGER] trace_id=%s step=validation_failed reason=%v", req.IdempotencyKey, err)
+		durationMS := time.Since(startTime).Milliseconds()
+		s.emitTerminal(ctx, "ledger.record.failed", observability.LevelError, "Validation failed", durationMS, false, map[string]any{"reason": err.Error()})
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 
 	col := s.mongoClient.Database("banking_db").Collection("ledger_entries")
@@ -99,8 +108,19 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 		}, nil
 	}
 
+	var docID primitive.ObjectID
+	if req.TransactionId != "" {
+		if parsed, err := primitive.ObjectIDFromHex(req.TransactionId); err == nil {
+			docID = parsed
+		} else {
+			docID = primitive.NewObjectID()
+		}
+	} else {
+		docID = primitive.NewObjectID()
+	}
+
 	doc := LedgerDocument{
-		ID:                  primitive.NewObjectID(),
+		ID:                  docID,
 		IdempotencyKey:      req.IdempotencyKey,
 		SourceWalletID:      req.SourceWalletId,
 		DestinationWalletID: req.DestinationWalletId,
@@ -174,7 +194,28 @@ func (s *server) GetLedgerEntries(ctx context.Context, req *ledgerv1.GetLedgerRe
 		},
 	}
 
-	cursor, err := col.Find(ctx, filter)
+	limit := int64(req.Limit)
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+
+	var offset int64 = 0
+	if req.PageToken != "" {
+		if decoded, err := base64.StdEncoding.DecodeString(req.PageToken); err == nil {
+			if parsedOffset, err := strconv.ParseInt(string(decoded), 10, 64); err == nil && parsedOffset >= 0 {
+				offset = parsedOffset
+			}
+		}
+	}
+
+	totalCount, _ := col.CountDocuments(ctx, filter)
+
+	findOpts := options.Find().
+		SetSort(bson.D{{Key: "timestamp", Value: -1}}).
+		SetSkip(offset).
+		SetLimit(limit)
+
+	cursor, err := col.Find(ctx, filter, findOpts)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to query ledger: %v", err)
 	}
@@ -198,7 +239,16 @@ func (s *server) GetLedgerEntries(ctx context.Context, req *ledgerv1.GetLedgerRe
 		})
 	}
 
-	return &ledgerv1.GetLedgerResponse{Entries: entries}, nil
+	var nextPageToken string
+	if offset+int64(len(entries)) < totalCount {
+		nextPageToken = base64.StdEncoding.EncodeToString([]byte(strconv.FormatInt(offset+int64(len(entries)), 10)))
+	}
+
+	return &ledgerv1.GetLedgerResponse{
+		Entries:       entries,
+		NextPageToken: nextPageToken,
+		TotalCount:    totalCount,
+	}, nil
 }
 
 func environmentName() string {
@@ -227,6 +277,13 @@ func main() {
 		log.Fatalf("Could not connect to MongoDB: %v", err)
 	}
 	defer client.Disconnect(ctx)
+
+	// Phase 1: Ensure MongoDB indexes
+	idxCtx, idxCancel := context.WithTimeout(ctx, 10*time.Second)
+	if err := db.EnsureLedgerIndexes(idxCtx, client.Database("banking_db")); err != nil {
+		log.Printf("[LEDGER-SERVICE] Ledger database index creation warning: %v", err)
+	}
+	idxCancel()
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {

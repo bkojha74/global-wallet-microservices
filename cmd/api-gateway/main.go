@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
+	"wallet-system/pkg/db"
 	"wallet-system/pkg/observability"
 	ledgerv1 "wallet-system/proto/ledger"
 	walletv1 "wallet-system/proto/wallet"
@@ -113,6 +115,15 @@ func (g *Gateway) handleCreateWallet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if !db.IsValidCurrency(req.Currency) {
+		http.Error(w, fmt.Sprintf("Invalid or unsupported currency: %s", req.Currency), http.StatusBadRequest)
+		return
+	}
+	if req.InitialBalance < 0 {
+		http.Error(w, "Initial balance cannot be negative", http.StatusBadRequest)
+		return
+	}
+
 	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=create_wallet wallet_id=%s", traceID, req.WalletID)
 	protoReq := &walletv1.CreateWalletRequest{WalletId: req.WalletID, Currency: req.Currency, InitialBalance: req.InitialBalance}
 	logProto(traceID, "http_json_to_wallet_proto_request", protoReq)
@@ -212,6 +223,10 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	if req.IdempotencyKey != "" {
 		correlation.IdempotencyKey = req.IdempotencyKey
 	}
+	if err := db.ValidateAmount(req.Amount, req.Currency); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	ctx := observability.WithCorrelation(r.Context(), correlation)
 	// Step 1: api.request.received (INFO)
 	g.emit(ctx, "api.request.received", observability.LevelInfo, "HTTP transfer request received", map[string]any{
@@ -287,19 +302,38 @@ func (g *Gateway) handleLedger(w http.ResponseWriter, r *http.Request) {
 	}
 
 	walletID := r.URL.Query().Get("wallet_id")
+	limitStr := r.URL.Query().Get("limit")
+	pageToken := r.URL.Query().Get("page_token")
+
+	var limit int32 = 20
+	if limitStr != "" {
+		if parsedLimit, err := strconv.ParseInt(limitStr, 10, 32); err == nil && parsedLimit > 0 {
+			limit = int32(parsedLimit)
+		}
+	}
+
 	correlation := observability.FromHTTPRequest(r)
 	ctx := observability.WithCorrelation(r.Context(), correlation)
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
 	ctx = observability.WithOutgoingMetadata(ctx, correlation)
-	resp, err := g.ledgerClient.GetLedgerEntries(ctx, &ledgerv1.GetLedgerRequest{WalletId: walletID})
+	resp, err := g.ledgerClient.GetLedgerEntries(ctx, &ledgerv1.GetLedgerRequest{
+		WalletId:  walletID,
+		Limit:     limit,
+		PageToken: pageToken,
+	})
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Ledger query failure: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, resp.Entries)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"wallet_id":       walletID,
+		"entries":         resp.Entries,
+		"next_page_token": resp.NextPageToken,
+		"total_count":     resp.TotalCount,
+	})
 }
 
 func (g *Gateway) handleClusterStatus(w http.ResponseWriter, r *http.Request) {

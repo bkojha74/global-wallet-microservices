@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readconcern"
@@ -35,6 +36,8 @@ type server struct {
 	logger       observability.Logger
 	// Phase 5 (GAP-10): outbox writes AUDIT events inside the MongoDB transaction.
 	outbox *observability.MongoOutbox // nil when outbox is disabled
+	// Phase 1 (GAP-FIN-01): transactional outbox relay for decoupled ledger entries.
+	ledgerRelay *LedgerRelay
 }
 
 func (s *server) emit(ctx context.Context, eventType, level, message string, attributes map[string]any) {
@@ -93,6 +96,14 @@ func (s *server) CreateWallet(ctx context.Context, req *walletv1.CreateWalletReq
 	ctx = observability.WithCorrelation(ctx, correlation)
 	s.emit(ctx, "wallet.create.request_received", observability.LevelInfo, "Create wallet request received", map[string]any{"wallet_id": req.WalletId})
 	log.Printf("[WALLET] CreateWallet proto received: wallet_id=%s currency=%s initial_balance=%d region=%s", req.WalletId, req.Currency, req.InitialBalance, s.region)
+
+	if !db.IsValidCurrency(req.Currency) {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid or unsupported currency: %s", req.Currency)
+	}
+	if req.InitialBalance < 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "initial balance cannot be negative: %d", req.InitialBalance)
+	}
+
 	col := s.mongoClient.Database("banking_db").Collection("wallets")
 
 	model := WalletModel{
@@ -164,15 +175,25 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 	})
 	traceID := req.IdempotencyKey
 	log.Printf("[WALLET-TX] trace_id=%s step=wallet_proto_request_received source=%s destination=%s amount=%d currency=%s region=%s", traceID, req.SourceWalletId, req.DestinationWalletId, req.Amount.GetUnits(), req.Amount.GetCurrency(), s.region)
-	if req.IdempotencyKey == "" || req.SourceWalletId == "" || req.DestinationWalletId == "" || req.Amount == nil || req.Amount.Currency == "" || req.Amount.Units <= 0 {
-		log.Printf("[WALLET-TX] trace_id=%s step=validation_failed reason=invalid_transfer_request", traceID)
+	if req.IdempotencyKey == "" || req.SourceWalletId == "" || req.DestinationWalletId == "" || req.Amount == nil {
+		log.Printf("[WALLET-TX] trace_id=%s step=validation_failed reason=missing_fields", traceID)
 		durationMS := time.Since(startTime).Milliseconds()
 		s.emitTerminal(ctx, "wallet.transfer.failed", observability.LevelError, "Validation failed", durationMS, false, map[string]any{
 			"error_code":    "invalid_transfer_request",
-			"error_message": "idempotency_key, source_wallet_id, destination_wallet_id, amount.currency, and positive amount.units are required",
+			"error_message": "idempotency_key, source_wallet_id, destination_wallet_id, and amount are required",
 			"step":          "validation",
 		})
-		return nil, status.Error(codes.InvalidArgument, "idempotency_key, source_wallet_id, destination_wallet_id, amount.currency, and positive amount.units are required")
+		return nil, status.Error(codes.InvalidArgument, "idempotency_key, source_wallet_id, destination_wallet_id, and amount are required")
+	}
+	if err := db.ValidateAmount(req.Amount.Units, req.Amount.Currency); err != nil {
+		log.Printf("[WALLET-TX] trace_id=%s step=validation_failed reason=%v", traceID, err)
+		durationMS := time.Since(startTime).Milliseconds()
+		s.emitTerminal(ctx, "wallet.transfer.failed", observability.LevelError, "Validation failed", durationMS, false, map[string]any{
+			"error_code":    "invalid_amount",
+			"error_message": err.Error(),
+			"step":          "validation",
+		})
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	if req.SourceWalletId == req.DestinationWalletId {
 		log.Printf("[WALLET-TX] trace_id=%s step=validation_failed reason=identical_wallets", traceID)
@@ -205,7 +226,9 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 		SetWriteConcern(writeconcern.Majority()).
 		SetReadConcern(readconcern.Snapshot())
 
-	var finalTxnID string
+	finalTxnID := primitive.NewObjectID().Hex()
+	outboxTaskID := primitive.NewObjectID()
+	var outboxTask LedgerTask
 	var txnStatus walletv1.TransferFundsResponse_Status = walletv1.TransferFundsResponse_SUCCESS
 	var txnErrMsg string
 	var sourceDebited bool
@@ -214,6 +237,7 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 		log.Printf("[WALLET-TX] trace_id=%s step=mongo_transaction_started", traceID)
 		walletsCol := s.mongoClient.Database("banking_db").Collection("wallets")
 		idempCol := s.mongoClient.Database("banking_db").Collection("idempotency_records")
+		ledgerTasksCol := s.mongoClient.Database("banking_db").Collection("ledger_tasks")
 
 		// 1. Idempotency verification
 		var existingIdemp IdempotencyRecord
@@ -273,7 +297,7 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 			EventType:      "wallet.transfer.source_debited",
 			Message:        "Source wallet debited",
 			AssociationID:  correlation.AssociationID,
-			TransactionID:  correlation.TransactionID,
+			TransactionID:  finalTxnID,
 			IdempotencyKey: correlation.IdempotencyKey,
 			Attributes: observability.RedactAttributes(map[string]any{
 				"source_wallet": req.SourceWalletId,
@@ -321,7 +345,7 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 			EventType:      "wallet.transfer.destination_credited",
 			Message:        "Destination wallet credited",
 			AssociationID:  correlation.AssociationID,
-			TransactionID:  correlation.TransactionID,
+			TransactionID:  finalTxnID,
 			IdempotencyKey: correlation.IdempotencyKey,
 			Attributes: observability.RedactAttributes(map[string]any{
 				"dest_wallet":   req.DestinationWalletId,
@@ -337,40 +361,24 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 			}
 		}
 
-		// 4. Inter-service gRPC call to Ledger Service for immutable audit record
-		log.Printf("[WALLET-TX] trace_id=%s step=ledger_grpc_request", traceID)
-		ledgerCtx := observability.WithOutgoingMetadata(sessCtx, correlation)
-
-		// Step 7: wallet.transfer.ledger_request_sent (DEBUG)
-		s.emit(ctx, "wallet.transfer.ledger_request_sent", observability.LevelDebug, "Ledger transaction record request sent", map[string]any{
-			"source_wallet": req.SourceWalletId,
-			"dest_wallet":   req.DestinationWalletId,
-			"amount":        req.Amount.Units,
-			"currency":      req.Amount.Currency,
-		})
-
-		ledgerResp, err := s.ledgerClient.RecordTransaction(ledgerCtx, &ledgerv1.RecordTransactionRequest{
+		// 4. Record transactional outbox entry for reliable decoupled ledger delivery (GAP-FIN-01)
+		outboxTask = LedgerTask{
+			ID:                  outboxTaskID,
+			TransactionID:       finalTxnID,
 			IdempotencyKey:      req.IdempotencyKey,
-			SourceWalletId:      req.SourceWalletId,
-			DestinationWalletId: req.DestinationWalletId,
+			SourceWalletID:      req.SourceWalletId,
+			DestinationWalletID: req.DestinationWalletId,
 			Amount:              req.Amount.Units,
 			Currency:            req.Amount.Currency,
 			Region:              s.region,
-		})
-		if err != nil || ledgerResp == nil || !ledgerResp.Success {
-			log.Printf("[WALLET-TX] trace_id=%s step=ledger_grpc_response success=%t error=%v", traceID, ledgerResp != nil && ledgerResp.Success, err)
-			return nil, fmt.Errorf("failed to record ledger transaction: %v", err)
+			Status:              LedgerTaskStatusPending,
+			CreatedAt:           time.Now().UTC(),
 		}
-		finalTxnID = ledgerResp.TransactionId
-		correlation.TransactionID = finalTxnID
-		ctx = observability.WithCorrelation(ctx, correlation)
-		log.Printf("[WALLET-TX] trace_id=%s step=ledger_grpc_response transaction_id=%s", traceID, finalTxnID)
-
-		// Step 9: wallet.transfer.ledger_response_received (DEBUG)
-		s.emit(ctx, "wallet.transfer.ledger_response_received", observability.LevelDebug, "Ledger response received", map[string]any{
-			"transaction_id": finalTxnID,
-			"ledger_status":  "SUCCESS",
-		})
+		if err := AppendLedgerTask(sessCtx, ledgerTasksCol, outboxTask); err != nil {
+			log.Printf("[WALLET-TX] failed to append ledger outbox task: %v", err)
+			return nil, fmt.Errorf("failed to append ledger outbox task: %w", err)
+		}
+		log.Printf("[WALLET-TX] trace_id=%s step=ledger_outbox_task_appended task_id=%s", traceID, outboxTaskID.Hex())
 
 		// 5. Store Idempotency Key mapping
 		_, err = idempCol.InsertOne(sessCtx, IdempotencyRecord{
@@ -420,6 +428,25 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 			ErrorMessage:    txnErrMsg,
 			HandledByRegion: s.region,
 		}, nil
+	}
+
+	// 6. Immediate synchronous dispatch attempt outside the MongoDB transaction
+	if txnStatus == walletv1.TransferFundsResponse_SUCCESS && s.ledgerRelay != nil {
+		s.emit(ctx, "wallet.transfer.ledger_request_sent", observability.LevelDebug, "Ledger transaction record request sent", map[string]any{
+			"source_wallet": req.SourceWalletId,
+			"dest_wallet":   req.DestinationWalletId,
+			"amount":        req.Amount.Units,
+			"currency":      req.Amount.Currency,
+		})
+		if syncErr := s.ledgerRelay.DispatchImmediate(ctx, outboxTask); syncErr != nil {
+			log.Printf("[WALLET-TX] trace_id=%s immediate ledger sync failed: %v (queued for background relay)", traceID, syncErr)
+		} else {
+			log.Printf("[WALLET-TX] trace_id=%s immediate ledger sync succeeded", traceID)
+			s.emit(ctx, "wallet.transfer.ledger_response_received", observability.LevelDebug, "Ledger response received", map[string]any{
+				"transaction_id": finalTxnID,
+				"ledger_status":  "SUCCESS",
+			})
+		}
 	}
 
 	// Step 11: wallet.transfer.completed (AUDIT)
@@ -492,6 +519,17 @@ func main() {
 
 	grpcServer := grpc.NewServer()
 
+	// Phase 1: Ensure MongoDB indexes
+	walletIdxCtx, walletIdxCancel := context.WithTimeout(ctx, 10*time.Second)
+	if err := db.EnsureWalletIndexes(walletIdxCtx, client.Database("banking_db")); err != nil {
+		log.Printf("[WALLET-SERVICE] Wallet database index creation warning: %v", err)
+	}
+	walletIdxCancel()
+
+	// Phase 1 (GAP-FIN-01): Initialize decoupled ledger outbox relay
+	ledgerRelay := NewLedgerRelay(client.Database("banking_db"), ledgerClient, 2*time.Second, 50, nil)
+	ledgerRelay.Start(ctx)
+
 	// Phase 5 (GAP-10): initialise transactional outbox when enabled.
 	var walletOutbox *observability.MongoOutbox
 	var outboxPublisher *observability.RabbitPublisher
@@ -521,6 +559,7 @@ func main() {
 		isActive:     isActive,
 		logger:       observability.LoggerFromEnvironment("wallet-service", environment, region, os.Stdout),
 		outbox:       walletOutbox,
+		ledgerRelay:  ledgerRelay,
 	}
 	walletv1.RegisterWalletServiceServer(grpcServer, srv)
 

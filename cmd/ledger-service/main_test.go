@@ -17,13 +17,30 @@ func TestRecordTransactionRejectsInvalidPayload(t *testing.T) {
 	}{
 		{
 			name: "missing idempotency key",
-			req:  &ledgerv1.RecordTransactionRequest{Amount: 10},
+			req:  &ledgerv1.RecordTransactionRequest{Amount: 10, Currency: "USD"},
 		},
 		{
 			name: "non-positive amount",
 			req: &ledgerv1.RecordTransactionRequest{
 				IdempotencyKey: "key-1",
 				Amount:         0,
+				Currency:       "USD",
+			},
+		},
+		{
+			name: "negative amount",
+			req: &ledgerv1.RecordTransactionRequest{
+				IdempotencyKey: "key-2",
+				Amount:         -100,
+				Currency:       "USD",
+			},
+		},
+		{
+			name: "unsupported currency",
+			req: &ledgerv1.RecordTransactionRequest{
+				IdempotencyKey: "key-3",
+				Amount:         100,
+				Currency:       "FAKE",
 			},
 		},
 	}

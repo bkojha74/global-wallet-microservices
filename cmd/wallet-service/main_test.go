@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -46,7 +47,68 @@ func TestTransferFundsRejectsMissingWalletIDs(t *testing.T) {
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("expected InvalidArgument, got %v", err)
 	}
-	if status.Convert(err).Message() != "idempotency_key, source_wallet_id, destination_wallet_id, amount.currency, and positive amount.units are required" {
+	if !strings.Contains(status.Convert(err).Message(), "required") {
 		t.Fatalf("unexpected validation error: %v", err)
+	}
+}
+
+func TestTransferFundsRejectsInvalidCurrency(t *testing.T) {
+	service := &server{region: "test-region"}
+	response, err := service.TransferFunds(context.Background(), &walletv1.TransferFundsRequest{
+		IdempotencyKey:      "invalid-curr-test",
+		SourceWalletId:      "alice",
+		DestinationWalletId: "bob",
+		Amount:              &walletv1.Money{Currency: "FAKECURR", Units: 50},
+	})
+
+	if response != nil {
+		t.Fatalf("expected no response, got %+v", response)
+	}
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument, got %v", err)
+	}
+	if !strings.Contains(status.Convert(err).Message(), "invalid or unsupported currency") {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+}
+
+func TestTransferFundsRejectsNonPositiveAmount(t *testing.T) {
+	service := &server{region: "test-region"}
+	response, err := service.TransferFunds(context.Background(), &walletv1.TransferFundsRequest{
+		IdempotencyKey:      "zero-amount-test",
+		SourceWalletId:      "alice",
+		DestinationWalletId: "bob",
+		Amount:              &walletv1.Money{Currency: "USD", Units: 0},
+	})
+
+	if response != nil {
+		t.Fatalf("expected no response, got %+v", response)
+	}
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument, got %v", err)
+	}
+}
+
+func TestCreateWalletValidation(t *testing.T) {
+	service := &server{region: "test-region"}
+
+	// Invalid currency
+	_, err := service.CreateWallet(context.Background(), &walletv1.CreateWalletRequest{
+		WalletId:       "user-1",
+		Currency:       "XYZ",
+		InitialBalance: 100,
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for bad currency, got %v", err)
+	}
+
+	// Negative balance
+	_, err = service.CreateWallet(context.Background(), &walletv1.CreateWalletRequest{
+		WalletId:       "user-2",
+		Currency:       "USD",
+		InitialBalance: -50,
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for negative balance, got %v", err)
 	}
 }
