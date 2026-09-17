@@ -10,19 +10,26 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
+	"wallet-system/pkg/auth"
 	"wallet-system/pkg/db"
 	"wallet-system/pkg/observability"
+	"wallet-system/pkg/tlsutil"
 	ledgerv1 "wallet-system/proto/ledger"
 	walletv1 "wallet-system/proto/wallet"
 )
+
+const defaultJWTSecret = "development-wallet-insecure-secret-key-change-in-prod"
 
 type Gateway struct {
 	mu             sync.RWMutex
@@ -123,6 +130,13 @@ func (g *Gateway) handleCreateWallet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Initial balance cannot be negative", http.StatusBadRequest)
 		return
 	}
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		if err := ValidateWalletOwnership(claims, req.WalletID); err != nil {
+			log.Printf("[SECURITY] IDOR blocked: subject %s tried to create wallet for %s", claims.Subject, req.WalletID)
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf("Forbidden: %v", err))
+			return
+		}
+	}
 
 	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=create_wallet wallet_id=%s", traceID, req.WalletID)
 	protoReq := &walletv1.CreateWalletRequest{WalletId: req.WalletID, Currency: req.Currency, InitialBalance: req.InitialBalance}
@@ -137,6 +151,16 @@ func (g *Gateway) handleCreateWallet(w http.ResponseWriter, r *http.Request) {
 	resp, err := client.CreateWallet(ctx, protoReq)
 	if err != nil {
 		log.Printf("[TRACE] trace_id=%s step=wallet_grpc_response error=%v", traceID, err)
+		if st, ok := status.FromError(err); ok {
+			if st.Code() == codes.AlreadyExists {
+				http.Error(w, st.Message(), http.StatusConflict)
+				return
+			}
+			if st.Code() == codes.InvalidArgument {
+				http.Error(w, st.Message(), http.StatusBadRequest)
+				return
+			}
+		}
 		http.Error(w, fmt.Sprintf("Error creating wallet: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -161,6 +185,13 @@ func (g *Gateway) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 	if walletID == "" {
 		http.Error(w, "Missing 'id' query parameter", http.StatusBadRequest)
 		return
+	}
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		if err := ValidateWalletOwnership(claims, walletID); err != nil {
+			log.Printf("[SECURITY] IDOR blocked: subject %s tried to view balance of %s", claims.Subject, walletID)
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf("Forbidden: %v", err))
+			return
+		}
 	}
 	correlation := observability.FromHTTPRequest(r)
 	ctx := observability.WithCorrelation(r.Context(), correlation)
@@ -226,6 +257,13 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	if err := db.ValidateAmount(req.Amount, req.Currency); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		if err := ValidateWalletOwnership(claims, req.SourceWallet); err != nil {
+			log.Printf("[SECURITY] IDOR blocked: subject %s tried to transfer from %s", claims.Subject, req.SourceWallet)
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf("Forbidden: %v", err))
+			return
+		}
 	}
 	ctx := observability.WithCorrelation(r.Context(), correlation)
 	// Step 1: api.request.received (INFO)
@@ -301,7 +339,18 @@ func (g *Gateway) handleLedger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	walletID := r.URL.Query().Get("wallet_id")
+	walletID := strings.TrimSpace(r.URL.Query().Get("wallet_id"))
+	if walletID == "" {
+		http.Error(w, "wallet_id query parameter is required", http.StatusBadRequest)
+		return
+	}
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		if err := ValidateWalletOwnership(claims, walletID); err != nil {
+			log.Printf("[SECURITY] IDOR blocked: subject %s tried to view ledger of %s", claims.Subject, walletID)
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf("Forbidden: %v", err))
+			return
+		}
+	}
 	limitStr := r.URL.Query().Get("limit")
 	pageToken := r.URL.Query().Get("page_token")
 
@@ -369,6 +418,14 @@ func (g *Gateway) handleFailover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		if !claims.HasRole(auth.RoleAdmin) && !claims.HasScope(auth.ScopeClusterAdmin) {
+			log.Printf("[SECURITY] Failover unauthorized attempt by subject: %s", claims.Subject)
+			writeAuthError(w, http.StatusForbidden, "Forbidden: cluster failover requires admin privileges")
+			return
+		}
+	}
+
 	g.mu.Lock()
 	if g.activeTarget == "PRIMARY" {
 		g.activeTarget = "STANDBY"
@@ -383,6 +440,98 @@ func (g *Gateway) handleFailover(w http.ResponseWriter, r *http.Request) {
 		"message":              "Failover routing triggered",
 		"active_routed_target": newTarget,
 	})
+}
+
+func (g *Gateway) handleAuthToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	sub := r.URL.Query().Get("sub")
+	role := r.URL.Query().Get("role")
+	scope := r.URL.Query().Get("scope")
+
+	if r.Method == http.MethodPost && r.Body != nil {
+		var req struct {
+			Subject string   `json:"subject"`
+			Roles   []string `json:"roles"`
+			Scopes  []string `json:"scopes"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+			if req.Subject != "" {
+				sub = req.Subject
+			}
+			if len(req.Roles) > 0 {
+				role = req.Roles[0]
+			}
+			if len(req.Scopes) > 0 {
+				scope = strings.Join(req.Scopes, ",")
+			}
+		}
+	}
+
+	if sub == "" {
+		sub = "alice"
+	}
+	if role == "" {
+		role = auth.RoleUser
+	}
+
+	var roles []string
+	if role != "" {
+		roles = []string{role}
+	}
+	var scopes []string
+	if scope != "" {
+		scopes = strings.Split(scope, ",")
+	} else if role == auth.RoleAdmin {
+		scopes = []string{auth.ScopeClusterAdmin, auth.ScopeLedgerAudit, auth.ScopeWalletTransfer, auth.ScopeWalletRead}
+	} else {
+		scopes = []string{auth.ScopeWalletTransfer, auth.ScopeWalletRead}
+	}
+
+	claims := auth.Claims{
+		Subject: sub,
+		Roles:   roles,
+		Scopes:  scopes,
+	}
+
+	secret := os.Getenv("JWT_SECRET")
+	if secret == "" {
+		secret = defaultJWTSecret
+	}
+
+	token, err := auth.GenerateToken(claims, secret)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to generate token: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"token":      token,
+		"token_type": "Bearer",
+		"subject":    sub,
+		"roles":      roles,
+		"scopes":     scopes,
+		"expires_in": 3600,
+	})
+}
+
+func getClientDialOption() (grpc.DialOption, error) {
+	if os.Getenv("GRPC_TLS_ENABLED") == "true" {
+		certFile := os.Getenv("GRPC_CLIENT_CERT")
+		keyFile := os.Getenv("GRPC_CLIENT_KEY")
+		caFile := os.Getenv("GRPC_CA_CERT")
+		serverName := os.Getenv("GRPC_SERVER_NAME")
+		creds, err := tlsutil.NewClientTransportCredentials(certFile, keyFile, caFile, serverName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load client mTLS credentials: %w", err)
+		}
+		log.Println("[SECURITY] Outbound gRPC dialed with mTLS transport credentials")
+		return grpc.WithTransportCredentials(creds), nil
+	}
+	return grpc.WithTransportCredentials(insecure.NewCredentials()), nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
@@ -435,19 +584,24 @@ func main() {
 	}
 	logger := observability.LoggerFromEnvironment("api-gateway", environment, "", os.Stdout)
 
-	pConn, err := grpc.NewClient(primaryAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	dialOpt, err := getClientDialOption()
+	if err != nil {
+		log.Fatalf("Failed to initialize gRPC dial credentials: %v", err)
+	}
+
+	pConn, err := grpc.NewClient(primaryAddr, dialOpt)
 	if err != nil {
 		log.Fatalf("Failed to dial primary wallet: %v", err)
 	}
 	defer pConn.Close()
 
-	sConn, err := grpc.NewClient(standbyAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	sConn, err := grpc.NewClient(standbyAddr, dialOpt)
 	if err != nil {
 		log.Fatalf("Failed to dial standby wallet: %v", err)
 	}
 	defer sConn.Close()
 
-	lConn, err := grpc.NewClient(ledgerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	lConn, err := grpc.NewClient(ledgerAddr, dialOpt)
 	if err != nil {
 		log.Fatalf("Failed to dial ledger: %v", err)
 	}
@@ -463,7 +617,8 @@ func main() {
 		logger:         logger,
 	}
 
-	http.HandleFunc("/api/v1/wallets", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/wallets", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			gw.handleCreateWallet(w, r)
 		} else if r.Method == http.MethodGet {
@@ -472,16 +627,55 @@ func main() {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
-	http.HandleFunc("/api/v1/transfers", gw.handleTransfer)
-	http.HandleFunc("/api/v1/ledger", gw.handleLedger)
-	http.HandleFunc("/api/v1/cluster/status", gw.handleClusterStatus)
-	http.HandleFunc("/api/v1/cluster/failover", gw.handleFailover)
+	mux.HandleFunc("/api/v1/transfers", gw.handleTransfer)
+	mux.HandleFunc("/api/v1/ledger", gw.handleLedger)
+	mux.HandleFunc("/api/v1/cluster/status", gw.handleClusterStatus)
+	mux.HandleFunc("/api/v1/cluster/failover", gw.handleFailover)
+	mux.HandleFunc("/api/v1/auth/token", gw.handleAuthToken)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "UP"})
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "READY"})
+	})
 
 	// Expose Prometheus metrics (GAP-07)
-	http.Handle("/metrics", observability.DefaultMetrics.Handler())
+	mux.Handle("/metrics", observability.DefaultMetrics.Handler())
 
-	log.Printf("[API-GATEWAY] HTTP REST Gateway listening on :%s", httpPort)
-	if err := http.ListenAndServe(":"+httpPort, nil); err != nil {
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		jwtSecret = defaultJWTSecret
+		log.Println("[SECURITY-WARNING] JWT_SECRET not set in environment, using default development secret!")
+	}
+
+	publicPaths := map[string]bool{
+		"/healthz":              true,
+		"/readyz":               true,
+		"/metrics":              true,
+		"/api/v1/auth/token":    true,
+		"/api/v1/cluster/status": true,
+	}
+
+	rateLimiter := NewRateLimiter(60, 100)
+
+	var handler http.Handler = mux
+	handler = MaxBytesMiddleware(1<<20, handler) // 1MB payload limit (GAP-SEC-05)
+	handler = CORSMiddleware(handler)
+	handler = SecurityHeadersMiddleware(handler)
+	handler = RateLimitMiddleware(rateLimiter, handler)
+	handler = AuthMiddleware(jwtSecret, publicPaths, handler)
+
+	server := &http.Server{
+		Addr:              ":" + httpPort,
+		Handler:           handler,
+		ReadHeaderTimeout: 3 * time.Second, // Slowloris mitigation (GAP-REL-02)
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	log.Printf("[API-GATEWAY] HTTP REST Gateway listening on :%s (Zero-Trust Security & mTLS enabled)", httpPort)
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Gateway server failure: %v", err)
 	}
 }

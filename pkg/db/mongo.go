@@ -33,6 +33,9 @@ func ConnectWithRetry(ctx context.Context, uri string, maxRetries int) (*mongo.C
 
 	opts := options.Client().ApplyURI(uri)
 	opts.SetServerSelectionTimeout(3 * time.Second)
+	opts.SetMaxPoolSize(100)
+	opts.SetMinPoolSize(10)
+	opts.SetMaxConnIdleTime(5 * time.Minute)
 
 	var client *mongo.Client
 	var err error

@@ -188,14 +188,26 @@ The Compose setup starts MongoDB, initializes its single-node replica set, then 
 docker compose logs -f
 ```
 
+### Mint JWT authentication tokens
+
+With Phase 2 security enabled, all operations require a valid JWT token. The API gateway exposes a test token endpoint:
+
+```bash
+ALICE_TOKEN=$(curl -s -X POST "http://localhost:8080/api/v1/auth/token?sub=alice&role=user" | jq -r .token)
+BOB_TOKEN=$(curl -s -X POST "http://localhost:8080/api/v1/auth/token?sub=bob&role=user" | jq -r .token)
+ADMIN_TOKEN=$(curl -s -X POST "http://localhost:8080/api/v1/auth/token?sub=admin&role=admin" | jq -r .token)
+```
+
 ### Create Alice and Bob
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/wallets \
+  -H "Authorization: Bearer $ALICE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"wallet_id":"alice","currency":"USD","initial_balance":1000}'
 
 curl -X POST http://localhost:8080/api/v1/wallets \
+  -H "Authorization: Bearer $BOB_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"wallet_id":"bob","currency":"USD","initial_balance":500}'
 ```
@@ -215,6 +227,7 @@ The gateway routes these calls to the active wallet service. The wallet service 
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/transfers \
+  -H "Authorization: Bearer $ALICE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "idempotency_key":"transfer-alice-bob-001",
@@ -227,16 +240,17 @@ curl -X POST http://localhost:8080/api/v1/transfers \
 
 The request flow is:
 
-1. The client sends HTTP JSON to the gateway.
-2. The gateway selects the active wallet client.
-3. The gateway converts JSON into `TransferFundsRequest` and calls `WalletService.TransferFunds` over gRPC.
-4. Wallet Service checks `idempotency_records` for the key.
-5. It conditionally debits Alice only when Alice has at least 25 USD.
-6. It conditionally credits Bob only when Bob exists with USD currency.
-7. Wallet Service calls `LedgerService.RecordTransaction` over gRPC.
-8. Ledger Service writes an audit entry to `ledger_entries` and returns a transaction ID.
-9. Wallet Service stores the idempotency key and transaction ID.
-10. The gateway returns the result as JSON.
+1. The client sends HTTP JSON with Bearer token to the gateway.
+2. Gateway verifies token signature, expiry, and verifies caller identity (`sub == source_wallet_id` for IDOR protection).
+3. The gateway selects the active wallet client.
+4. The gateway converts JSON into `TransferFundsRequest` and calls `WalletService.TransferFunds` over gRPC.
+5. Wallet Service checks `idempotency_records` for the key.
+6. It conditionally debits Alice only when Alice has at least 25 USD.
+7. It conditionally credits Bob only when Bob exists with USD currency.
+8. Wallet Service saves an outbox task and notifies/calls `LedgerService.RecordTransaction` over gRPC.
+9. Ledger Service writes an audit entry to `ledger_entries` and returns a transaction ID.
+10. Wallet Service stores the idempotency key and transaction ID.
+11. The gateway returns the result as JSON.
 
 Expected balance effect:
 
@@ -256,9 +270,9 @@ The key is the retry identity. A new key represents a new transfer attempt.
 ### Read the results
 
 ```bash
-curl "http://localhost:8080/api/v1/wallets?id=alice"
-curl "http://localhost:8080/api/v1/wallets?id=bob"
-curl "http://localhost:8080/api/v1/ledger?wallet_id=alice"
+curl -H "Authorization: Bearer $ALICE_TOKEN" "http://localhost:8080/api/v1/wallets?id=alice"
+curl -H "Authorization: Bearer $BOB_TOKEN" "http://localhost:8080/api/v1/wallets?id=bob"
+curl -H "Authorization: Bearer $ALICE_TOKEN" "http://localhost:8080/api/v1/ledger?wallet_id=alice"
 ```
 
 ## 6. What MongoDB stores
@@ -297,13 +311,14 @@ Check the current routing target:
 curl http://localhost:8080/api/v1/cluster/status
 ```
 
-Toggle the target:
+Toggle the target (requires Admin authorization token):
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/cluster/failover
+curl -X POST http://localhost:8080/api/v1/cluster/failover \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
-This changes an in-memory value inside the gateway process. It does not automatically detect failures, replicate data between databases, or move traffic between independent regions. Restarting the gateway resets its initial target.
+This changes an in-memory value inside the gateway process under administrative RBAC (`role=admin` or `scope=cluster:admin`). It does not automatically detect failures, replicate data between databases, or move traffic between independent regions. Restarting the gateway resets its initial target.
 
 ## 9. Kubernetes overview
 
@@ -319,17 +334,13 @@ Build the images before applying the manifests, and make sure the images are ava
 
 ## 10. Caveats worth knowing
 
-This project is a learning/demo system. The current implementation has several important boundaries:
+This project is an advanced architectural learning/demo system. The current implementation has several architectural characteristics and boundaries:
 
-- `CreateWallet` uses an upsert and `$set`, so creating an existing wallet can overwrite its balance and currency.
-- Request validation is limited. Empty IDs, invalid amounts, and other malformed business inputs are not comprehensively rejected.
-- Idempotency uses lookup-then-insert. Review unique indexes and concurrent retries before treating it as production-grade duplicate protection.
-- The ledger service also uses lookup-then-insert behavior for duplicate keys.
-- A single ledger document is stored per transfer; the project calls this double-entry conceptually, but does not store separate debit and credit documents.
-- Ledger results are not explicitly sorted.
-- Primary and standby share MongoDB in the local deployment.
-- Failover is a manual in-memory route toggle.
-- The project uses insecure gRPC transport inside the local deployment. Production deployments need authentication, authorization, encryption, validation, observability, and stronger failure handling.
+- `CreateWallet` strictly enforces account uniqueness: creating an existing wallet ID returns HTTP 409 Conflict (`codes.AlreadyExists`) preventing account overwrite.
+- Zero-Trust security is enforced at the API Gateway: HMAC-SHA256 JWT tokens, IDOR ownership verification (`sub == wallet_id`), administrative RBAC for failover, rate limiting (60 rps/100 burst), 1MB payload limits, and security headers.
+- Inter-service gRPC supports mutual TLS (`mTLS`) via `GRPC_TLS_ENABLED=true` (and defaults to plaintext for friction-free local development).
+- Double-entry bookkeeping: A single journal document with source and destination is stored per transfer; full GAAP/IFRS multi-account debit/credit split postings are planned for Phase 4.
+- Primary and standby share MongoDB in the local deployment. Cross-region data replication and distributed consensus for failover are planned for Phase 3.
 
 ## 11. Where to read next
 

@@ -111,4 +111,23 @@ func TestCreateWalletValidation(t *testing.T) {
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("expected InvalidArgument for negative balance, got %v", err)
 	}
+
+	// Missing wallet ID
+	_, err = service.CreateWallet(context.Background(), &walletv1.CreateWalletRequest{
+		WalletId:       "",
+		Currency:       "USD",
+		InitialBalance: 100,
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for empty wallet ID, got %v", err)
+	}
 }
+
+func TestGetBalanceRejectsMissingWalletID(t *testing.T) {
+	service := &server{region: "test-region"}
+	_, err := service.GetBalance(context.Background(), &walletv1.GetBalanceRequest{WalletId: ""})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for empty wallet ID, got %v", err)
+	}
+}
+

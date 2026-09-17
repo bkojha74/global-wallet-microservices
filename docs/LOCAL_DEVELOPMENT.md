@@ -429,6 +429,9 @@ $env:PRIMARY_WALLET_ADDR = "127.0.0.1:50051"
 $env:STANDBY_WALLET_ADDR = "127.0.0.1:50053"
 $env:LEDGER_ADDR = "127.0.0.1:50052"
 $env:LOGGING_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
+$env:JWT_SECRET = "dev-secret-key-change-in-production"
+# Optional: enable mTLS across all gRPC services (requires running `go run scripts/generate_certs.go` first)
+# $env:GRPC_TLS_ENABLED = "true"
 go run .\cmd\api-gateway
 ```
 
@@ -459,51 +462,98 @@ The gateway selects the primary wallet service initially. The failover endpoint 
 
 ## 5. Test the local HTTP API
 
-Use `Invoke-RestMethod` for JSON POST requests in PowerShell. It preserves JSON quoting reliably. `curl.exe` is fine for simple GET requests.
+With **Phase 2 (Zero-Trust Security & Identity)** active, the API Gateway enforces cryptographic JWT Bearer authentication, Insecure Direct Object Reference (IDOR) verification, rate limiting, and administrative RBAC.
 
-### Check service status
+Unauthenticated calls or calls acting on another user's wallet without an `admin` role will return `401 Unauthorized` or `403 Forbidden`.
+
+### 5.0 Mint JWT Authentication Tokens
+
+The gateway provides a local development minting endpoint `POST /api/v1/auth/token`. Mint tokens for `alice` (standard user), `bob` (standard user), and `admin` (operations administrator):
 
 ```powershell
+$AliceToken = (Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/auth/token?sub=alice&role=user").token
+$BobToken   = (Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/auth/token?sub=bob&role=user").token
+$AdminToken = (Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/auth/token?sub=admin&role=admin").token
+
+$AliceHeaders = @{ Authorization = "Bearer $AliceToken" }
+$BobHeaders   = @{ Authorization = "Bearer $BobToken" }
+$AdminHeaders = @{ Authorization = "Bearer $AdminToken" }
+```
+
+### 5.1 Check service health & status (Public)
+
+```powershell
+curl.exe http://127.0.0.1:8080/healthz
+curl.exe http://127.0.0.1:8080/readyz
 curl.exe http://127.0.0.1:8080/api/v1/cluster/status
 ```
 
-### Create wallets
+### 5.2 Create wallets
+
+Create initial wallets for Alice and Bob. Note: If a wallet ID already exists, the API returns `409 Conflict`:
 
 ```powershell
 $body = @{ wallet_id = "alice"; currency = "USD"; initial_balance = 1000 } | ConvertTo-Json -Compress
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/wallets" -ContentType "application/json" -Body $body | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/wallets" -Headers $AliceHeaders -ContentType "application/json" -Body $body | ConvertTo-Json
 
 $body = @{ wallet_id = "bob"; currency = "USD"; initial_balance = 500 } | ConvertTo-Json -Compress
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/wallets" -ContentType "application/json" -Body $body | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/wallets" -Headers $BobHeaders -ContentType "application/json" -Body $body | ConvertTo-Json
 ```
 
-### Transfer funds
+### 5.3 Transfer funds & test idempotency
 
-Use a unique idempotency key for a new transfer:
+Alice transfers $250 USD to Bob:
 
 ```powershell
 $body = @{ idempotency_key = "local-tx-001"; source_wallet_id = "alice"; destination_wallet_id = "bob"; amount = 250; currency = "USD" } | ConvertTo-Json -Compress
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/transfers" -ContentType "application/json" -Body $body | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/transfers" -Headers $AliceHeaders -ContentType "application/json" -Body $body | ConvertTo-Json
 ```
 
-Repeat the exact command. The second response should have status `REJECTED_DUPLICATE` and must not debit Alice again.
+Repeat the exact command with the same `idempotency_key`. The second response returns the cached transaction with status `REJECTED_DUPLICATE` and will not debit Alice again.
 
-### Read balances and ledger entries
+### 5.4 Test IDOR security (Insecure Direct Object Reference)
+
+Attempting to read Bob's balance using Alice's token is blocked:
 
 ```powershell
-curl.exe "http://127.0.0.1:8080/api/v1/wallets?id=alice"
-curl.exe "http://127.0.0.1:8080/api/v1/wallets?id=bob"
-curl.exe "http://127.0.0.1:8080/api/v1/ledger?wallet_id=alice"
+# Expected: 403 Forbidden (claims.Subject != wallet_id)
+curl.exe -i -H "Authorization: Bearer $AliceToken" "http://127.0.0.1:8080/api/v1/wallets?id=bob"
 ```
 
-### Test failover
+Authorized balance and ledger inquiries:
 
 ```powershell
-curl.exe -X POST http://127.0.0.1:8080/api/v1/cluster/failover
+curl.exe -s -H "Authorization: Bearer $AliceToken" "http://127.0.0.1:8080/api/v1/wallets?id=alice"
+curl.exe -s -H "Authorization: Bearer $BobToken" "http://127.0.0.1:8080/api/v1/wallets?id=bob"
+curl.exe -s -H "Authorization: Bearer $AliceToken" "http://127.0.0.1:8080/api/v1/ledger?wallet_id=alice"
+```
+
+### 5.5 Test failover (Requires Admin RBAC)
+
+Attempting failover without an admin token returns `401 Unauthorized` or `403 Forbidden`. Execute failover using `$AdminHeaders`:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/cluster/failover" -Headers $AdminHeaders | ConvertTo-Json
 curl.exe http://127.0.0.1:8080/api/v1/cluster/status
 ```
 
-The second transfer after failover should report the standby region. Both wallet processes use the same local MongoDB, so both can see the same wallet data.
+### 5.6 Automated Testing via Postman or Bruno
+
+A complete, 24-test automated suite is provided in the repository under [postman/](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/postman):
+- `postman/Global_Wallet_Microservices.postman_collection.json`
+- `postman/Global_Wallet_Local.postman_environment.json`
+
+**To run in Postman or Bruno**:
+1. Open Postman or Bruno.
+2. In Bruno: Click **Import Collection** -> Select **Postman Collection** -> choose `postman/Global_Wallet_Microservices.postman_collection.json`. Then import the environment file.
+3. In Postman: Click **Import** -> Select both files -> Select the `Global Wallet (Local Environment)` environment.
+4. Run the full collection to automatically verify:
+   - System Health (`/healthz`, `/readyz`, `/api/v1/cluster/status`)
+   - Authentication & Token Minting (`/api/v1/auth/token`)
+   - Security Protections (Missing Auth 401, Invalid Token 401, IDOR 403, Rate Limiting 429)
+   - Wallet Management (Alice $1000, Bob $500, Duplicate 409 Conflict)
+   - Transfers & Idempotency (Atomic transfer, duplicate key replay, insufficient funds)
+   - Disaster Recovery Failover (Admin-only failover, route verification, reset)
 
 ## 6. Trace one transaction in logs
 
@@ -705,10 +755,13 @@ $status = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:8080/api/v1/clust
 $status | ConvertTo-Json -Depth 5
 ```
 
-The initial `current_routed_target` should be `PRIMARY`. Toggle to standby:
+The initial `current_routed_target` should be `PRIMARY`. Toggle to standby (requires Admin token):
 
 ```powershell
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/cluster/failover" | ConvertTo-Json
+$AdminToken = (Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/auth/token?sub=admin&role=admin").token
+$AdminHeaders = @{ Authorization = "Bearer $AdminToken" }
+
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/cluster/failover" -Headers $AdminHeaders | ConvertTo-Json
 $status = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:8080/api/v1/cluster/status"
 $status | ConvertTo-Json -Depth 5
 ```
@@ -718,15 +771,18 @@ The route should now be `STANDBY`. Create or transfer a wallet and verify the re
 To simulate primary application failure while traffic is on standby:
 
 ```powershell
+$AliceToken = (Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/auth/token?sub=alice&role=user").token
+$AliceHeaders = @{ Authorization = "Bearer $AliceToken" }
+
 docker stop wallet_primary_active
-Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:8080/api/v1/wallets?id=alice" | ConvertTo-Json
+Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:8080/api/v1/wallets?id=alice" -Headers $AliceHeaders | ConvertTo-Json
 docker start wallet_primary_active
 ```
 
 The balance request should still succeed through standby. Restore the gateway route when finished:
 
 ```powershell
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/cluster/failover" | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/cluster/failover" -Headers $AdminHeaders | ConvertTo-Json
 ```
 
 Verify the single MongoDB member with:

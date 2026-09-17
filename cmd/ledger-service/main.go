@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -21,6 +22,7 @@ import (
 
 	"wallet-system/pkg/db"
 	"wallet-system/pkg/observability"
+	"wallet-system/pkg/tlsutil"
 	ledgerv1 "wallet-system/proto/ledger"
 )
 
@@ -133,6 +135,17 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 	_, err = col.InsertOne(ctx, doc)
 	durationMS := time.Since(startTime).Milliseconds()
 	if err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			log.Printf("[LEDGER] Race detected: Duplicate transaction key on insert: %s", req.IdempotencyKey)
+			var dupDoc LedgerDocument
+			if findErr := col.FindOne(ctx, bson.M{"idempotency_key": req.IdempotencyKey}).Decode(&dupDoc); findErr == nil {
+				s.emitTerminal(ctx, "ledger.transaction.duplicate", observability.LevelInfo, "Duplicate ledger transaction detected", durationMS, true, map[string]any{"transaction_id": dupDoc.ID.Hex()})
+				return &ledgerv1.RecordTransactionResponse{
+					TransactionId: dupDoc.ID.Hex(),
+					Success:       true,
+				}, nil
+			}
+		}
 		log.Printf("[LEDGER] Error persisting audit record: %v", err)
 		s.emitTerminal(ctx, "ledger.record.failed", observability.LevelError, "Failed to persist ledger record", durationMS, false, map[string]any{"error": err.Error()})
 		return &ledgerv1.RecordTransactionResponse{
@@ -185,6 +198,10 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 }
 
 func (s *server) GetLedgerEntries(ctx context.Context, req *ledgerv1.GetLedgerRequest) (*ledgerv1.GetLedgerResponse, error) {
+	if req == nil || strings.TrimSpace(req.WalletId) == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "wallet_id is required")
+	}
+
 	col := s.mongoClient.Database("banking_db").Collection("ledger_entries")
 
 	filter := bson.M{
@@ -258,6 +275,21 @@ func environmentName() string {
 	return "local"
 }
 
+func getLedgerServerOptions() ([]grpc.ServerOption, error) {
+	if os.Getenv("GRPC_TLS_ENABLED") == "true" {
+		certFile := os.Getenv("GRPC_SERVER_CERT")
+		keyFile := os.Getenv("GRPC_SERVER_KEY")
+		caFile := os.Getenv("GRPC_CA_CERT")
+		creds, err := tlsutil.NewServerTransportCredentials(certFile, keyFile, caFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load ledger server mTLS credentials: %w", err)
+		}
+		log.Println("[SECURITY] Ledger gRPC server configured with mTLS transport credentials")
+		return []grpc.ServerOption{grpc.Creds(creds)}, nil
+	}
+	return nil, nil
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -290,7 +322,11 @@ func main() {
 		log.Fatalf("Failed to listen: %v", err)
 	}
 
-	grpcServer := grpc.NewServer()
+	serverOpts, err := getLedgerServerOptions()
+	if err != nil {
+		log.Fatalf("Failed to configure server mTLS credentials: %v", err)
+	}
+	grpcServer := grpc.NewServer(serverOpts...)
 
 	// Phase 5 (GAP-10): initialise transactional outbox when enabled.
 	var ledgerOutbox *observability.MongoOutbox

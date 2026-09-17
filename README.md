@@ -2,6 +2,8 @@
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go&logoColor=white)](https://golang.org)
+[![Microservices](https://img.shields.io/badge/Architecture-Event--Driven_Microservices-blueviolet)](README.md#key-architectural-pillars)
+[![Zero-Trust Security](https://img.shields.io/badge/Security-Zero--Trust_mTLS_%26_JWT-success?logo=security&logoColor=white)](SECURITY.md)
 [![gRPC](https://img.shields.io/badge/gRPC-Protobuf_v3-244c5a?logo=grpc&logoColor=white)](https://grpc.io)
 [![Database](https://img.shields.io/badge/MongoDB-7.0_Replica_Set_ACID-47A248?logo=mongodb&logoColor=white)](https://www.mongodb.com)
 [![Message Broker](https://img.shields.io/badge/RabbitMQ-3.13_AMQP-FF6600?logo=rabbitmq&logoColor=white)](https://www.rabbitmq.com)
@@ -14,11 +16,15 @@ A production-grade, distributed microservices platform for atomic multi-currency
 ## Table of Contents
 
 - [System Overview](#system-overview)
+- [Key Architectural Pillars](#key-architectural-pillars)
+  - [🏛️ Domain-Driven Microservices Architecture](#️-domain-driven-microservices-architecture)
+  - [🛡️ Zero-Trust Security & Identity Model](#️-zero-trust-security--identity-model)
 - [Pictorial Architecture & Flow Representations](#pictorial-architecture--flow-representations)
   - [1. High-Level System Architecture](#1-high-level-system-architecture)
   - [2. End-to-End Atomic Transfer & Transactional Outbox Flow](#2-end-to-end-atomic-transfer--transactional-outbox-flow)
   - [3. Multi-Region Active-Standby Failover Flow](#3-multi-region-active-standby-failover-flow)
   - [4. Asynchronous Centralized Logging & Resilient Disk Spooling](#4-asynchronous-centralized-logging--resilient-disk-spooling)
+  - [5. Zero-Trust Security Architecture & Ingress Defense Pipeline](#5-zero-trust-security-architecture--ingress-defense-pipeline)
 - [Microservice Directory & Port Matrix](#microservice-directory--port-matrix)
 - [Implementation Status & Production Readiness Roadmap](#implementation-status--production-readiness-roadmap)
   - [Completed Implementations](#completed-implementations)
@@ -43,6 +49,67 @@ The **Global Multi-Currency Digital Wallet & Ledger Service** is engineered to d
 * **Active-Standby Multi-Region Disaster Recovery**: Simulated multi-region architecture (`us-east-1` Primary Active, `eu-west-1` Standby Hot DR) featuring dynamic routing switchover at the API Gateway.
 * **Resilient Centralized Logging Ecosystem**: Non-blocking asynchronous event emission to RabbitMQ with automatic local JSONL disk spooling and backpressure-aware background replay workers.
 * **Operational Tracing & Observability**: Correlation IDs (`association_id`, `idempotency_key`, `transaction_id`) propagated across gRPC metadata and HTTP headers, with a dedicated Log Query API, Prometheus metrics, and preconfigured Grafana dashboards.
+
+---
+
+## Key Architectural Pillars
+
+> [!IMPORTANT]
+> The platform is built around two foundational design paradigms: **Independent Event-Driven Microservices** for domain isolation and horizontal scalability, and a **Zero-Trust Security Model** enforcing continuous verification across both public and inter-service boundaries.
+
+### 🏛️ Domain-Driven Microservices Architecture
+
+The system decomposes financial operations into autonomous, loosely-coupled microservices with clearly bounded contexts:
+
+| Microservice Component | Protocol & Ports | Architectural Role | Bounded Context & Persistence |
+|---|---|---|---|
+| **API Gateway** | HTTP `:8080`<br>Prometheus `:8081` | • Edge ingress & HTTP REST-to-gRPC translation<br>• 6-layer defense-in-depth security pipeline<br>• Dynamic Active-Standby failover router | Stateless |
+| **Wallet Service (Primary)** | gRPC `:50051` | • Core banking engine for `us-east-1-primary`<br>• Multi-document ACID transactions (`Majority`/`Snapshot`)<br>• Atomic Transactional Outbox relay for ledger decoupling | `banking_db.wallets`<br>`banking_db.idempotency_records`<br>`banking_db.ledger_tasks` (Outbox) |
+| **Wallet Service (Standby)** | gRPC `:50053` | • Hot disaster recovery replica for `eu-west-1-standby`<br>• Real-time takeover target with identical business engine | Shared replica set `rs0`<br>(instant failover target) |
+| **Ledger Service** | gRPC `:50052` | • Immutable financial journal & audit ledger<br>• Reverse-chronological cursor-based queries<br>• Compound and unique indexing eliminating COLLSCAN | `banking_db.ledger_entries` |
+| **Logging Service** | HTTP `:8090`<br>Prometheus `:9090` | • High-throughput AMQP event consumer & deduplicator<br>• Operational log search API & trace reconstruction<br>• Dead-letter queue governance (`wallet.logging.dead.v1`) | `logging_db.events` |
+
+* **Strict Contract-First Communication**: Internal inter-service communication operates exclusively over gRPC using Protobuf v3 contracts (`proto/wallet/wallet.proto` and `proto/ledger/ledger.proto`), guaranteeing type safety, high throughput, and backward compatibility.
+* **Decoupled Transactional Outbox Pattern**: Prevents distributed transaction deadlocks by eliminating cross-service RPCs from inside database transactions. Debit/credit updates and an outbox task are committed atomically; an asynchronous relay delivers ledger records with guaranteed at-least-once semantics.
+* **Resilient Asynchronous Messaging**: Event logging is completely offloaded from the transactional path via RabbitMQ direct exchanges and durable quorum queues, featuring local disk-spooling fallback to withstand broker outages.
+
+---
+
+### 🛡️ Zero-Trust Security & Identity Model
+
+Operating under the foundational principle of **"Never Trust, Always Verify"**, the system enforces end-to-end cryptographic authentication, fine-grained access control, and transport encryption across all actors and network hops:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                               ZERO-TRUST ENFORCEMENT MATRIX                                 │
+├─────────────────────────┬─────────────────────────────┬─────────────────────────────────────┤
+│ Security Vector         │ Enforcement Mechanism       │ Technical Implementation            │
+├─────────────────────────┼─────────────────────────────┼─────────────────────────────────────┤
+│ 1. External AuthN       │ Cryptographic HMAC-SHA256   │ Validates token signature, issuer,  │
+│                         │ JSON Web Tokens (JWT)       │ audience, and expiration on all APIs│
+├─────────────────────────┼─────────────────────────────┼─────────────────────────────────────┤
+│ 2. Data Access (IDOR)   │ Subject Ownership Check     │ Enforces claims.sub == wallet_id;   │
+│                         │ (AuthZ)                     │ cross-account access yields 403     │
+├─────────────────────────┼─────────────────────────────┼─────────────────────────────────────┤
+│ 3. Operations Control   │ Administrative RBAC         │ /cluster/failover requires role:    │
+│                         │ & Scope Verification        │ 'admin' or scope: 'cluster:admin'   │
+├─────────────────────────┼─────────────────────────────┼─────────────────────────────────────┤
+│ 4. Internal Transport   │ Mutual TLS (mTLS)           │ Bidirectional x509 cert validation  │
+│                         │ for gRPC                    │ (tls.RequireAndVerifyClientCert)    │
+├─────────────────────────┼─────────────────────────────┼─────────────────────────────────────┤
+│ 5. Perimeter Protection │ Defense-in-Depth Middleware │ Rate limiting (60 rps/100 burst),   │
+│                         │ Pipeline                    │ 1MB max body, HSTS, CSP, nosniff    │
+├─────────────────────────┼─────────────────────────────┼─────────────────────────────────────┤
+│ 6. Account Integrity    │ Atomic Uniqueness Guard     │ InsertOne duplicate rejection (409  │
+│                         │                             │ Conflict) prevents account overwrite│
+└─────────────────────────┴─────────────────────────────┴─────────────────────────────────────┘
+```
+
+1. **Perimeter Defense-in-Depth**: Every incoming request must traverse a comprehensive middleware pipeline at the API Gateway: Security Headers (HSTS, CSP, X-Frame-Options: DENY, X-Content-Type-Options: nosniff), MaxBytes (1MB payload limit), CORS, Token-Bucket Rate Limiter (60 req/s, 100 burst), and JWT Bearer validation.
+2. **Insecure Direct Object Reference (IDOR) Immunity**: Callers can only perform balance checks, fund transfers, or ledger queries on wallets matching their authenticated JWT subject (`sub`). Attempts to manipulate another party's wallet are immediately rejected with `403 Forbidden` unless the caller possesses verified administrative privileges.
+3. **Internal Zero-Trust Mesh via Mutual TLS (mTLS)**: Cleartext gRPC is eliminated. The API Gateway and all core microservices mandate bidirectional x509 certificate verification (`tls.RequireAndVerifyClientCert`) with dedicated Root CA verification, preventing MITM attacks and pod-to-pod impersonation.
+4. **Resilience & Anti-Abuse**: Explicit server timeouts (`ReadHeaderTimeout: 3s`, `ReadTimeout: 10s`) neutralize Slowloris attacks; token-bucket algorithms mitigate brute-force and DoS floods.
+
 
 ---
 
@@ -274,6 +341,40 @@ flowchart LR
 
 ---
 
+### 5. Zero-Trust Security Architecture & Ingress Defense Pipeline
+
+The following diagram illustrates how every inbound request is authenticated and verified through the **Gateway Defense-in-Depth Pipeline** and routed across the internal **Zero-Trust Mutual TLS (mTLS) Mesh**:
+
+```mermaid
+graph TD
+    Client["HTTP / REST Client"] -->|"1. HTTPS + Bearer JWT"| GW["API Gateway (:8080)"]
+
+    subgraph IngressDefense["API Gateway Defense-in-Depth Pipeline"]
+        GW --> M1["SecurityHeadersMiddleware<br/>HSTS, CSP, X-Frame-Options: DENY, nosniff"]
+        M1 --> M2["MaxBytesMiddleware<br/>1MB Body Limit (Anti-DoS)"]
+        M2 --> M3["CORSMiddleware<br/>Preflight & Origin Filtering"]
+        M3 --> M4["RateLimitMiddleware<br/>Token Bucket: 60 rps, 100 burst per IP"]
+        M4 --> M5["AuthMiddleware<br/>HMAC-SHA256 Token Validation"]
+        M5 --> M6{"IDOR & RBAC Validator"}
+    end
+
+    M6 -->|"sub == wallet_id (or admin)"| Allow["Authorized Domain Operation"]
+    M6 -->|"sub != wallet_id"| DenyIDOR["403 Forbidden: IDOR Blocked"]
+    M6 -->|"Failover Endpoint"| CheckAdmin{"Role: admin / Scope: cluster:admin?"}
+    CheckAdmin -->|Yes| ExecFailover["POST /api/v1/cluster/failover"]
+    CheckAdmin -->|No| DenyAdmin["403 Forbidden: Admin Role Required"]
+
+    subgraph ZeroTrustMesh["Internal Zero-Trust Network (Mutual TLS / mTLS)"]
+        Allow -->|"gRPC over mTLS (Verified Client Cert)"| WP["wallet-primary (:50051)<br/>tls.RequireAndVerifyClientCert"]
+        Allow -->|"gRPC over mTLS (Verified Client Cert)"| WS["wallet-standby (:50053)<br/>tls.RequireAndVerifyClientCert"]
+        Allow -->|"gRPC over mTLS (Verified Client Cert)"| LS["ledger-service (:50052)<br/>tls.RequireAndVerifyClientCert"]
+        WP -->|"gRPC over mTLS"| LS
+        WS -->|"gRPC over mTLS"| LS
+    end
+```
+
+---
+
 ## Microservice Directory & Port Matrix
 
 | Service | Container Name | Protocol / Ports | Role & Responsibilities |
@@ -301,7 +402,7 @@ graph TD
 
     P1["Phase 1: Financial & Persistence Hardening<br/>(COMPLETED)"]:::completed
     L15["Centralized Asynchronous Logging (Phases 1-5)<br/>(COMPLETED)"]:::completed
-    P2["Phase 2: Zero-Trust Security & Identity<br/>(PLANNED)"]:::planned
+    P2["Phase 2: Zero-Trust Security & Identity<br/>(COMPLETED)"]:::completed
     P3["Phase 3: High Availability & Tracing<br/>(PLANNED)"]:::planned
     P4["Phase 4: Cloud-Native & Double-Entry<br/>(PLANNED)"]:::planned
 
@@ -327,17 +428,18 @@ graph TD
 - [x] **Operational Log & Trace Query REST API (Phase 4)**: Added `/api/v1/logs` with rich multi-field filtering and `/api/v1/traces/{association_id}` to reconstruct the full distributed 12-step transaction timeline with latency metrics.
 - [x] **Production Hardening & Monitoring (Phase 5)**: Configured TLS transport, quorum queue support, scheduled data retention cleaner, API key access control, Prometheus metrics exporter (`:9090`), Grafana dashboards, and audit-critical transactional outbox.
 
+#### 3. Zero-Trust Security & Identity (Phase 2)
+- [x] **JWT Gateway Authentication & Token Minting (GAP-SEC-01)**: Implemented cryptographic HMAC-SHA256 JWT validation at API Gateway with claims schema (`sub`, `roles`, `scopes`, `exp`). Added dev minting endpoint `/api/v1/auth/token`.
+- [x] **Insecure Direct Object Reference (IDOR) Protection (GAP-SEC-01)**: Enforced identity ownership (`sub == wallet_id`) across transfers, balance inquiries, and ledger queries. Cross-account access is strictly rejected with HTTP 403 Forbidden unless caller possesses `admin` role.
+- [x] **Administrative Access Control for Failover (GAP-SEC-03)**: Restricted `POST /api/v1/cluster/failover` behind administrative RBAC requiring role `admin` or scope `cluster:admin`.
+- [x] **Mutual TLS (mTLS) for Inter-Service gRPC (GAP-SEC-02)**: Configured bidirectional TLS verification with `tls.RequireAndVerifyClientCert` and root CA pools across `api-gateway`, `wallet-service`, and `ledger-service`. Activated dynamically via `GRPC_TLS_ENABLED=true` with standalone cert generator script (`scripts/generate_certs.go`).
+- [x] **Gateway Defense-in-Depth (GAP-SEC-05 & GAP-REL-02)**: Token-bucket rate limiting (60 rps, 100 burst), 1MB payload limits (`http.MaxBytesReader`), standard security headers (`HSTS`, `CSP`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`), and Slowloris timeout protection (`ReadHeaderTimeout: 3s`).
+- [x] **Duplicate Wallet Prevention**: Enforced strict `InsertOne` semantics with `codes.AlreadyExists` / HTTP 409 Conflict preventing account balance overwrites.
+- [x] **Secrets & Configuration Management (GAP-SEC-04)**: Externalized all configuration and certificate paths into `.env.example`.
+
 ---
 
 ### Planned Roadmap (Yet to be Implemented)
-
-#### Phase 2: Zero-Trust Security & Identity (Upcoming)
-- [ ] **JWT / OAuth2 / OIDC Gateway Authentication (GAP-SEC-01)**: Secure all client-facing REST endpoints with token validation and claim inspection.
-- [ ] **Fine-Grained RBAC & Tenant Authorization (GAP-SEC-01)**: Enforce scopes (`wallet:read`, `wallet:transfer`, `cluster:admin`, `ledger:audit`) and verify subject ownership against wallet identity.
-- [ ] **Mutual TLS (mTLS) for Inter-Service gRPC (GAP-SEC-02)**: Replace `insecure.NewCredentials()` with mutual TLS authentication and x509 certificate validation.
-- [ ] **Secured Cluster Administration (GAP-SEC-03)**: Protect `/api/v1/cluster/failover` with administrative RBAC, audit trailing, and cryptographic approval.
-- [ ] **Gateway Defense-in-Depth (GAP-SEC-05)**: Implement distributed token-bucket rate limiting, request body bounds (`http.MaxBytesReader`), and standard HTTP security headers (HSTS, CSP, X-Frame-Options).
-- [ ] **Vault & Secrets Management (GAP-SEC-04)**: Eliminate cleartext credentials from Compose files; integrate HashiCorp Vault / Kubernetes Secrets and enable MongoDB `SCRAM-SHA-256` authentication.
 
 #### Phase 3: High Availability, Resilience & Tracing (Upcoming)
 - [ ] **Graceful Process Lifecycle (GAP-REL-01)**: Implement OS signal interception (`SIGTERM`/`SIGINT`) with connection draining on HTTP servers and `grpcServer.GracefulStop()` across all services.
@@ -409,17 +511,30 @@ make status      # Check container health and status
 
 ## Interactive API Verification Guide (cURL)
 
+### 0. Mint JWT Authentication Tokens (Phase 2)
+Generate signed test tokens for Alice (user) and Ops Admin:
+
+```bash
+# Mint user token for Alice
+ALICE_TOKEN=$(curl -s -X POST "http://localhost:8080/api/v1/auth/token?sub=alice&role=user" | jq -r .token)
+
+# Mint admin token for Ops
+ADMIN_TOKEN=$(curl -s -X POST "http://localhost:8080/api/v1/auth/token?sub=ops-admin&role=admin" | jq -r .token)
+```
+
 ### 1. Create Wallets
 Create accounts for Alice and Bob in USD:
 
 ```bash
 # Create Alice's Wallet ($1,000 USD)
 curl -s -X POST http://localhost:8080/api/v1/wallets \
+  -H "Authorization: Bearer $ALICE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"wallet_id":"alice","currency":"USD","initial_balance":1000}' | jq .
 
 # Create Bob's Wallet ($500 USD)
 curl -s -X POST http://localhost:8080/api/v1/wallets \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"wallet_id":"bob","currency":"USD","initial_balance":500}' | jq .
 ```
@@ -429,6 +544,7 @@ Execute an atomic transfer of $250 USD from Alice to Bob:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/v1/transfers \
+  -H "Authorization: Bearer $ALICE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "idempotency_key": "tx-prod-001",
@@ -453,6 +569,7 @@ Re-send the exact same transfer request with idempotency key `"tx-prod-001"`. Th
 
 ```bash
 curl -s -X POST http://localhost:8080/api/v1/transfers \
+  -H "Authorization: Bearer $ALICE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "idempotency_key": "tx-prod-001",
@@ -464,10 +581,11 @@ curl -s -X POST http://localhost:8080/api/v1/transfers \
 ```
 
 ### 4. Regional Disaster Recovery Failover Simulation
-Trigger failover from `wallet-primary` (`us-east-1`) to `wallet-standby` (`eu-west-1`):
+Trigger failover from `wallet-primary` (`us-east-1`) to `wallet-standby` (`eu-west-1`) using the Admin token:
 
 ```bash
-curl -s -X POST http://localhost:8080/api/v1/cluster/failover | jq .
+curl -s -X POST http://localhost:8080/api/v1/cluster/failover \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
 ```
 
 *Response:*
@@ -512,6 +630,19 @@ curl -s "http://localhost:8090/api/v1/traces/<association_id>" | jq .
 * **Grafana Dashboards**: [http://localhost:3000](http://localhost:3000) (Credentials: `admin` / `admin`)
 * **RabbitMQ Management Console**: [http://localhost:15672](http://localhost:15672) (Credentials: `guest` / `guest`)
 
+### 9. Automated Testing with Postman or Bruno
+A comprehensive 24-test suite covering all Phase 1 and Phase 2 endpoints and edge cases is included in the `postman/` directory:
+* **Collection**: `postman/Global_Wallet_Microservices.postman_collection.json`
+* **Environment**: `postman/Global_Wallet_Local.postman_environment.json`
+
+Both files can be imported directly into **Postman** or **Bruno** (via *Import Collection* -> *Postman Collection*). The test runner validates:
+1. System Health & Probes (`/healthz`, `/readyz`, `/api/v1/cluster/status`)
+2. Auth & Token Minting (`/api/v1/auth/token` with claims validation)
+3. Zero-Trust Security Gates (Missing token 401, Invalid token 401, IDOR rejection 403, Rate limiter 429)
+4. Wallet Lifecycle (Alice USD $1000, Bob USD $500, Duplicate wallet 409 Conflict)
+5. Transfers & Idempotency (Atomic fund transfers, duplicate key replay, insufficient funds)
+6. Disaster Recovery Failover (Admin-only failover, route verification, reset)
+
 ---
 
 ## Documentation Sitemap
@@ -520,12 +651,15 @@ curl -s "http://localhost:8090/api/v1/traces/<association_id>" | jq .
 |---|---|
 | [docs/PRODUCTION_READINESS_AUDIT.md](docs/PRODUCTION_READINESS_AUDIT.md) | Comprehensive 8-pillar production audit, gap catalog, risk analysis, and 4-phase remediation roadmap. |
 | [docs/PHASE1_IMPLEMENTATION.md](docs/PHASE1_IMPLEMENTATION.md) | Technical deep-dive on Phase 1: transactional outbox pattern, database indexing, TTL, and pagination. |
+| [docs/PHASE2_IMPLEMENTATION.md](docs/PHASE2_IMPLEMENTATION.md) | Technical deep-dive on Phase 2: JWT authentication, RBAC, IDOR protection, inter-service mTLS, rate limiting, and security headers. |
 | [docs/LOGGING_ARCHITECTURE.md](docs/LOGGING_ARCHITECTURE.md) | Architectural specification for centralized asynchronous logging, correlation IDs, and resilient spooling. |
 | [docs/LOGGING_IMPLEMENTATION.md](docs/LOGGING_IMPLEMENTATION.md) | Complete implementation record for logging phases 1 through 5, metric definitions, and dashboard provisioning. |
 | [docs/BEGINNER_GUIDE.md](docs/BEGINNER_GUIDE.md) | Step-by-step onboarding guide explaining microservices, gRPC, Protobuf, and request flow from first principles. |
 | [docs/LOCAL_DEVELOPMENT.md](docs/LOCAL_DEVELOPMENT.md) | Guide for native local development on Windows/macOS/Linux without full Docker Compose dependencies. |
 | [docs/BLOOMRPC_GUIDE.md](docs/BLOOMRPC_GUIDE.md) | Instructions for interacting directly with gRPC microservices using BloomRPC or Postman gRPC client. |
+| [postman/](postman/) | Automated 24-test integration test collection and environment for Postman and Bruno. |
 | [SECURITY.md](SECURITY.md) | Security policy, vulnerability reporting guidelines, and development boundaries. |
+
 
 ---
 

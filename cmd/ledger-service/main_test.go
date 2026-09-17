@@ -59,3 +59,15 @@ func TestRecordTransactionRejectsInvalidPayload(t *testing.T) {
 		})
 	}
 }
+
+func TestGetLedgerEntriesRejectsMissingWalletID(t *testing.T) {
+	service := &server{}
+	resp, err := service.GetLedgerEntries(context.Background(), &ledgerv1.GetLedgerRequest{WalletId: ""})
+	if resp != nil {
+		t.Fatalf("expected nil response, got %+v", resp)
+	}
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument, got %v", err)
+	}
+}
+

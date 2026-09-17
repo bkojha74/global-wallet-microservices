@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -23,6 +24,7 @@ import (
 
 	"wallet-system/pkg/db"
 	"wallet-system/pkg/observability"
+	"wallet-system/pkg/tlsutil"
 	ledgerv1 "wallet-system/proto/ledger"
 	walletv1 "wallet-system/proto/wallet"
 )
@@ -92,6 +94,9 @@ func (s *server) HealthCheck(ctx context.Context, req *walletv1.HealthRequest) (
 }
 
 func (s *server) CreateWallet(ctx context.Context, req *walletv1.CreateWalletRequest) (*walletv1.CreateWalletResponse, error) {
+	if req == nil || strings.TrimSpace(req.WalletId) == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "wallet_id is required")
+	}
 	correlation := observability.FromIncomingContext(ctx)
 	ctx = observability.WithCorrelation(ctx, correlation)
 	s.emit(ctx, "wallet.create.request_received", observability.LevelInfo, "Create wallet request received", map[string]any{"wallet_id": req.WalletId})
@@ -113,9 +118,11 @@ func (s *server) CreateWallet(ctx context.Context, req *walletv1.CreateWalletReq
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 
-	opts := options.Update().SetUpsert(true)
-	_, err := col.UpdateOne(ctx, bson.M{"_id": req.WalletId}, bson.M{"$set": model}, opts)
+	_, err := col.InsertOne(ctx, model)
 	if err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			return nil, status.Errorf(codes.AlreadyExists, "wallet %s already exists", req.WalletId)
+		}
 		return nil, status.Errorf(codes.Internal, "failed to create wallet: %v", err)
 	}
 
@@ -130,6 +137,9 @@ func (s *server) CreateWallet(ctx context.Context, req *walletv1.CreateWalletReq
 }
 
 func (s *server) GetBalance(ctx context.Context, req *walletv1.GetBalanceRequest) (*walletv1.GetBalanceResponse, error) {
+	if req == nil || strings.TrimSpace(req.WalletId) == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "wallet_id is required")
+	}
 	correlation := observability.FromIncomingContext(ctx)
 	ctx = observability.WithCorrelation(ctx, correlation)
 	s.emit(ctx, "wallet.balance.request_received", observability.LevelInfo, "Get balance request received", map[string]any{"wallet_id": req.WalletId})
@@ -505,7 +515,11 @@ func main() {
 
 	// Dial Ledger Service via gRPC
 	log.Printf("[WALLET-SERVICE] Connecting to Ledger Service at %s...", ledgerAddr)
-	conn, err := grpc.NewClient(ledgerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	dialOpt, err := getOutboundDialOption()
+	if err != nil {
+		log.Fatalf("Failed to initialize outbound mTLS dial credentials: %v", err)
+	}
+	conn, err := grpc.NewClient(ledgerAddr, dialOpt)
 	if err != nil {
 		log.Fatalf("Failed to connect to ledger service: %v", err)
 	}
@@ -517,7 +531,11 @@ func main() {
 		log.Fatalf("Failed to listen: %v", err)
 	}
 
-	grpcServer := grpc.NewServer()
+	serverOpts, err := getServerOptions()
+	if err != nil {
+		log.Fatalf("Failed to configure server mTLS credentials: %v", err)
+	}
+	grpcServer := grpc.NewServer(serverOpts...)
 
 	// Phase 1: Ensure MongoDB indexes
 	walletIdxCtx, walletIdxCancel := context.WithTimeout(ctx, 10*time.Second)
@@ -579,3 +597,35 @@ func environmentName() string {
 	}
 	return "development"
 }
+
+func getOutboundDialOption() (grpc.DialOption, error) {
+	if os.Getenv("GRPC_TLS_ENABLED") == "true" {
+		certFile := os.Getenv("GRPC_CLIENT_CERT")
+		keyFile := os.Getenv("GRPC_CLIENT_KEY")
+		caFile := os.Getenv("GRPC_CA_CERT")
+		serverName := os.Getenv("GRPC_SERVER_NAME")
+		creds, err := tlsutil.NewClientTransportCredentials(certFile, keyFile, caFile, serverName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load client mTLS credentials: %w", err)
+		}
+		log.Println("[SECURITY] Outbound ledger gRPC dialed with mTLS transport credentials")
+		return grpc.WithTransportCredentials(creds), nil
+	}
+	return grpc.WithTransportCredentials(insecure.NewCredentials()), nil
+}
+
+func getServerOptions() ([]grpc.ServerOption, error) {
+	if os.Getenv("GRPC_TLS_ENABLED") == "true" {
+		certFile := os.Getenv("GRPC_SERVER_CERT")
+		keyFile := os.Getenv("GRPC_SERVER_KEY")
+		caFile := os.Getenv("GRPC_CA_CERT")
+		creds, err := tlsutil.NewServerTransportCredentials(certFile, keyFile, caFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load server mTLS credentials: %w", err)
+		}
+		log.Println("[SECURITY] Wallet gRPC server configured with mTLS transport credentials")
+		return []grpc.ServerOption{grpc.Creds(creds)}, nil
+	}
+	return nil, nil
+}
+
