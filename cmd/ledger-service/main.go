@@ -2,22 +2,33 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 
 	"wallet-system/pkg/db"
 	"wallet-system/pkg/observability"
+	"wallet-system/pkg/tlsutil"
 	ledgerv1 "wallet-system/proto/ledger"
 )
 
@@ -58,6 +69,7 @@ func (s *server) emitFull(ctx context.Context, eventType, level, message string,
 
 type LedgerDocument struct {
 	ID                  primitive.ObjectID `bson:"_id,omitempty"`
+	SequenceNumber      int64              `bson:"sequence_number,omitempty"`
 	IdempotencyKey      string             `bson:"idempotency_key"`
 	SourceWalletID      string             `bson:"source_wallet_id"`
 	DestinationWalletID string             `bson:"destination_wallet_id"`
@@ -65,6 +77,9 @@ type LedgerDocument struct {
 	Currency            string             `bson:"currency"`
 	Region              string             `bson:"region"`
 	Timestamp           time.Time          `bson:"timestamp"`
+	Postings            []JournalPosting   `bson:"postings,omitempty"`
+	PreviousHash        string             `bson:"previous_hash,omitempty"`
+	EntryHash           string             `bson:"entry_hash,omitempty"`
 }
 
 func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTransactionRequest) (*ledgerv1.RecordTransactionResponse, error) {
@@ -76,11 +91,17 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 	ctx = observability.WithCorrelation(ctx, correlation)
 	s.emit(ctx, "ledger.record.request_received", observability.LevelInfo, "Record transaction request received", map[string]any{"source_wallet_id": req.SourceWalletId, "destination_wallet_id": req.DestinationWalletId})
 	log.Printf("[LEDGER] proto request received: trace_id=%s source=%s destination=%s amount=%d currency=%s region=%s", req.IdempotencyKey, req.SourceWalletId, req.DestinationWalletId, req.Amount, req.Currency, req.Region)
-	if req.IdempotencyKey == "" || req.Amount <= 0 {
-		log.Printf("[LEDGER] trace_id=%s step=validation_failed", req.IdempotencyKey)
+	if req.IdempotencyKey == "" {
+		log.Printf("[LEDGER] trace_id=%s step=validation_failed reason=missing_idempotency_key", req.IdempotencyKey)
 		durationMS := time.Since(startTime).Milliseconds()
-		s.emitTerminal(ctx, "ledger.record.failed", observability.LevelError, "Validation failed", durationMS, false, map[string]any{"reason": "invalid_payload"})
-		return nil, status.Errorf(codes.InvalidArgument, "invalid ledger transaction payload")
+		s.emitTerminal(ctx, "ledger.record.failed", observability.LevelError, "Validation failed", durationMS, false, map[string]any{"reason": "missing_idempotency_key"})
+		return nil, status.Errorf(codes.InvalidArgument, "idempotency_key is required")
+	}
+	if err := db.ValidateAmount(req.Amount, req.Currency); err != nil {
+		log.Printf("[LEDGER] trace_id=%s step=validation_failed reason=%v", req.IdempotencyKey, err)
+		durationMS := time.Since(startTime).Milliseconds()
+		s.emitTerminal(ctx, "ledger.record.failed", observability.LevelError, "Validation failed", durationMS, false, map[string]any{"reason": err.Error()})
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 
 	col := s.mongoClient.Database("banking_db").Collection("ledger_entries")
@@ -99,20 +120,70 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 		}, nil
 	}
 
+	var docID primitive.ObjectID
+	if req.TransactionId != "" {
+		if parsed, err := primitive.ObjectIDFromHex(req.TransactionId); err == nil {
+			docID = parsed
+		} else {
+			docID = primitive.NewObjectID()
+		}
+	} else {
+		docID = primitive.NewObjectID()
+	}
+
+	// GAAP/IFRS Double-Entry Postings (GAP-FIN-02)
+	postings, postErr := CreateTransferPostings(req.SourceWalletId, req.DestinationWalletId, req.Amount, req.Currency)
+	if postErr != nil {
+		log.Printf("[LEDGER] trace_id=%s step=double_entry_failed reason=%v", req.IdempotencyKey, postErr)
+		durationMS := time.Since(startTime).Milliseconds()
+		s.emitTerminal(ctx, "ledger.record.failed", observability.LevelError, "Double-entry validation failed", durationMS, false, map[string]any{"reason": postErr.Error()})
+		return nil, status.Errorf(codes.InvalidArgument, "double-entry validation failed: %v", postErr)
+	}
+
+	// Cryptographic Hash Chaining (GAP-FIN-02): find the previous entry
+	var seqNumber int64 = 1
+	prevHash := GenesisHash
+	var lastDoc LedgerDocument
+	findLastOpts := options.FindOne().SetSort(bson.D{{Key: "sequence_number", Value: -1}})
+	if findErr := col.FindOne(ctx, bson.M{"sequence_number": bson.M{"$gt": 0}}, findLastOpts).Decode(&lastDoc); findErr == nil {
+		seqNumber = lastDoc.SequenceNumber + 1
+		if lastDoc.EntryHash != "" {
+			prevHash = lastDoc.EntryHash
+		}
+	}
+
+	now := time.Now().UTC()
+	entryHash := ComputeEntryHash(prevHash, seqNumber, docID.Hex(), req.IdempotencyKey, now, postings)
+
 	doc := LedgerDocument{
-		ID:                  primitive.NewObjectID(),
+		ID:                  docID,
+		SequenceNumber:      seqNumber,
 		IdempotencyKey:      req.IdempotencyKey,
 		SourceWalletID:      req.SourceWalletId,
 		DestinationWalletID: req.DestinationWalletId,
 		Amount:              req.Amount,
 		Currency:            req.Currency,
 		Region:              s.region,
-		Timestamp:           time.Now().UTC(),
+		Timestamp:           now,
+		Postings:            postings,
+		PreviousHash:        prevHash,
+		EntryHash:           entryHash,
 	}
 
 	_, err = col.InsertOne(ctx, doc)
 	durationMS := time.Since(startTime).Milliseconds()
 	if err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			log.Printf("[LEDGER] Race detected: Duplicate transaction key on insert: %s", req.IdempotencyKey)
+			var dupDoc LedgerDocument
+			if findErr := col.FindOne(ctx, bson.M{"idempotency_key": req.IdempotencyKey}).Decode(&dupDoc); findErr == nil {
+				s.emitTerminal(ctx, "ledger.transaction.duplicate", observability.LevelInfo, "Duplicate ledger transaction detected", durationMS, true, map[string]any{"transaction_id": dupDoc.ID.Hex()})
+				return &ledgerv1.RecordTransactionResponse{
+					TransactionId: dupDoc.ID.Hex(),
+					Success:       true,
+				}, nil
+			}
+		}
 		log.Printf("[LEDGER] Error persisting audit record: %v", err)
 		s.emitTerminal(ctx, "ledger.record.failed", observability.LevelError, "Failed to persist ledger record", durationMS, false, map[string]any{"error": err.Error()})
 		return &ledgerv1.RecordTransactionResponse{
@@ -165,6 +236,10 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 }
 
 func (s *server) GetLedgerEntries(ctx context.Context, req *ledgerv1.GetLedgerRequest) (*ledgerv1.GetLedgerResponse, error) {
+	if req == nil || strings.TrimSpace(req.WalletId) == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "wallet_id is required")
+	}
+
 	col := s.mongoClient.Database("banking_db").Collection("ledger_entries")
 
 	filter := bson.M{
@@ -174,7 +249,28 @@ func (s *server) GetLedgerEntries(ctx context.Context, req *ledgerv1.GetLedgerRe
 		},
 	}
 
-	cursor, err := col.Find(ctx, filter)
+	limit := int64(req.Limit)
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+
+	var offset int64 = 0
+	if req.PageToken != "" {
+		if decoded, err := base64.StdEncoding.DecodeString(req.PageToken); err == nil {
+			if parsedOffset, err := strconv.ParseInt(string(decoded), 10, 64); err == nil && parsedOffset >= 0 {
+				offset = parsedOffset
+			}
+		}
+	}
+
+	totalCount, _ := col.CountDocuments(ctx, filter)
+
+	findOpts := options.Find().
+		SetSort(bson.D{{Key: "timestamp", Value: -1}}).
+		SetSkip(offset).
+		SetLimit(limit)
+
+	cursor, err := col.Find(ctx, filter, findOpts)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to query ledger: %v", err)
 	}
@@ -198,7 +294,16 @@ func (s *server) GetLedgerEntries(ctx context.Context, req *ledgerv1.GetLedgerRe
 		})
 	}
 
-	return &ledgerv1.GetLedgerResponse{Entries: entries}, nil
+	var nextPageToken string
+	if offset+int64(len(entries)) < totalCount {
+		nextPageToken = base64.StdEncoding.EncodeToString([]byte(strconv.FormatInt(offset+int64(len(entries)), 10)))
+	}
+
+	return &ledgerv1.GetLedgerResponse{
+		Entries:       entries,
+		NextPageToken: nextPageToken,
+		TotalCount:    totalCount,
+	}, nil
 }
 
 func environmentName() string {
@@ -206,6 +311,21 @@ func environmentName() string {
 		return environment
 	}
 	return "local"
+}
+
+func getLedgerServerOptions() ([]grpc.ServerOption, error) {
+	if os.Getenv("GRPC_TLS_ENABLED") == "true" {
+		certFile := os.Getenv("GRPC_SERVER_CERT")
+		keyFile := os.Getenv("GRPC_SERVER_KEY")
+		caFile := os.Getenv("GRPC_CA_CERT")
+		creds, err := tlsutil.NewServerTransportCredentials(certFile, keyFile, caFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load ledger server mTLS credentials: %w", err)
+		}
+		log.Println("[SECURITY] Ledger gRPC server configured with mTLS transport credentials")
+		return []grpc.ServerOption{grpc.Creds(creds)}, nil
+	}
+	return nil, nil
 }
 
 func main() {
@@ -228,12 +348,39 @@ func main() {
 	}
 	defer client.Disconnect(ctx)
 
+	// Phase 1: Ensure MongoDB indexes
+	idxCtx, idxCancel := context.WithTimeout(ctx, 10*time.Second)
+	if err := db.EnsureLedgerIndexes(idxCtx, client.Database("banking_db")); err != nil {
+		log.Printf("[LEDGER-SERVICE] Ledger database index creation warning: %v", err)
+	}
+	idxCancel()
+
+	// Phase 3 (GAP-OBS-01): OpenTelemetry W3C distributed tracing
+	shutdownTracer, err := observability.InitTracer("ledger-service")
+	if err == nil && shutdownTracer != nil {
+		defer func() { _ = shutdownTracer(context.Background()) }()
+	}
+
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
 		log.Fatalf("Failed to listen: %v", err)
 	}
 
-	grpcServer := grpc.NewServer()
+	serverOpts, err := getLedgerServerOptions()
+	if err != nil {
+		log.Fatalf("Failed to configure server mTLS credentials: %v", err)
+	}
+	serverOpts = append(serverOpts, grpc.ChainUnaryInterceptor(
+		observability.UnaryServerTraceInterceptor("ledger-service"),
+		observability.DefaultMetrics.UnaryServerMetricsInterceptor("ledger-service"),
+	))
+	grpcServer := grpc.NewServer(serverOpts...)
+
+	// Phase 3 (GAP-REL-03): Register standard gRPC Health Check service
+	healthServer := health.NewServer()
+	grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
+	healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+	healthServer.SetServingStatus("ledger.v1.LedgerService", grpc_health_v1.HealthCheckResponse_SERVING)
 
 	// Phase 5 (GAP-10): initialise transactional outbox when enabled.
 	var ledgerOutbox *observability.MongoOutbox
@@ -265,12 +412,70 @@ func main() {
 	}
 	ledgerv1.RegisterLedgerServiceServer(grpcServer, srv)
 
-	if outboxPublisher != nil {
-		defer outboxPublisher.Close()
+	// Phase 3 (GAP-OBS-02): Dedicated management HTTP server for Prometheus metrics and health
+	metricsPort := os.Getenv("METRICS_PORT")
+	if metricsPort == "" {
+		metricsPort = "9092"
 	}
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", observability.DefaultMetrics.Handler())
+	metricsMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"status":"UP","region":%q}`+"\n", region)
+	})
+	// Phase 4 (GAP-FIN-02): Ledger Audit Chain & Trial Balance Verification
+	metricsMux.HandleFunc("/audit/verify", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		col := client.Database("banking_db").Collection("ledger_entries")
+		res, err := VerifyAuditChain(r.Context(), col)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{"status": "ERROR", "error": err.Error()})
+			return
+		}
+		if res.Status != "VERIFIED" {
+			w.WriteHeader(http.StatusConflict)
+		}
+		json.NewEncoder(w).Encode(res)
+	})
+	metricsServer := &http.Server{
+		Addr:    ":" + metricsPort,
+		Handler: metricsMux,
+	}
+	go func() {
+		log.Printf("[LEDGER-SERVICE] Management metrics server listening on :%s/metrics", metricsPort)
+		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("[LEDGER-SERVICE] Metrics server error: %v", err)
+		}
+	}()
 
-	log.Printf("[LEDGER-SERVICE] gRPC listening on :%s", port)
-	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
+	go func() {
+		log.Printf("[LEDGER-SERVICE] gRPC listening on :%s", port)
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("Failed to serve: %v", err)
+		}
+	}()
+
+	// Phase 3 (GAP-REL-01): Graceful Shutdown on SIGINT / SIGTERM
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	sig := <-sigChan
+	log.Printf("[LEDGER-SERVICE] Received signal %v, initiating graceful shutdown...", sig)
+
+	healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+	healthServer.SetServingStatus("ledger.v1.LedgerService", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+
+	grpcServer.GracefulStop()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[LEDGER-SERVICE] Metrics server shutdown error: %v", err)
 	}
+	if outboxPublisher != nil {
+		outboxPublisher.Close()
+	}
+	client.Disconnect(shutdownCtx)
+	log.Println("[LEDGER-SERVICE] Graceful shutdown completed cleanly.")
 }

@@ -22,7 +22,7 @@ func DefaultMongoURI() string {
 	if _, err := net.LookupHost("mongodb"); err == nil {
 		return "mongodb://mongodb:27017/?replicaSet=rs0&directConnection=true"
 	}
-	return "mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true"
+	return "mongodb://127.0.0.1:27017/?directConnection=true"
 }
 
 // ConnectWithRetry connects to MongoDB with exponential backoff to handle replica set initialization
@@ -33,6 +33,9 @@ func ConnectWithRetry(ctx context.Context, uri string, maxRetries int) (*mongo.C
 
 	opts := options.Client().ApplyURI(uri)
 	opts.SetServerSelectionTimeout(3 * time.Second)
+	opts.SetMaxPoolSize(100)
+	opts.SetMinPoolSize(10)
+	opts.SetMaxConnIdleTime(5 * time.Minute)
 
 	var client *mongo.Client
 	var err error

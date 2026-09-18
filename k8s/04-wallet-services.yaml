@@ -3,6 +3,9 @@ kind: Deployment
 metadata:
   name: wallet-primary
   namespace: banking-system
+  labels:
+    app: wallet-service
+    tier: primary
 spec:
   replicas: 2
   selector:
@@ -15,34 +18,90 @@ spec:
         app: wallet-service
         tier: primary
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      terminationGracePeriodSeconds: 20
       containers:
         - name: wallet-primary
           image: wallet-system/wallet-service:latest
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           ports:
             - containerPort: 50051
+              name: grpc
+            - containerPort: 9094
+              name: metrics
+          envFrom:
+            - configMapRef:
+                name: wallet-config
           env:
             - name: PORT
               value: "50051"
-            - name: MONGO_URI
-              value: "mongodb://mongodb-service.banking-system.svc.cluster.local:27017/?replicaSet=rs0&directConnection=true"
-            - name: LEDGER_SERVICE_ADDR
-              value: "ledger-service:50052"
+            - name: METRICS_PORT
+              value: "9094"
             - name: REGION_NAME
               value: "k8s-region-us-east-1 (Primary)"
             - name: IS_ACTIVE
               value: "true"
+            - name: COORDINATOR_ROLE
+              value: "PRIMARY"
+            - name: LEDGER_SERVICE_ADDR
+              value: "ledger-service:50052"
+            - name: MONGO_URI
+              valueFrom:
+                secretKeyRef:
+                  name: wallet-secrets
+                  key: MONGO_URI
+            - name: LOGGING_RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: wallet-secrets
+                  key: RABBITMQ_URL
+          resources:
+            requests:
+              cpu: 150m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9094
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9094
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: wallet-primary-service
   namespace: banking-system
+  labels:
+    app: wallet-service
+    tier: primary
 spec:
   type: ClusterIP
   ports:
     - port: 50051
       targetPort: 50051
+      name: grpc
+    - port: 9094
+      targetPort: 9094
+      name: metrics
   selector:
     app: wallet-service
     tier: primary
@@ -52,6 +111,9 @@ kind: Deployment
 metadata:
   name: wallet-standby
   namespace: banking-system
+  labels:
+    app: wallet-service
+    tier: standby
 spec:
   replicas: 1
   selector:
@@ -64,34 +126,90 @@ spec:
         app: wallet-service
         tier: standby
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      terminationGracePeriodSeconds: 20
       containers:
         - name: wallet-standby
           image: wallet-system/wallet-service:latest
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           ports:
             - containerPort: 50053
+              name: grpc
+            - containerPort: 9093
+              name: metrics
+          envFrom:
+            - configMapRef:
+                name: wallet-config
           env:
             - name: PORT
               value: "50053"
-            - name: MONGO_URI
-              value: "mongodb://mongodb-service.banking-system.svc.cluster.local:27017/?replicaSet=rs0&directConnection=true"
-            - name: LEDGER_SERVICE_ADDR
-              value: "ledger-service:50052"
+            - name: METRICS_PORT
+              value: "9093"
             - name: REGION_NAME
               value: "k8s-region-eu-west-1 (Standby)"
             - name: IS_ACTIVE
               value: "false"
+            - name: COORDINATOR_ROLE
+              value: "STANDBY"
+            - name: LEDGER_SERVICE_ADDR
+              value: "ledger-service:50052"
+            - name: MONGO_URI
+              valueFrom:
+                secretKeyRef:
+                  name: wallet-secrets
+                  key: MONGO_URI
+            - name: LOGGING_RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: wallet-secrets
+                  key: RABBITMQ_URL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9093
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9093
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: wallet-standby-service
   namespace: banking-system
+  labels:
+    app: wallet-service
+    tier: standby
 spec:
   type: ClusterIP
   ports:
     - port: 50053
       targetPort: 50053
+      name: grpc
+    - port: 9093
+      targetPort: 9093
+      name: metrics
   selector:
     app: wallet-service
     tier: standby

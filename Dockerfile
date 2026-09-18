@@ -8,7 +8,10 @@ RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2 && \
 
 WORKDIR /app
 
-COPY go.mod ./
+# Deterministic dependency caching (GAP-OPS-02)
+COPY go.mod go.sum ./
+RUN go mod download
+
 COPY proto ./proto
 
 # Compile protocol buffers into Go interfaces & structs
@@ -20,40 +23,55 @@ RUN protoc --go_out=. --go_opt=paths=source_relative \
 COPY pkg ./pkg
 COPY cmd ./cmd
 
-RUN go mod tidy
-
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/wallet-service ./cmd/wallet-service
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/ledger-service ./cmd/ledger-service
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/api-gateway ./cmd/api-gateway
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/logging-service ./cmd/logging-service
-# Stage 2: Wallet Service Minimal Runtime
+
+# Stage 2: Wallet Service Minimal Runtime (GAP-OPS-01)
 FROM alpine:3.20 AS wallet-service
-RUN apk add --no-cache ca-certificates curl
+RUN apk add --no-cache ca-certificates curl && \
+    addgroup -g 10001 -S appgroup && \
+    adduser -u 10001 -S appuser -G appgroup
 WORKDIR /app
+RUN mkdir -p /app/data/logging && chown -R appuser:appgroup /app
 COPY --from=builder /bin/wallet-service /app/wallet-service
-EXPOSE 50051 50053
+USER appuser
+EXPOSE 50051 50053 9094 9093
 ENTRYPOINT ["/app/wallet-service"]
 
-# Stage 3: Ledger Service Minimal Runtime
+# Stage 3: Ledger Service Minimal Runtime (GAP-OPS-01)
 FROM alpine:3.20 AS ledger-service
-RUN apk add --no-cache ca-certificates curl
+RUN apk add --no-cache ca-certificates curl && \
+    addgroup -g 10001 -S appgroup && \
+    adduser -u 10001 -S appuser -G appgroup
 WORKDIR /app
+RUN mkdir -p /app/data/logging && chown -R appuser:appgroup /app
 COPY --from=builder /bin/ledger-service /app/ledger-service
-EXPOSE 50052
+USER appuser
+EXPOSE 50052 9092
 ENTRYPOINT ["/app/ledger-service"]
 
-# Stage 4: API Gateway Minimal Runtime
+# Stage 4: API Gateway Minimal Runtime (GAP-OPS-01)
 FROM alpine:3.20 AS api-gateway
-RUN apk add --no-cache ca-certificates curl
+RUN apk add --no-cache ca-certificates curl && \
+    addgroup -g 10001 -S appgroup && \
+    adduser -u 10001 -S appuser -G appgroup
 WORKDIR /app
+RUN mkdir -p /app/data/logging && chown -R appuser:appgroup /app
 COPY --from=builder /bin/api-gateway /app/api-gateway
-EXPOSE 8080
+USER appuser
+EXPOSE 8080 8081
 ENTRYPOINT ["/app/api-gateway"]
 
-# Stage 5: Logging Service Minimal Runtime
+# Stage 5: Logging Service Minimal Runtime (GAP-OPS-01)
 FROM alpine:3.20 AS logging-service
-RUN apk add --no-cache ca-certificates curl
+RUN apk add --no-cache ca-certificates curl && \
+    addgroup -g 10001 -S appgroup && \
+    adduser -u 10001 -S appuser -G appgroup
 WORKDIR /app
+RUN mkdir -p /app/data/logging && chown -R appuser:appgroup /app
 COPY --from=builder /bin/logging-service /app/logging-service
+USER appuser
 EXPOSE 8090 9090
 ENTRYPOINT ["/app/logging-service"]

@@ -26,6 +26,7 @@ message RecordTransactionRequest {
   int64 amount = 4;
   string currency = 5;
   string region = 6;
+  string transaction_id = 7;
 }
 
 message RecordTransactionResponse {
@@ -36,8 +37,12 @@ message RecordTransactionResponse {
 
 message GetLedgerRequest {
   string wallet_id = 1;
+  int32 limit = 2;
+  string page_token = 3;
 }
 
 message GetLedgerResponse {
   repeated LedgerEntry entries = 1;
+  string next_page_token = 2;
+  int64 total_count = 3;
 }
