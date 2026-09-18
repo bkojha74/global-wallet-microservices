@@ -12,15 +12,15 @@ import (
 )
 
 var (
-	ErrInvalidToken       = errors.New("invalid token format")
-	ErrInvalidSignature   = errors.New("invalid token signature")
-	ErrTokenExpired       = errors.New("token has expired")
-	ErrInvalidHeader      = errors.New("invalid token header")
-	ErrInvalidClaims      = errors.New("invalid token claims")
-	ErrMissingAuthHeader  = errors.New("authorization header required")
-	ErrInvalidAuthFormat  = errors.New("authorization format must be Bearer <token>")
-	ErrInsufficientPerms  = errors.New("insufficient permissions for resource")
-	ErrIDORViolation      = errors.New("subject is not authorized to act on this wallet")
+	ErrInvalidToken      = errors.New("invalid token format")
+	ErrInvalidSignature  = errors.New("invalid token signature")
+	ErrTokenExpired      = errors.New("token has expired")
+	ErrInvalidHeader     = errors.New("invalid token header")
+	ErrInvalidClaims     = errors.New("invalid token claims")
+	ErrMissingAuthHeader = errors.New("authorization header required")
+	ErrInvalidAuthFormat = errors.New("authorization format must be Bearer <token>")
+	ErrInsufficientPerms = errors.New("insufficient permissions for resource")
+	ErrIDORViolation     = errors.New("subject is not authorized to act on this wallet")
 )
 
 const (

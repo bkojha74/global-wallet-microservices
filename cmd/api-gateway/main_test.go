@@ -334,5 +334,3 @@ func TestHandleFailoverRestrictedToAdmin(t *testing.T) {
 		t.Fatalf("expected 200 for admin on failover, got %d", recAdmin.Code)
 	}
 }
-
-
