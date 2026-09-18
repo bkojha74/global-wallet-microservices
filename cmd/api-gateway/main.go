@@ -9,9 +9,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -22,6 +24,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"wallet-system/pkg/auth"
+	"wallet-system/pkg/coordinator"
 	"wallet-system/pkg/db"
 	"wallet-system/pkg/observability"
 	"wallet-system/pkg/tlsutil"
@@ -33,7 +36,8 @@ const defaultJWTSecret = "development-wallet-insecure-secret-key-change-in-prod"
 
 type Gateway struct {
 	mu             sync.RWMutex
-	activeTarget   string // "PRIMARY" or "STANDBY"
+	activeTarget   string // "PRIMARY" or "STANDBY" (cached fallback)
+	coordinator    coordinator.FailoverCoordinator
 	primaryClient  walletv1.WalletServiceClient
 	standbyClient  walletv1.WalletServiceClient
 	ledgerClient   ledgerv1.LedgerServiceClient
@@ -87,13 +91,23 @@ func readClientJSON(traceID string, body io.Reader) ([]byte, error) {
 	return payload, nil
 }
 
-func (g *Gateway) getActiveWalletClient() (walletv1.WalletServiceClient, string) {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	if g.activeTarget == "STANDBY" {
-		return g.standbyClient, "STANDBY"
+func (g *Gateway) getActiveWalletClient(ctx context.Context) (walletv1.WalletServiceClient, string) {
+	target := coordinator.TargetPrimary
+	if g.coordinator != nil {
+		if t, err := g.coordinator.GetActiveTarget(ctx); err == nil && t != "" {
+			target = t
+		}
+	} else {
+		g.mu.RLock()
+		if g.activeTarget != "" {
+			target = g.activeTarget
+		}
+		g.mu.RUnlock()
 	}
-	return g.primaryClient, "PRIMARY"
+	if target == coordinator.TargetStandby {
+		return g.standbyClient, coordinator.TargetStandby
+	}
+	return g.primaryClient, coordinator.TargetPrimary
 }
 
 func (g *Gateway) handleCreateWallet(w http.ResponseWriter, r *http.Request) {
@@ -142,7 +156,7 @@ func (g *Gateway) handleCreateWallet(w http.ResponseWriter, r *http.Request) {
 	protoReq := &walletv1.CreateWalletRequest{WalletId: req.WalletID, Currency: req.Currency, InitialBalance: req.InitialBalance}
 	logProto(traceID, "http_json_to_wallet_proto_request", protoReq)
 
-	client, target := g.getActiveWalletClient()
+	client, target := g.getActiveWalletClient(ctx)
 	log.Printf("[TRACE] trace_id=%s step=wallet_grpc_request target=%s", traceID, target)
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
@@ -201,7 +215,7 @@ func (g *Gateway) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 	protoReq := &walletv1.GetBalanceRequest{WalletId: walletID}
 	logProto(traceID, "http_json_to_wallet_proto_request", protoReq)
 
-	client, target := g.getActiveWalletClient()
+	client, target := g.getActiveWalletClient(ctx)
 	log.Printf("[TRACE] trace_id=%s step=wallet_grpc_request target=%s", traceID, target)
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
@@ -284,7 +298,7 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 	logProto(traceID, "http_json_to_wallet_proto_request", protoReq)
 
-	client, target := g.getActiveWalletClient()
+	client, target := g.getActiveWalletClient(ctx)
 
 	// Step 2: api.wallet_proto.request_created (DEBUG)
 	g.emit(ctx, "api.wallet_proto.request_created", observability.LevelDebug, "Wallet protobuf request created", map[string]any{
@@ -395,9 +409,18 @@ func (g *Gateway) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	pHealth, _ := g.primaryClient.HealthCheck(ctx, &walletv1.HealthRequest{})
 	sHealth, _ := g.standbyClient.HealthCheck(ctx, &walletv1.HealthRequest{})
 
-	g.mu.RLock()
-	currentActive := g.activeTarget
-	g.mu.RUnlock()
+	currentActive := coordinator.TargetPrimary
+	if g.coordinator != nil {
+		if t, err := g.coordinator.GetActiveTarget(ctx); err == nil && t != "" {
+			currentActive = t
+		}
+	} else {
+		g.mu.RLock()
+		if g.activeTarget != "" {
+			currentActive = g.activeTarget
+		}
+		g.mu.RUnlock()
+	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"current_routed_target": currentActive,
@@ -426,15 +449,37 @@ func (g *Gateway) handleFailover(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	g.mu.Lock()
-	if g.activeTarget == "PRIMARY" {
-		g.activeTarget = "STANDBY"
+	currentTarget := coordinator.TargetPrimary
+	if g.coordinator != nil {
+		if t, err := g.coordinator.GetActiveTarget(r.Context()); err == nil && t != "" {
+			currentTarget = t
+		}
 	} else {
-		g.activeTarget = "PRIMARY"
+		g.mu.RLock()
+		if g.activeTarget != "" {
+			currentTarget = g.activeTarget
+		}
+		g.mu.RUnlock()
 	}
-	newTarget := g.activeTarget
+
+	newTarget := coordinator.TargetStandby
+	if currentTarget == coordinator.TargetStandby {
+		newTarget = coordinator.TargetPrimary
+	}
+
+	if g.coordinator != nil {
+		if err := g.coordinator.SetActiveTarget(r.Context(), newTarget); err != nil {
+			log.Printf("[GATEWAY-FAILOVER] Failed to persist failover target: %v", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to persist failover target"})
+			return
+		}
+	}
+
+	g.mu.Lock()
+	g.activeTarget = newTarget
 	g.mu.Unlock()
 
+	observability.DefaultMetrics.SetClusterActiveTarget("api-gateway", newTarget)
 	log.Printf("[GATEWAY-FAILOVER] Switched traffic route to: %s", newTarget)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"message":              "Failover routing triggered",
@@ -584,37 +629,73 @@ func main() {
 	}
 	logger := observability.LoggerFromEnvironment("api-gateway", environment, "", os.Stdout)
 
+	// Phase 3 (GAP-OBS-01): OpenTelemetry W3C distributed tracing
+	shutdownTracer, err := observability.InitTracer("api-gateway")
+	if err == nil && shutdownTracer != nil {
+		defer func() { _ = shutdownTracer(context.Background()) }()
+	}
+
 	dialOpt, err := getClientDialOption()
 	if err != nil {
 		log.Fatalf("Failed to initialize gRPC dial credentials: %v", err)
 	}
+	dialOpts := []grpc.DialOption{
+		dialOpt,
+		grpc.WithUnaryInterceptor(observability.UnaryClientTraceInterceptor("api-gateway")),
+	}
 
-	pConn, err := grpc.NewClient(primaryAddr, dialOpt)
+	pConn, err := grpc.NewClient(primaryAddr, dialOpts...)
 	if err != nil {
 		log.Fatalf("Failed to dial primary wallet: %v", err)
 	}
 	defer pConn.Close()
 
-	sConn, err := grpc.NewClient(standbyAddr, dialOpt)
+	sConn, err := grpc.NewClient(standbyAddr, dialOpts...)
 	if err != nil {
 		log.Fatalf("Failed to dial standby wallet: %v", err)
 	}
 	defer sConn.Close()
 
-	lConn, err := grpc.NewClient(ledgerAddr, dialOpt)
+	lConn, err := grpc.NewClient(ledgerAddr, dialOpts...)
 	if err != nil {
 		log.Fatalf("Failed to dial ledger: %v", err)
 	}
 	defer lConn.Close()
 
+	// Phase 3 (GAP-HA-01): Distributed Failover Coordinator
+	var coord coordinator.FailoverCoordinator
+	mongoURI := os.Getenv("MONGO_URI")
+	if mongoURI != "" {
+		mCtx, mCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		mClient, mErr := db.ConnectWithRetry(mCtx, mongoURI, 3)
+		mCancel()
+		if mErr == nil {
+			coord = coordinator.NewMongoFailoverCoordinator(mClient.Database("banking_db"), 1*time.Second)
+			defer mClient.Disconnect(context.Background())
+			log.Println("[API-GATEWAY] Distributed MongoFailoverCoordinator connected")
+		} else {
+			log.Printf("[API-GATEWAY] Mongo connection failed for failover coordinator (%v), falling back to in-memory coordinator", mErr)
+			coord = coordinator.NewMemoryFailoverCoordinator(coordinator.TargetPrimary)
+		}
+	} else {
+		coord = coordinator.NewMemoryFailoverCoordinator(coordinator.TargetPrimary)
+	}
+	defer coord.Close()
+
 	gw := &Gateway{
 		activeTarget:   "PRIMARY",
+		coordinator:    coord,
 		primaryClient:  walletv1.NewWalletServiceClient(pConn),
 		standbyClient:  walletv1.NewWalletServiceClient(sConn),
 		ledgerClient:   ledgerv1.NewLedgerServiceClient(lConn),
 		primaryAddress: primaryAddr,
 		standbyAddress: standbyAddr,
 		logger:         logger,
+	}
+
+	// Update active target metric initially
+	if initTarget, err := coord.GetActiveTarget(context.Background()); err == nil {
+		observability.DefaultMetrics.SetClusterActiveTarget("api-gateway", initTarget)
 	}
 
 	mux := http.NewServeMux()
@@ -636,7 +717,23 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "UP"})
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "READY"})
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		client, activeTarget := gw.getActiveWalletClient(ctx)
+		wHealth, wErr := client.HealthCheck(ctx, &walletv1.HealthRequest{})
+		if wErr != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+				"status":        "DEGRADED",
+				"active_target": activeTarget,
+				"error":         fmt.Sprintf("active wallet health check failed: %v", wErr),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status":        "READY",
+			"active_target": activeTarget,
+			"wallet_status": wHealth.Status,
+		})
 	})
 
 	// Expose Prometheus metrics (GAP-07)
@@ -649,10 +746,10 @@ func main() {
 	}
 
 	publicPaths := map[string]bool{
-		"/healthz":              true,
-		"/readyz":               true,
-		"/metrics":              true,
-		"/api/v1/auth/token":    true,
+		"/healthz":               true,
+		"/readyz":                true,
+		"/metrics":               true,
+		"/api/v1/auth/token":     true,
 		"/api/v1/cluster/status": true,
 	}
 
@@ -664,6 +761,7 @@ func main() {
 	handler = SecurityHeadersMiddleware(handler)
 	handler = RateLimitMiddleware(rateLimiter, handler)
 	handler = AuthMiddleware(jwtSecret, publicPaths, handler)
+	handler = observability.TraceHTTPMiddleware("api-gateway", handler) // Phase 3 (GAP-OBS-01)
 
 	server := &http.Server{
 		Addr:              ":" + httpPort,
@@ -674,8 +772,24 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	log.Printf("[API-GATEWAY] HTTP REST Gateway listening on :%s (Zero-Trust Security & mTLS enabled)", httpPort)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("Gateway server failure: %v", err)
+	go func() {
+		log.Printf("[API-GATEWAY] HTTP REST Gateway listening on :%s (Zero-Trust Security, Distributed Failover & OTel enabled)", httpPort)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Gateway server failure: %v", err)
+		}
+	}()
+
+	// Phase 3 (GAP-REL-01): Graceful Shutdown on SIGINT / SIGTERM
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	sig := <-sigChan
+	log.Printf("[API-GATEWAY] Received signal %v, initiating graceful shutdown...", sig)
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer shutdownCancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[API-GATEWAY] HTTP server graceful shutdown error: %v", err)
 	}
+	log.Println("[API-GATEWAY] Graceful shutdown completed cleanly.")
 }

@@ -30,3 +30,25 @@ scrape_configs:
     static_configs:
       - targets: ["host.docker.internal:8080"]
     metrics_path: /metrics
+
+  # ── Wallet Primary Service (Active) ───────────────────────────────────────────
+  # Scrape wallet-primary management HTTP server on port 9094 (Phase 3 / GAP-OBS-02).
+  - job_name: "wallet-primary"
+    static_configs:
+      - targets: ["host.docker.internal:9094", "wallet_primary_active:9094"]
+    metrics_path: /metrics
+
+  # ── Wallet Standby Service (Hot DR) ───────────────────────────────────────────
+  # Scrape wallet-standby management HTTP server on port 9093 (Phase 3 / GAP-OBS-02).
+  - job_name: "wallet-standby"
+    static_configs:
+      - targets: ["host.docker.internal:9093", "wallet_standby_hot_dr:9093"]
+    metrics_path: /metrics
+
+  # ── Ledger Service ────────────────────────────────────────────────────────────
+  # Scrape ledger-service management HTTP server on port 9092 (Phase 3 / GAP-OBS-02).
+  - job_name: "ledger-service"
+    static_configs:
+      - targets: ["host.docker.internal:9092", "wallet_ledger_service:9092"]
+    metrics_path: /metrics
+

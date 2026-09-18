@@ -53,6 +53,7 @@ type LedgerRelay struct {
 	pollInterval time.Duration
 	batchSize    int64
 	logger       observability.Logger
+	cancel       context.CancelFunc
 }
 
 func NewLedgerRelay(db *mongo.Database, client ledgerv1.LedgerServiceClient, pollInterval time.Duration, batchSize int64, logger observability.Logger) *LedgerRelay {
@@ -112,6 +113,9 @@ func (r *LedgerRelay) DispatchImmediate(ctx context.Context, task LedgerTask) er
 
 // Start begins the background relay loop until context cancellation.
 func (r *LedgerRelay) Start(ctx context.Context) {
+	relayCtx, cancel := context.WithCancel(ctx)
+	r.cancel = cancel
+
 	go func() {
 		log.Printf("[LEDGER-RELAY] Background outbox relay started (interval: %v, batch: %d)", r.pollInterval, r.batchSize)
 		ticker := time.NewTicker(r.pollInterval)
@@ -120,17 +124,24 @@ func (r *LedgerRelay) Start(ctx context.Context) {
 		for {
 			select {
 			case <-ticker.C:
-				if count, err := r.ProcessBatch(ctx); err != nil {
+				if count, err := r.ProcessBatch(relayCtx); err != nil {
 					log.Printf("[LEDGER-RELAY] Error processing batch: %v", err)
 				} else if count > 0 {
 					log.Printf("[LEDGER-RELAY] Relayed %d pending ledger entries successfully", count)
 				}
-			case <-ctx.Done():
+			case <-relayCtx.Done():
 				log.Println("[LEDGER-RELAY] Outbox relay shutting down...")
 				return
 			}
 		}
 	}()
+}
+
+// Stop signals the background relay loop to terminate.
+func (r *LedgerRelay) Stop() {
+	if r.cancel != nil {
+		r.cancel()
+	}
 }
 
 // ProcessBatch finds and dispatches up to batchSize pending ledger tasks.

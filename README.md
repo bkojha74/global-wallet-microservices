@@ -63,10 +63,10 @@ The system decomposes financial operations into autonomous, loosely-coupled micr
 
 | Microservice Component | Protocol & Ports | Architectural Role | Bounded Context & Persistence |
 |---|---|---|---|
-| **API Gateway** | HTTP `:8080`<br>Prometheus `:8081` | • Edge ingress & HTTP REST-to-gRPC translation<br>• 6-layer defense-in-depth security pipeline<br>• Dynamic Active-Standby failover router | Stateless |
-| **Wallet Service (Primary)** | gRPC `:50051` | • Core banking engine for `us-east-1-primary`<br>• Multi-document ACID transactions (`Majority`/`Snapshot`)<br>• Atomic Transactional Outbox relay for ledger decoupling | `banking_db.wallets`<br>`banking_db.idempotency_records`<br>`banking_db.ledger_tasks` (Outbox) |
-| **Wallet Service (Standby)** | gRPC `:50053` | • Hot disaster recovery replica for `eu-west-1-standby`<br>• Real-time takeover target with identical business engine | Shared replica set `rs0`<br>(instant failover target) |
-| **Ledger Service** | gRPC `:50052` | • Immutable financial journal & audit ledger<br>• Reverse-chronological cursor-based queries<br>• Compound and unique indexing eliminating COLLSCAN | `banking_db.ledger_entries` |
+| **API Gateway** | HTTP `:8080`<br>Prometheus `:8081` | • Edge ingress & HTTP REST-to-gRPC translation<br>• 6-layer defense-in-depth security pipeline<br>• Distributed `FailoverCoordinator` dynamic router | Stateless |
+| **Wallet Service (Primary)** | gRPC `:50051`<br>Management `:9094` | • Core banking engine for `us-east-1-primary`<br>• Multi-document ACID transactions (`Majority`/`Snapshot`)<br>• Atomic Transactional Outbox relay for ledger decoupling<br>• OTel W3C tracing, gRPC health, Prometheus metrics | `banking_db.wallets`<br>`banking_db.idempotency_records`<br>`banking_db.ledger_tasks` (Outbox) |
+| **Wallet Service (Standby)** | gRPC `:50053`<br>Management `:9093` | • Hot disaster recovery replica for `eu-west-1-standby`<br>• Real-time takeover target with Standby Write Fencing<br>• OTel W3C tracing, gRPC health, Prometheus metrics | Shared replica set `rs0`<br>(instant failover target) |
+| **Ledger Service** | gRPC `:50052`<br>Management `:9092` | • Immutable financial journal & audit ledger<br>• Reverse-chronological cursor-based queries<br>• Compound and unique indexing eliminating COLLSCAN<br>• OTel W3C tracing, gRPC health, Prometheus metrics | `banking_db.ledger_entries` |
 | **Logging Service** | HTTP `:8090`<br>Prometheus `:9090` | • High-throughput AMQP event consumer & deduplicator<br>• Operational log search API & trace reconstruction<br>• Dead-letter queue governance (`wallet.logging.dead.v1`) | `logging_db.events` |
 
 * **Strict Contract-First Communication**: Internal inter-service communication operates exclusively over gRPC using Protobuf v3 contracts (`proto/wallet/wallet.proto` and `proto/ledger/ledger.proto`), guaranteeing type safety, high throughput, and backward compatibility.
@@ -133,13 +133,13 @@ flowchart TB
 
     subgraph CoreServices["Core Financial Services Layer"]
         subgraph PrimaryRegion["us-east-1 (Primary Active)"]
-            WP["wallet-primary (:50051)<br/>- ACID Transfer Engine<br/>- Ledger Outbox Relay Worker"]
+            WP["wallet-primary (:50051)<br/>- ACID Transfer Engine<br/>- Ledger Outbox Relay Worker<br/>- Management HTTP (:9094)"]
         end
         subgraph StandbyRegion["eu-west-1 (Standby Hot DR)"]
-            WS["wallet-standby (:50053)<br/>- Standby Hot Replica<br/>- Instant Takeover Target"]
+            WS["wallet-standby (:50053)<br/>- Standby Hot Replica (Fenced)<br/>- Instant Takeover Target<br/>- Management HTTP (:9093)"]
         end
         subgraph CoreLedger["Core Ledger Domain"]
-            LS["ledger-service (:50052)<br/>- Immutable Audit Ledger<br/>- Cursor-Based Pagination"]
+            LS["ledger-service (:50052)<br/>- Immutable Audit Ledger<br/>- Cursor-Based Pagination<br/>- Management HTTP (:9092)"]
         end
     end
 
@@ -149,10 +149,12 @@ flowchart TB
         MDB_I[("Collection: idempotency_records<br/>(30-day TTL)")]
         MDB_O[("Collection: ledger_tasks<br/>(Outbox)")]
         MDB_L[("Collection: ledger_entries<br/>(Indexed)")]
+        MDB_C[("Collection: cluster_state<br/>(Consensus)")]
         MDB --- MDB_W
         MDB --- MDB_I
         MDB --- MDB_O
         MDB --- MDB_L
+        MDB --- MDB_C
     end
 
     subgraph ObservabilityLayer["Centralized Logging & Observability Layer"]
@@ -172,6 +174,7 @@ flowchart TB
     GW -->|"gRPC (Active)"| WP
     GW -.->|"gRPC (Standby)"| WS
     GW -->|"gRPC"| LS
+    GW <-->|"Failover Consensus"| MDB_C
 
     WP -->|"ACID Multi-Doc TX"| MDB
     WS -.->|"ACID Multi-Doc TX"| MDB
@@ -188,7 +191,10 @@ flowchart TB
     LOG_SVC -->|"Persist Logs"| LOG_DB
     REST -->|"Log & Trace Queries"| LOG_SVC
 
-    PROM -->|"Scrape :8081, :9090"| GW
+    PROM -->|"Scrape :8081"| GW
+    PROM -->|"Scrape :9094"| WP
+    PROM -->|"Scrape :9093"| WS
+    PROM -->|"Scrape :9092"| LS
     PROM -->|"Scrape :9090"| LOG_SVC
     GRAF -->|"Visualize Data"| PROM
 ```
@@ -379,14 +385,14 @@ graph TD
 
 | Service | Container Name | Protocol / Ports | Role & Responsibilities |
 |---|---|---|---|
-| **API Gateway** | `wallet_api_gateway` | HTTP `:8080`<br/>Prometheus `:8081` | REST ingress, request validation, gRPC reverse proxy, active-standby failover router. |
-| **Wallet Service (Primary)** | `wallet_primary_active` | gRPC `:50051` | Primary active banking engine (`us-east-1`). ACID multi-doc transactions, balance management, `LedgerRelay` outbox worker. |
-| **Wallet Service (Standby)** | `wallet_standby_hot_dr` | gRPC `:50053` | Hot standby disaster recovery replica (`eu-west-1`). Identical engine ready for instant promotion. |
-| **Ledger Service** | `wallet_ledger_service` | gRPC `:50052` | Immutable financial ledger, transaction journal recording, reverse-chronological cursor-based queries. |
+| **API Gateway** | `wallet_api_gateway` | HTTP `:8080`<br/>Prometheus `:8081` | REST ingress, request validation, gRPC reverse proxy, distributed failover coordinator router. |
+| **Wallet Service (Primary)** | `wallet_primary_active` | gRPC `:50051`<br/>Management `:9094` | Primary active banking engine (`us-east-1`). ACID multi-doc transactions, balance management, `LedgerRelay` outbox worker, gRPC health probe, Prometheus `/metrics` and `/healthz`. |
+| **Wallet Service (Standby)** | `wallet_standby_hot_dr` | gRPC `:50053`<br/>Management `:9093` | Hot standby disaster recovery replica (`eu-west-1`). Identical engine with Standby Write Fencing ready for instant promotion, gRPC health probe, Prometheus `/metrics` and `/healthz`. |
+| **Ledger Service** | `wallet_ledger_service` | gRPC `:50052`<br/>Management `:9092` | Immutable financial ledger, transaction journal recording, reverse-chronological cursor-based queries, gRPC health probe, Prometheus `/metrics` and `/healthz`. |
 | **Logging Service** | `wallet_logging_service` | HTTP `:8090`<br/>Prometheus `:9090` | AMQP log consumer, validation, deduplication, Log Search API (`/api/v1/logs`), Trace Reconstruction (`/api/v1/traces/{id}`). |
-| **MongoDB** | `wallet_mongodb` | TCP `:27017` | Multi-document ACID transactional datastore running replica set `rs0`. Hosts `banking_db` and `logging_db`. |
+| **MongoDB** | `wallet_mongodb` | TCP `:27017` | Multi-document ACID transactional datastore running replica set `rs0`. Hosts `banking_db` (including `cluster_state`) and `logging_db`. |
 | **RabbitMQ** | `wallet_rabbitmq` | AMQP `:5672`<br/>Management `:15672` | High-throughput asynchronous message broker with management UI, direct exchange, and dead-letter exchanges. |
-| **Prometheus** | `wallet_prometheus` | HTTP `:9091` | Time-series metrics collection server scraping gateway, logging, and infrastructure metrics. |
+| **Prometheus** | `wallet_prometheus` | HTTP `:9091` | Time-series metrics collection server scraping gateway (:8081), primary wallet (:9094), standby wallet (:9093), ledger (:9092), and logging (:9090). |
 | **Grafana** | `wallet_grafana` | HTTP `:3000` | Observability dashboards auto-provisioned with logging health, throughput, and error metrics. |
 
 ---
@@ -403,7 +409,7 @@ graph TD
     P1["Phase 1: Financial & Persistence Hardening<br/>(COMPLETED)"]:::completed
     L15["Centralized Asynchronous Logging (Phases 1-5)<br/>(COMPLETED)"]:::completed
     P2["Phase 2: Zero-Trust Security & Identity<br/>(COMPLETED)"]:::completed
-    P3["Phase 3: High Availability & Tracing<br/>(PLANNED)"]:::planned
+    P3["Phase 3: High Availability & Tracing<br/>(COMPLETED)"]:::completed
     P4["Phase 4: Cloud-Native & Double-Entry<br/>(PLANNED)"]:::planned
 
     P1 --> P2
@@ -437,17 +443,18 @@ graph TD
 - [x] **Duplicate Wallet Prevention**: Enforced strict `InsertOne` semantics with `codes.AlreadyExists` / HTTP 409 Conflict preventing account balance overwrites.
 - [x] **Secrets & Configuration Management (GAP-SEC-04)**: Externalized all configuration and certificate paths into `.env.example`.
 
+#### 4. High Availability, Resilience & Distributed Tracing (Phase 3)
+- [x] **Graceful Process Lifecycle & Request Draining (GAP-REL-01)**: Implemented OS signal capture (`SIGTERM`/`SIGINT`) with HTTP `server.Shutdown()` (15s drain window) and `grpcServer.GracefulStop()` across `api-gateway`, `wallet-service`, and `ledger-service`. Decoupled background `LedgerRelay` workers safely shut down via `relay.Stop()`.
+- [x] **Distributed Failover Coordination (GAP-HA-01)**: Replaced single-process in-memory state with a pluggable `FailoverCoordinator` backed by MongoDB `cluster_state` collection (`_id: "active_target"`) featuring 1-second TTL cache for sub-microsecond gateway routing. Atomic updates propagate immediately across all gateway replicas and persist across restarts.
+- [x] **Standby Write Fencing & Role Consensus (GAP-HA-02)**: Enforced write fencing on standby wallet instances. Mutation RPCs (`CreateWallet`, `TransferFunds`) are rejected on standby with `codes.FailedPrecondition`, while read queries (`GetBalance`) and health checks remain fully accessible.
+- [x] **Standard gRPC Health Probes (GAP-REL-03)**: Implemented official `grpc.health.v1.Health` protocol on `wallet-service` (Primary & Standby) and `ledger-service`. Integrated API Gateway `/readyz` endpoint with live gRPC health validation of the active target node.
+- [x] **OpenTelemetry Distributed Tracing (GAP-OBS-01)**: Integrated official OpenTelemetry Go SDK (`go.opentelemetry.io/otel`) with global W3C `TraceContext` propagator. Added `TraceHTTPMiddleware` (injecting `X-Trace-ID` and `traceparent` headers) and gRPC client/server interceptors for end-to-end distributed span propagation.
+- [x] **Core Service Prometheus Exporters (GAP-OBS-02)**: Exposed dedicated management HTTP servers on `:9094` (`wallet-primary`), `:9093` (`wallet-standby`), and `:9092` (`ledger-service`), serving Prometheus `/metrics` (gRPC latency histograms, request counters, active target gauge) and `/healthz`. Configured automated Prometheus scrape jobs.
+- [x] **High-Concurrency Automated Test Suite (GAP-QA-01)**: Implemented race-verified concurrency tests (`cmd/wallet-service/concurrency_test.go`) covering 50-thread concurrent overdraft debit races ($100 balance, exactly 10 succeed, 40 fail, ending balance strictly $0.00 with zero leakage), 20-thread idempotent replays, standby write fencing, and gRPC health checks. 100% race-free under `go test -race ./...`.
+
 ---
 
 ### Planned Roadmap (Yet to be Implemented)
-
-#### Phase 3: High Availability, Resilience & Tracing (Upcoming)
-- [ ] **Graceful Process Lifecycle (GAP-REL-01)**: Implement OS signal interception (`SIGTERM`/`SIGINT`) with connection draining on HTTP servers and `grpcServer.GracefulStop()` across all services.
-- [ ] **Distributed Failover Consensus (GAP-HA-01)**: Replace the single-process in-memory `activeTarget` state with a distributed coordination store (Consul KV / etcd / Raft) or service mesh routing.
-- [ ] **OpenTelemetry Distributed Tracing (GAP-OBS-01)**: Integrate the official OpenTelemetry Go SDK with W3C TraceContext propagation (`traceparent`, `tracestate`) exporting to Jaeger/Tempo.
-- [ ] **Standard gRPC Health Probes (GAP-REL-03)**: Implement `grpc.health.v1.Health` protocol across all gRPC services for Kubernetes liveness and readiness monitoring.
-- [ ] **Core Service Prometheus Exporters (GAP-OBS-02)**: Expose `:9090/metrics` on `wallet-service` and `ledger-service` exporting gRPC latency histograms and database connection pool statistics.
-- [ ] **High-Concurrency Automated Test Suite (GAP-QA-01)**: Add automated stress and race testing (50+ concurrent transfers against identical wallets) verifying atomic balance constraints under extreme load.
 
 #### Phase 4: Cloud-Native Infrastructure & True Double-Entry (Upcoming)
 - [ ] **GAAP/IFRS True Double-Entry Bookkeeping (GAP-FIN-02)**: Transition ledger to multi-asset chart of accounts with balanced journal postings ($\sum \text{Debits} == \sum \text{Credits}$) and cryptographic hash chaining.
@@ -630,18 +637,21 @@ curl -s "http://localhost:8090/api/v1/traces/<association_id>" | jq .
 * **Grafana Dashboards**: [http://localhost:3000](http://localhost:3000) (Credentials: `admin` / `admin`)
 * **RabbitMQ Management Console**: [http://localhost:15672](http://localhost:15672) (Credentials: `guest` / `guest`)
 
-### 9. Automated Testing with Postman or Bruno
-A comprehensive 24-test suite covering all Phase 1 and Phase 2 endpoints and edge cases is included in the `postman/` directory:
-* **Collection**: `postman/Global_Wallet_Microservices.postman_collection.json`
-* **Environment**: `postman/Global_Wallet_Local.postman_environment.json`
+### 9. Automated Testing with Postman, Bruno & BloomRPC
+A comprehensive 28-test automated regression suite covering all Phase 1, Phase 2, and Phase 3 capabilities is included in the `postman/` directory:
+* **Postman/Bruno Collection**: `postman/Global_Wallet_Microservices.postman_collection.json`
+* **Local Environment**: `postman/Global_Wallet_Local.postman_environment.json`
+* **BloomRPC Test Presets**: `postman/BloomRPC_Test_Presets.json` (see [docs/BLOOMRPC_GUIDE.md](docs/BLOOMRPC_GUIDE.md))
 
-Both files can be imported directly into **Postman** or **Bruno** (via *Import Collection* -> *Postman Collection*). The test runner validates:
-1. System Health & Probes (`/healthz`, `/readyz`, `/api/v1/cluster/status`)
+Both Postman and Bruno test runners validate:
+1. System Health & Probes (`/healthz`, `/readyz` live gRPC active node check, `/api/v1/cluster/status`)
 2. Auth & Token Minting (`/api/v1/auth/token` with claims validation)
 3. Zero-Trust Security Gates (Missing token 401, Invalid token 401, IDOR rejection 403, Rate limiter 429)
 4. Wallet Lifecycle (Alice USD $1000, Bob USD $500, Duplicate wallet 409 Conflict)
 5. Transfers & Idempotency (Atomic fund transfers, duplicate key replay, insufficient funds)
-6. Disaster Recovery Failover (Admin-only failover, route verification, reset)
+6. Disaster Recovery Failover (Admin-only failover, distributed `cluster_state` verification, route reset)
+7. Phase 3 Management Metrics (`:9094/metrics`, `:9093/metrics`, `:9092/metrics`, `:9090/metrics`)
+8. OpenTelemetry W3C distributed tracing context propagation (`traceparent` and `X-Trace-ID` verification)
 
 ---
 
@@ -652,12 +662,13 @@ Both files can be imported directly into **Postman** or **Bruno** (via *Import C
 | [docs/PRODUCTION_READINESS_AUDIT.md](docs/PRODUCTION_READINESS_AUDIT.md) | Comprehensive 8-pillar production audit, gap catalog, risk analysis, and 4-phase remediation roadmap. |
 | [docs/PHASE1_IMPLEMENTATION.md](docs/PHASE1_IMPLEMENTATION.md) | Technical deep-dive on Phase 1: transactional outbox pattern, database indexing, TTL, and pagination. |
 | [docs/PHASE2_IMPLEMENTATION.md](docs/PHASE2_IMPLEMENTATION.md) | Technical deep-dive on Phase 2: JWT authentication, RBAC, IDOR protection, inter-service mTLS, rate limiting, and security headers. |
+| [docs/PHASE3_IMPLEMENTATION.md](docs/PHASE3_IMPLEMENTATION.md) | Technical deep-dive on Phase 3: distributed failover coordination, standby write fencing, graceful shutdown, standard gRPC health probes, OpenTelemetry W3C distributed tracing, Prometheus metrics, and high-concurrency race suites. |
 | [docs/LOGGING_ARCHITECTURE.md](docs/LOGGING_ARCHITECTURE.md) | Architectural specification for centralized asynchronous logging, correlation IDs, and resilient spooling. |
 | [docs/LOGGING_IMPLEMENTATION.md](docs/LOGGING_IMPLEMENTATION.md) | Complete implementation record for logging phases 1 through 5, metric definitions, and dashboard provisioning. |
 | [docs/BEGINNER_GUIDE.md](docs/BEGINNER_GUIDE.md) | Step-by-step onboarding guide explaining microservices, gRPC, Protobuf, and request flow from first principles. |
 | [docs/LOCAL_DEVELOPMENT.md](docs/LOCAL_DEVELOPMENT.md) | Guide for native local development on Windows/macOS/Linux without full Docker Compose dependencies. |
 | [docs/BLOOMRPC_GUIDE.md](docs/BLOOMRPC_GUIDE.md) | Instructions for interacting directly with gRPC microservices using BloomRPC or Postman gRPC client. |
-| [postman/](postman/) | Automated 24-test integration test collection and environment for Postman and Bruno. |
+| [postman/](postman/) | Automated 28-test integration collection, environment, and BloomRPC JSON presets. |
 | [SECURITY.md](SECURITY.md) | Security policy, vulnerability reporting guidelines, and development boundaries. |
 
 

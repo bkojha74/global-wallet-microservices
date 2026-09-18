@@ -175,6 +175,7 @@ Open a new PowerShell window and leave it running:
 ```powershell
 Set-Location "C:\workarea\personal\After-equifax\global-wallet-microservices"
 $env:PORT = "50052"
+$env:METRICS_PORT = "9092"
 $env:MONGO_URI = "mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true"
 $env:REGION_NAME = "global-core"
 $env:LOGGING_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
@@ -185,6 +186,7 @@ Wait for:
 
 ```text
 [LEDGER-SERVICE] gRPC listening on :50052
+[LEDGER-SERVICE] Management HTTP server listening on :9092 (/metrics, /healthz)
 ```
 
 ### 3. Start the primary wallet service
@@ -194,10 +196,12 @@ Open another PowerShell window:
 ```powershell
 Set-Location "C:\workarea\personal\After-equifax\global-wallet-microservices"
 $env:PORT = "50051"
+$env:METRICS_PORT = "9094"
 $env:MONGO_URI = "mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true"
 $env:LEDGER_SERVICE_ADDR = "127.0.0.1:50052"
 $env:REGION_NAME = "us-east-1-primary"
 $env:IS_ACTIVE = "true"
+$env:COORDINATOR_ROLE = "PRIMARY"
 $env:LOGGING_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 go run .\cmd\wallet-service
 ```
@@ -206,6 +210,7 @@ Wait for:
 
 ```text
 [WALLET-SERVICE] Listening for gRPC requests on :50051
+[WALLET-SERVICE] Management HTTP server listening on :9094 (/metrics, /healthz)
 ```
 
 ### 4. Start the standby wallet service
@@ -215,10 +220,12 @@ Open another PowerShell window:
 ```powershell
 Set-Location "C:\workarea\personal\After-equifax\global-wallet-microservices"
 $env:PORT = "50053"
+$env:METRICS_PORT = "9093"
 $env:MONGO_URI = "mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true"
 $env:LEDGER_SERVICE_ADDR = "127.0.0.1:50052"
 $env:REGION_NAME = "eu-west-1-standby"
 $env:IS_ACTIVE = "false"
+$env:COORDINATOR_ROLE = "STANDBY"
 $env:LOGGING_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 go run .\cmd\wallet-service
 ```
@@ -227,6 +234,7 @@ Wait for:
 
 ```text
 [WALLET-SERVICE] Listening for gRPC requests on :50053
+[WALLET-SERVICE] Management HTTP server listening on :9093 (/metrics, /healthz)
 ```
 
 ### 5. Start the API gateway
@@ -236,6 +244,8 @@ Open a fourth PowerShell window:
 ```powershell
 Set-Location "C:\workarea\personal\After-equifax\global-wallet-microservices"
 $env:HTTP_PORT = "8080"
+$env:METRICS_PORT = "8081"
+$env:MONGO_URI = "mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true"
 $env:PRIMARY_WALLET_ADDR = "127.0.0.1:50051"
 $env:STANDBY_WALLET_ADDR = "127.0.0.1:50053"
 $env:LEDGER_ADDR = "127.0.0.1:50052"
@@ -247,6 +257,7 @@ Wait for:
 
 ```text
 [API-GATEWAY] HTTP REST Gateway listening on :8080
+[API-GATEWAY] Metrics exporter listening on :8081
 ```
 
 ### 6. Start the logging service
@@ -372,6 +383,7 @@ Use a separate PowerShell window for each process. Start MongoDB first, then the
 ```powershell
 Set-Location "C:\workarea\personal\After-equifax\global-wallet-microservices"
 $env:PORT = "50052"
+$env:METRICS_PORT = "9092"
 $env:MONGO_URI = "mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true"
 $env:REGION_NAME = "global-core"
 $env:LOGGING_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
@@ -382,6 +394,7 @@ Wait for a log similar to:
 
 ```text
 [LEDGER-SERVICE] gRPC listening on :50052
+[LEDGER-SERVICE] Management HTTP server listening on :9092 (/metrics, /healthz)
 ```
 
 ### 4.2 Primary wallet service
@@ -389,10 +402,12 @@ Wait for a log similar to:
 ```powershell
 Set-Location "C:\workarea\personal\After-equifax\global-wallet-microservices"
 $env:PORT = "50051"
+$env:METRICS_PORT = "9094"
 $env:MONGO_URI = "mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true"
 $env:LEDGER_SERVICE_ADDR = "127.0.0.1:50052"
 $env:REGION_NAME = "us-east-1-primary"
 $env:IS_ACTIVE = "true"
+$env:COORDINATOR_ROLE = "PRIMARY"
 $env:LOGGING_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 go run .\cmd\wallet-service
 ```
@@ -401,6 +416,7 @@ Wait for:
 
 ```text
 [WALLET-SERVICE] Listening for gRPC requests on :50051
+[WALLET-SERVICE] Management HTTP server listening on :9094 (/metrics, /healthz)
 ```
 
 ### 4.3 Standby wallet service
@@ -410,12 +426,21 @@ Run the same service in another PowerShell window with a different port and stan
 ```powershell
 Set-Location "C:\workarea\personal\After-equifax\global-wallet-microservices"
 $env:PORT = "50053"
+$env:METRICS_PORT = "9093"
 $env:MONGO_URI = "mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true"
 $env:LEDGER_SERVICE_ADDR = "127.0.0.1:50052"
 $env:REGION_NAME = "eu-west-1-standby"
 $env:IS_ACTIVE = "false"
+$env:COORDINATOR_ROLE = "STANDBY"
 $env:LOGGING_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 go run .\cmd\wallet-service
+```
+
+Wait for:
+
+```text
+[WALLET-SERVICE] Listening for gRPC requests on :50053
+[WALLET-SERVICE] Management HTTP server listening on :9093 (/metrics, /healthz)
 ```
 
 ### 4.4 API gateway
@@ -425,6 +450,8 @@ Run the gateway in a fourth PowerShell window:
 ```powershell
 Set-Location "C:\workarea\personal\After-equifax\global-wallet-microservices"
 $env:HTTP_PORT = "8080"
+$env:METRICS_PORT = "8081"
+$env:MONGO_URI = "mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true"
 $env:PRIMARY_WALLET_ADDR = "127.0.0.1:50051"
 $env:STANDBY_WALLET_ADDR = "127.0.0.1:50053"
 $env:LEDGER_ADDR = "127.0.0.1:50052"
@@ -439,6 +466,7 @@ Wait for:
 
 ```text
 [API-GATEWAY] HTTP REST Gateway listening on :8080
+[API-GATEWAY] Metrics exporter listening on :8081
 ```
 
 ### 4.5 Logging service
@@ -537,23 +565,26 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/cluster/failov
 curl.exe http://127.0.0.1:8080/api/v1/cluster/status
 ```
 
-### 5.6 Automated Testing via Postman or Bruno
+### 5.6 Automated Testing via Postman, Bruno & BloomRPC
 
-A complete, 24-test automated suite is provided in the repository under [postman/](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/postman):
+A complete 28-test automated suite is provided in the repository under [postman/](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/postman):
 - `postman/Global_Wallet_Microservices.postman_collection.json`
 - `postman/Global_Wallet_Local.postman_environment.json`
+- `postman/BloomRPC_Test_Presets.json` (for direct gRPC testing; see [docs/BLOOMRPC_GUIDE.md](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/docs/BLOOMRPC_GUIDE.md))
 
 **To run in Postman or Bruno**:
 1. Open Postman or Bruno.
 2. In Bruno: Click **Import Collection** -> Select **Postman Collection** -> choose `postman/Global_Wallet_Microservices.postman_collection.json`. Then import the environment file.
 3. In Postman: Click **Import** -> Select both files -> Select the `Global Wallet (Local Environment)` environment.
 4. Run the full collection to automatically verify:
-   - System Health (`/healthz`, `/readyz`, `/api/v1/cluster/status`)
+   - System Health (`/healthz`, `/readyz` live gRPC active node check, `/api/v1/cluster/status`)
    - Authentication & Token Minting (`/api/v1/auth/token`)
    - Security Protections (Missing Auth 401, Invalid Token 401, IDOR 403, Rate Limiting 429)
    - Wallet Management (Alice $1000, Bob $500, Duplicate 409 Conflict)
    - Transfers & Idempotency (Atomic transfer, duplicate key replay, insufficient funds)
-   - Disaster Recovery Failover (Admin-only failover, route verification, reset)
+   - Disaster Recovery Failover (Admin-only failover, distributed `cluster_state` verification, route reset)
+   - Phase 3 Management Metrics (`:9094/metrics`, `:9093/metrics`, `:9092/metrics`, `:9090/metrics`)
+   - OpenTelemetry W3C distributed tracing context propagation (`traceparent` and `X-Trace-ID` headers)
 
 ## 6. Trace one transaction in logs
 
@@ -743,8 +774,9 @@ Keep test data isolated with unique wallet IDs and idempotency keys, or reset th
 
 The gateway failover and MongoDB replica set solve different problems:
 
-- The gateway switches traffic between the primary wallet on `50051` and standby wallet on `50053`.
-- The current MongoDB `rs0` has one member. It supports transactions, but it cannot provide database failover. MongoDB failover requires multiple replica-set members.
+- The gateway switches traffic between the primary wallet on `50051` and standby wallet on `50053` using the distributed `FailoverCoordinator` backed by MongoDB `cluster_state` (`_id: "active_target"`). The active target persists across gateway restarts and synchronizes across replicas.
+- **Standby Write Fencing (GAP-HA-02)**: Mutations (`CreateWallet`, `TransferFunds`) sent to the standby node return `codes.FailedPrecondition`, preventing split-brain writes to standby instances. Read queries (`GetBalance`) and health checks remain fully operational on standby.
+- The current local MongoDB `rs0` has one member. It supports transactions, but multi-AZ database failover requires a multi-node replica set (Phase 4).
 
 Both wallet services use the same MongoDB database, so the standby can read data created through the primary.
 

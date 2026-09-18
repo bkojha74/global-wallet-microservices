@@ -6,13 +6,18 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -317,6 +322,12 @@ func main() {
 	}
 	idxCancel()
 
+	// Phase 3 (GAP-OBS-01): OpenTelemetry W3C distributed tracing
+	shutdownTracer, err := observability.InitTracer("ledger-service")
+	if err == nil && shutdownTracer != nil {
+		defer func() { _ = shutdownTracer(context.Background()) }()
+	}
+
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
 		log.Fatalf("Failed to listen: %v", err)
@@ -326,7 +337,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to configure server mTLS credentials: %v", err)
 	}
+	serverOpts = append(serverOpts, grpc.ChainUnaryInterceptor(
+		observability.UnaryServerTraceInterceptor("ledger-service"),
+		observability.DefaultMetrics.UnaryServerMetricsInterceptor("ledger-service"),
+	))
 	grpcServer := grpc.NewServer(serverOpts...)
+
+	// Phase 3 (GAP-REL-03): Register standard gRPC Health Check service
+	healthServer := health.NewServer()
+	grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
+	healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+	healthServer.SetServingStatus("ledger.v1.LedgerService", grpc_health_v1.HealthCheckResponse_SERVING)
 
 	// Phase 5 (GAP-10): initialise transactional outbox when enabled.
 	var ledgerOutbox *observability.MongoOutbox
@@ -358,12 +379,55 @@ func main() {
 	}
 	ledgerv1.RegisterLedgerServiceServer(grpcServer, srv)
 
-	if outboxPublisher != nil {
-		defer outboxPublisher.Close()
+	// Phase 3 (GAP-OBS-02): Dedicated management HTTP server for Prometheus metrics and health
+	metricsPort := os.Getenv("METRICS_PORT")
+	if metricsPort == "" {
+		metricsPort = "9092"
 	}
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", observability.DefaultMetrics.Handler())
+	metricsMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"status":"UP","region":%q}`+"\n", region)
+	})
+	metricsServer := &http.Server{
+		Addr:    ":" + metricsPort,
+		Handler: metricsMux,
+	}
+	go func() {
+		log.Printf("[LEDGER-SERVICE] Management metrics server listening on :%s/metrics", metricsPort)
+		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("[LEDGER-SERVICE] Metrics server error: %v", err)
+		}
+	}()
 
-	log.Printf("[LEDGER-SERVICE] gRPC listening on :%s", port)
-	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
+	go func() {
+		log.Printf("[LEDGER-SERVICE] gRPC listening on :%s", port)
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("Failed to serve: %v", err)
+		}
+	}()
+
+	// Phase 3 (GAP-REL-01): Graceful Shutdown on SIGINT / SIGTERM
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	sig := <-sigChan
+	log.Printf("[LEDGER-SERVICE] Received signal %v, initiating graceful shutdown...", sig)
+
+	healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+	healthServer.SetServingStatus("ledger.v1.LedgerService", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+
+	grpcServer.GracefulStop()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[LEDGER-SERVICE] Metrics server shutdown error: %v", err)
 	}
+	if outboxPublisher != nil {
+		outboxPublisher.Close()
+	}
+	client.Disconnect(shutdownCtx)
+	log.Println("[LEDGER-SERVICE] Graceful shutdown completed cleanly.")
 }

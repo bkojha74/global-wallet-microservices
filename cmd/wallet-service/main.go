@@ -5,14 +5,19 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -22,6 +27,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/readconcern"
 	"go.mongodb.org/mongo-driver/mongo/writeconcern"
 
+	"wallet-system/pkg/coordinator"
 	"wallet-system/pkg/db"
 	"wallet-system/pkg/observability"
 	"wallet-system/pkg/tlsutil"
@@ -35,11 +41,32 @@ type server struct {
 	ledgerClient ledgerv1.LedgerServiceClient
 	region       string
 	isActive     bool
+	targetRole   string // "PRIMARY" or "STANDBY"
+	coordinator  coordinator.FailoverCoordinator
 	logger       observability.Logger
+	dbName       string
 	// Phase 5 (GAP-10): outbox writes AUDIT events inside the MongoDB transaction.
 	outbox *observability.MongoOutbox // nil when outbox is disabled
 	// Phase 1 (GAP-FIN-01): transactional outbox relay for decoupled ledger entries.
 	ledgerRelay *LedgerRelay
+}
+
+func (s *server) db() *mongo.Database {
+	if s.dbName != "" {
+		return s.mongoClient.Database(s.dbName)
+	}
+	return s.mongoClient.Database("banking_db")
+}
+
+func (s *server) isWritable(ctx context.Context) bool {
+	if s.coordinator != nil {
+		if target, err := s.coordinator.GetActiveTarget(ctx); err == nil && target != "" {
+			if s.targetRole != "" {
+				return target == s.targetRole
+			}
+		}
+	}
+	return s.isActive
 }
 
 func (s *server) emit(ctx context.Context, eventType, level, message string, attributes map[string]any) {
@@ -82,14 +109,15 @@ type IdempotencyRecord struct {
 }
 
 func (s *server) HealthCheck(ctx context.Context, req *walletv1.HealthRequest) (*walletv1.HealthResponse, error) {
+	active := s.isWritable(ctx)
 	statusStr := "STANDBY"
-	if s.isActive {
+	if active {
 		statusStr = "ACTIVE"
 	}
 	return &walletv1.HealthResponse{
 		Status:   statusStr,
 		Region:   s.region,
-		IsActive: s.isActive,
+		IsActive: active,
 	}, nil
 }
 
@@ -109,7 +137,11 @@ func (s *server) CreateWallet(ctx context.Context, req *walletv1.CreateWalletReq
 		return nil, status.Errorf(codes.InvalidArgument, "initial balance cannot be negative: %d", req.InitialBalance)
 	}
 
-	col := s.mongoClient.Database("banking_db").Collection("wallets")
+	if !s.isWritable(ctx) {
+		return nil, status.Errorf(codes.FailedPrecondition, "instance is standby replica; write operations rejected (region: %s)", s.region)
+	}
+
+	col := s.db().Collection("wallets")
 
 	model := WalletModel{
 		ID:        req.WalletId,
@@ -144,7 +176,7 @@ func (s *server) GetBalance(ctx context.Context, req *walletv1.GetBalanceRequest
 	ctx = observability.WithCorrelation(ctx, correlation)
 	s.emit(ctx, "wallet.balance.request_received", observability.LevelInfo, "Get balance request received", map[string]any{"wallet_id": req.WalletId})
 	log.Printf("[WALLET] GetBalance proto received: wallet_id=%s region=%s", req.WalletId, s.region)
-	col := s.mongoClient.Database("banking_db").Collection("wallets")
+	col := s.db().Collection("wallets")
 
 	var wallet WalletModel
 	err := col.FindOne(ctx, bson.M{"_id": req.WalletId}).Decode(&wallet)
@@ -220,6 +252,20 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 		}, nil
 	}
 
+	if !s.isWritable(ctx) {
+		log.Printf("[WALLET-TX] trace_id=%s step=standby_write_rejected region=%s", traceID, s.region)
+		durationMS := time.Since(startTime).Milliseconds()
+		s.emitTerminal(ctx, "wallet.transfer.failed", observability.LevelWarn, "Standby write rejected", durationMS, false, map[string]any{
+			"error_code": "standby_write_rejected",
+			"region":     s.region,
+		})
+		return &walletv1.TransferFundsResponse{
+			Status:          walletv1.TransferFundsResponse_INTERNAL_ERROR,
+			ErrorMessage:    fmt.Sprintf("instance is standby replica; write operations rejected (region: %s)", s.region),
+			HandledByRegion: s.region,
+		}, status.Errorf(codes.FailedPrecondition, "instance is standby replica; write operations rejected (region: %s)", s.region)
+	}
+
 	session, err := s.mongoClient.StartSession()
 	if err != nil {
 		durationMS := time.Since(startTime).Milliseconds()
@@ -245,9 +291,9 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 
 	_, err = session.WithTransaction(ctx, func(sessCtx mongo.SessionContext) (interface{}, error) {
 		log.Printf("[WALLET-TX] trace_id=%s step=mongo_transaction_started", traceID)
-		walletsCol := s.mongoClient.Database("banking_db").Collection("wallets")
-		idempCol := s.mongoClient.Database("banking_db").Collection("idempotency_records")
-		ledgerTasksCol := s.mongoClient.Database("banking_db").Collection("ledger_tasks")
+		walletsCol := s.db().Collection("wallets")
+		idempCol := s.db().Collection("idempotency_records")
+		ledgerTasksCol := s.db().Collection("ledger_tasks")
 
 		// 1. Idempotency verification
 		var existingIdemp IdempotencyRecord
@@ -513,13 +559,23 @@ func main() {
 	}
 	defer client.Disconnect(ctx)
 
+	// Phase 3 (GAP-OBS-01): OpenTelemetry W3C distributed tracing
+	shutdownTracer, err := observability.InitTracer("wallet-service")
+	if err == nil && shutdownTracer != nil {
+		defer func() { _ = shutdownTracer(context.Background()) }()
+	}
+
 	// Dial Ledger Service via gRPC
 	log.Printf("[WALLET-SERVICE] Connecting to Ledger Service at %s...", ledgerAddr)
 	dialOpt, err := getOutboundDialOption()
 	if err != nil {
 		log.Fatalf("Failed to initialize outbound mTLS dial credentials: %v", err)
 	}
-	conn, err := grpc.NewClient(ledgerAddr, dialOpt)
+	ledgerDialOpts := []grpc.DialOption{
+		dialOpt,
+		grpc.WithUnaryInterceptor(observability.UnaryClientTraceInterceptor("wallet-service")),
+	}
+	conn, err := grpc.NewClient(ledgerAddr, ledgerDialOpts...)
 	if err != nil {
 		log.Fatalf("Failed to connect to ledger service: %v", err)
 	}
@@ -535,7 +591,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to configure server mTLS credentials: %v", err)
 	}
+	serverOpts = append(serverOpts, grpc.ChainUnaryInterceptor(
+		observability.UnaryServerTraceInterceptor("wallet-service"),
+		observability.DefaultMetrics.UnaryServerMetricsInterceptor("wallet-service"),
+	))
 	grpcServer := grpc.NewServer(serverOpts...)
+
+	// Phase 3 (GAP-REL-03): Register standard gRPC Health Check service
+	healthServer := health.NewServer()
+	grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
+	healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+	healthServer.SetServingStatus("wallet.v1.WalletService", grpc_health_v1.HealthCheckResponse_SERVING)
 
 	// Phase 1: Ensure MongoDB indexes
 	walletIdxCtx, walletIdxCancel := context.WithTimeout(ctx, 10*time.Second)
@@ -570,25 +636,92 @@ func main() {
 		}
 	}
 
+	targetRole := os.Getenv("COORDINATOR_ROLE")
+	if targetRole == "" {
+		if isActive {
+			targetRole = coordinator.TargetPrimary
+		} else {
+			targetRole = coordinator.TargetStandby
+		}
+	}
+	coord := coordinator.NewMongoFailoverCoordinator(client.Database("banking_db"), 1*time.Second)
+	defer coord.Close()
+
 	srv := &server{
 		mongoClient:  client,
 		ledgerClient: ledgerClient,
 		region:       region,
 		isActive:     isActive,
+		targetRole:   targetRole,
+		coordinator:  coord,
 		logger:       observability.LoggerFromEnvironment("wallet-service", environment, region, os.Stdout),
 		outbox:       walletOutbox,
 		ledgerRelay:  ledgerRelay,
 	}
 	walletv1.RegisterWalletServiceServer(grpcServer, srv)
 
-	if outboxPublisher != nil {
-		defer outboxPublisher.Close()
+	// Phase 3 (GAP-OBS-02): Dedicated management HTTP server for Prometheus metrics and health
+	metricsPort := os.Getenv("METRICS_PORT")
+	if metricsPort == "" {
+		metricsPort = "9094"
+		if !isActive {
+			metricsPort = "9093"
+		}
 	}
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", observability.DefaultMetrics.Handler())
+	metricsMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		active := srv.isWritable(r.Context())
+		st := "STANDBY"
+		if active {
+			st = "ACTIVE"
+		}
+		fmt.Fprintf(w, `{"status":%q,"region":%q,"is_active":%t}`+"\n", st, region, active)
+	})
+	metricsServer := &http.Server{
+		Addr:    ":" + metricsPort,
+		Handler: metricsMux,
+	}
+	go func() {
+		log.Printf("[WALLET-SERVICE] Management metrics server listening on :%s/metrics", metricsPort)
+		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("[WALLET-SERVICE] Metrics server error: %v", err)
+		}
+	}()
 
-	log.Printf("[WALLET-SERVICE] Listening for gRPC requests on :%s", port)
-	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
+	go func() {
+		log.Printf("[WALLET-SERVICE] Listening for gRPC requests on :%s", port)
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("Failed to serve: %v", err)
+		}
+	}()
+
+	// Phase 3 (GAP-REL-01): Graceful Shutdown on SIGINT / SIGTERM
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	sig := <-sigChan
+	log.Printf("[WALLET-SERVICE] Received signal %v, initiating graceful shutdown...", sig)
+
+	healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+	healthServer.SetServingStatus("wallet.v1.WalletService", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+
+	grpcServer.GracefulStop()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[WALLET-SERVICE] Metrics server shutdown error: %v", err)
 	}
+	if ledgerRelay != nil {
+		ledgerRelay.Stop()
+	}
+	if outboxPublisher != nil {
+		outboxPublisher.Close()
+	}
+	client.Disconnect(shutdownCtx)
+	log.Println("[WALLET-SERVICE] Graceful shutdown completed cleanly.")
 }
 
 func environmentName() string {

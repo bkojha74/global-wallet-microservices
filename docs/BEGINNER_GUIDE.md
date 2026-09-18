@@ -42,7 +42,7 @@ The gateway is the public HTTP entry point. It:
 3. Calls the active Wallet Service through gRPC.
 4. Converts the protobuf response back into JSON.
 
-`Gateway.getActiveWalletClient` chooses either the primary or standby wallet client. `handleFailover` changes this choice in memory. The gateway also calls the Ledger Service directly for ledger queries.
+`Gateway.getActiveWalletClient` queries the distributed `FailoverCoordinator` (`pkg/coordinator/coordinator.go`) to route to either the primary or standby wallet client. `handleFailover` atomically records the switch in MongoDB (`cluster_state` collection) under administrative RBAC. The gateway also calls the Ledger Service directly for ledger queries.
 
 ### Wallet Service
 
@@ -318,7 +318,9 @@ curl -X POST http://localhost:8080/api/v1/cluster/failover \
   -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
-This changes an in-memory value inside the gateway process under administrative RBAC (`role=admin` or `scope=cluster:admin`). It does not automatically detect failures, replicate data between databases, or move traffic between independent regions. Restarting the gateway resets its initial target.
+This invokes the distributed `FailoverCoordinator` (`pkg/coordinator/coordinator.go`) under administrative RBAC (`role=admin` or `scope=cluster:admin`), atomically recording the active target in MongoDB (`banking_db.cluster_state`). Because state is stored centrally in the database and cached with a 1-second TTL, all gateway replicas immediately synchronize, and the target persists across gateway restarts.
+
+Furthermore, **Standby Write Fencing (GAP-HA-02)** guarantees that write operations (`CreateWallet`, `TransferFunds`) sent to the standby node return `codes.FailedPrecondition`, ensuring only the promoted active node can execute balance modifications. Read queries (`GetBalance`) and health checks remain fully operational on standby.
 
 ## 9. Kubernetes overview
 
@@ -340,15 +342,20 @@ This project is an advanced architectural learning/demo system. The current impl
 - Zero-Trust security is enforced at the API Gateway: HMAC-SHA256 JWT tokens, IDOR ownership verification (`sub == wallet_id`), administrative RBAC for failover, rate limiting (60 rps/100 burst), 1MB payload limits, and security headers.
 - Inter-service gRPC supports mutual TLS (`mTLS`) via `GRPC_TLS_ENABLED=true` (and defaults to plaintext for friction-free local development).
 - Double-entry bookkeeping: A single journal document with source and destination is stored per transfer; full GAAP/IFRS multi-account debit/credit split postings are planned for Phase 4.
-- Primary and standby share MongoDB in the local deployment. Cross-region data replication and distributed consensus for failover are planned for Phase 3.
+- High Availability & Resilience (Phase 3 Completed): The platform features distributed consensus via `FailoverCoordinator`, Standby Write Fencing, OpenTelemetry W3C distributed tracing, standard `grpc.health.v1` health probes, and Prometheus management metrics on `:9094`/`:9093`/`:9092`. Multi-node cross-AZ replica sets and non-root Kubernetes hardening are scheduled for Phase 4.
 
 ## 11. Where to read next
 
-- HTTP routing: `cmd/api-gateway/main.go`
-- Wallet behavior and transfer sequence: `cmd/wallet-service/main.go`
-- Ledger persistence: `cmd/ledger-service/main.go`
+- HTTP routing & OTel middleware: `cmd/api-gateway/main.go`
+- Wallet behavior, outbox worker & write fencing: `cmd/wallet-service/main.go`
+- High-concurrency race suites: `cmd/wallet-service/concurrency_test.go`
+- Ledger persistence & gRPC health: `cmd/ledger-service/main.go`
+- Failover Coordinator: `pkg/coordinator/coordinator.go`
+- OpenTelemetry Tracing & Metrics: `pkg/observability/tracer.go` & `pkg/observability/metrics.go`
 - Wallet gRPC contract: `proto/wallet/wallet.proto`
 - Ledger gRPC contract: `proto/ledger/ledger.proto`
+- Phase 3 Implementation: `docs/PHASE3_IMPLEMENTATION.md`
+- BloomRPC gRPC Testing: `docs/BLOOMRPC_GUIDE.md`
 - MongoDB connection retry: `pkg/db/mongo.go`
 - Local topology: `docker-compose.yml`
 - Kubernetes topology: `k8s/`
