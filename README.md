@@ -404,13 +404,12 @@ An exhaustive production readiness audit was performed in [docs/PRODUCTION_READI
 ```mermaid
 graph TD
     classDef completed fill:#d4edda,stroke:#28a745,stroke-width:2px,color:#155724;
-    classDef planned fill:#fff3cd,stroke:#ffc107,stroke-width:2px,color:#856404;
 
     P1["Phase 1: Financial & Persistence Hardening<br/>(COMPLETED)"]:::completed
     L15["Centralized Asynchronous Logging (Phases 1-5)<br/>(COMPLETED)"]:::completed
     P2["Phase 2: Zero-Trust Security & Identity<br/>(COMPLETED)"]:::completed
     P3["Phase 3: High Availability & Tracing<br/>(COMPLETED)"]:::completed
-    P4["Phase 4: Cloud-Native & Double-Entry<br/>(PLANNED)"]:::planned
+    P4["Phase 4: Cloud-Native & Double-Entry<br/>(COMPLETED)"]:::completed
 
     P1 --> P2
     L15 --> P2
@@ -454,14 +453,19 @@ graph TD
 
 ---
 
-### Planned Roadmap (Yet to be Implemented)
+#### 5. Container Hardening, Kubernetes Suite, Double-Entry & Account Controls (Phase 4)
+- [x] **Hardened Non-Root Container Images (GAP-OPS-01 & GAP-OPS-02)**: Multi-stage Docker build running under unprivileged `appuser:appgroup` (UID 10001, GID 10001) with deterministic dependency caching (`COPY go.mod go.sum` -> `RUN go mod download`) and explicit management port declarations.
+- [x] **Production Kubernetes Manifest Suite (GAP-OPS-03 & GAP-HA-03)**: Comprehensive 10-manifest suite covering a 3-node HA MongoDB StatefulSet with headless DNS, automated `rs0` replica-set initiation, dynamic PVCs, resource requests/limits, securityContexts, liveness/readiness probes, RabbitMQ, Logging Service, NGINX Ingress with TLS, ConfigMaps/Secrets, HPA, and PDB.
+- [x] **GAAP/IFRS True Double-Entry Bookkeeping (GAP-FIN-02)**: Implemented balanced journal postings ($\sum \text{Debits} == \sum \text{Credits}$) for all financial movements, rejecting unbalanced legs before persistence.
+- [x] **Cryptographic SHA-256 Audit Chaining & Verification (GAP-FIN-02)**: Every ledger entry cryptographically chains its SHA-256 hash back to `GenesisHash` (`0000...0000`). Management HTTP endpoint `GET /audit/verify?wallet_id=<id>` on port `:9092` verifies entry equilibrium and flags any historical audit tampering.
+- [x] **Wallet Account Status & Operational Fencing (GAP-FIN-05)**: Added operational account states (`ACTIVE`, `FROZEN`, `CLOSED`). Prohibits transfers to or from frozen/closed accounts. Added management HTTP endpoint `GET|POST|PUT /admin/wallet/status` on ports `:9094`/`:9093` for live operational freeze/unfreeze actions.
 
-#### Phase 4: Cloud-Native Infrastructure & True Double-Entry (Upcoming)
-- [ ] **GAAP/IFRS True Double-Entry Bookkeeping (GAP-FIN-02)**: Transition ledger to multi-asset chart of accounts with balanced journal postings ($\sum \text{Debits} == \sum \text{Credits}$) and cryptographic hash chaining.
-- [ ] **Foreign Exchange (FX) Engine (GAP-FIN-03)**: Support cross-currency transfers with guaranteed quote validity windows (30–60s) and atomic multi-currency journal legs.
-- [ ] **Hardened Non-Root Container Images (GAP-OPS-01)**: Update Dockerfile stages to create and run as unprivileged `appuser` (UID 10001).
-- [ ] **Production Kubernetes Hardening (GAP-OPS-03)**: Upgrade manifests with explicit CPU/memory requests and limits, PodDisruptionBudgets, HorizontalPodAutoscalers, and Ingress with cert-manager TLS.
-- [ ] **High-Availability MongoDB Cluster (GAP-HA-03)**: Replace single-node MongoDB with a multi-node StatefulSet across multiple availability zones.
+---
+
+### Future Enhancements Roadmap
+
+- [ ] **Foreign Exchange (FX) Engine (GAP-FIN-03)**: Support cross-currency transfers with guaranteed quote validity windows (30–60s) and multi-currency journal legs.
+- [ ] **Circuit Breaking & Mesh Telemetry (GAP-REL-04)**: Dynamic circuit breaking (e.g., `sony/gobreaker` or Envoy service mesh) for automatic fast-failing during degraded downstream network conditions.
 
 ---
 
@@ -638,7 +642,7 @@ curl -s "http://localhost:8090/api/v1/traces/<association_id>" | jq .
 * **RabbitMQ Management Console**: [http://localhost:15672](http://localhost:15672) (Credentials: `guest` / `guest`)
 
 ### 9. Automated Testing with Postman, Bruno & BloomRPC
-A comprehensive 28-test automated regression suite covering all Phase 1, Phase 2, and Phase 3 capabilities is included in the `postman/` directory:
+A comprehensive 35-test automated regression suite covering all Phase 1, Phase 2, Phase 3, and Phase 4 capabilities is included in the `postman/` directory:
 * **Postman/Bruno Collection**: `postman/Global_Wallet_Microservices.postman_collection.json`
 * **Local Environment**: `postman/Global_Wallet_Local.postman_environment.json`
 * **BloomRPC Test Presets**: `postman/BloomRPC_Test_Presets.json` (see [docs/BLOOMRPC_GUIDE.md](docs/BLOOMRPC_GUIDE.md))
@@ -652,6 +656,8 @@ Both Postman and Bruno test runners validate:
 6. Disaster Recovery Failover (Admin-only failover, distributed `cluster_state` verification, route reset)
 7. Phase 3 Management Metrics (`:9094/metrics`, `:9093/metrics`, `:9092/metrics`, `:9090/metrics`)
 8. OpenTelemetry W3C distributed tracing context propagation (`traceparent` and `X-Trace-ID` verification)
+9. Phase 4 True Double-Entry Bookkeeping & SHA-256 Cryptographic Hash Chain Verification (`/audit/verify`)
+10. Phase 4 Wallet Account Operational Status Fencing (`ACTIVE`, `FROZEN`, `CLOSED`) via `/admin/wallet/status`
 
 ---
 
@@ -663,6 +669,7 @@ Both Postman and Bruno test runners validate:
 | [docs/PHASE1_IMPLEMENTATION.md](docs/PHASE1_IMPLEMENTATION.md) | Technical deep-dive on Phase 1: transactional outbox pattern, database indexing, TTL, and pagination. |
 | [docs/PHASE2_IMPLEMENTATION.md](docs/PHASE2_IMPLEMENTATION.md) | Technical deep-dive on Phase 2: JWT authentication, RBAC, IDOR protection, inter-service mTLS, rate limiting, and security headers. |
 | [docs/PHASE3_IMPLEMENTATION.md](docs/PHASE3_IMPLEMENTATION.md) | Technical deep-dive on Phase 3: distributed failover coordination, standby write fencing, graceful shutdown, standard gRPC health probes, OpenTelemetry W3C distributed tracing, Prometheus metrics, and high-concurrency race suites. |
+| [docs/PHASE4_IMPLEMENTATION.md](docs/PHASE4_IMPLEMENTATION.md) | Technical deep-dive on Phase 4: non-root Docker hardening, complete 10-manifest Kubernetes suite, true double-entry bookkeeping, SHA-256 cryptographic audit chaining, and wallet account status controls. |
 | [docs/LOGGING_ARCHITECTURE.md](docs/LOGGING_ARCHITECTURE.md) | Architectural specification for centralized asynchronous logging, correlation IDs, and resilient spooling. |
 | [docs/LOGGING_IMPLEMENTATION.md](docs/LOGGING_IMPLEMENTATION.md) | Complete implementation record for logging phases 1 through 5, metric definitions, and dashboard provisioning. |
 | [docs/BEGINNER_GUIDE.md](docs/BEGINNER_GUIDE.md) | Step-by-step onboarding guide explaining microservices, gRPC, Protobuf, and request flow from first principles. |

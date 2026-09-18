@@ -565,12 +565,41 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/cluster/failov
 curl.exe http://127.0.0.1:8080/api/v1/cluster/status
 ```
 
-### 5.6 Automated Testing via Postman, Bruno & BloomRPC
+### 5.6 Test Account Operational Status Controls & Fencing (Phase 4 / GAP-FIN-05)
 
-A complete 28-test automated suite is provided in the repository under [postman/](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/postman):
+Inspect and update wallet operational state (`ACTIVE`, `FROZEN`, `CLOSED`) on the primary management server (:9094):
+
+```powershell
+# 1. Inspect status
+Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:9094/admin/wallet/status?wallet_id=alice" | ConvertTo-Json
+
+# 2. Freeze Alice
+$freezeBody = @{ wallet_id = "alice"; status = "FROZEN"; reason = "Compliance hold" } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:9094/admin/wallet/status" -ContentType "application/json" -Body $freezeBody | ConvertTo-Json
+
+# 3. Transfer while frozen (rejected with operational fencing error)
+$transferBody = @{ idempotency_key = "frozen-test-1"; source_wallet_id = "alice"; destination_wallet_id = "bob"; amount = 25; currency = "USD" } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/api/v1/transfers" -Headers $AliceHeaders -ContentType "application/json" -Body $transferBody | ConvertTo-Json
+
+# 4. Unfreeze Alice
+$activeBody = @{ wallet_id = "alice"; status = "ACTIVE"; reason = "Hold cleared" } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:9094/admin/wallet/status" -ContentType "application/json" -Body $activeBody | ConvertTo-Json
+```
+
+### 5.7 Verify Ledger Cryptographic Audit Chain (Phase 4 / GAP-FIN-02)
+
+Verify GAAP/IFRS balanced double-entry postings ($\sum \text{Debits} == \sum \text{Credits}$) and SHA-256 hash chaining back to `GenesisHash` on the ledger management server (:9092):
+
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:9092/audit/verify?wallet_id=alice" | ConvertTo-Json
+```
+
+### 5.8 Automated Testing via Postman, Bruno & BloomRPC
+
+A complete 35-test automated regression suite across 8 suites is provided in the repository under [postman/](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/postman):
 - `postman/Global_Wallet_Microservices.postman_collection.json`
 - `postman/Global_Wallet_Local.postman_environment.json`
-- `postman/BloomRPC_Test_Presets.json` (for direct gRPC testing; see [docs/BLOOMRPC_GUIDE.md](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/docs/BLOOMRPC_GUIDE.md))
+- `postman/BloomRPC_Test_Presets.json` (for direct gRPC testing; 16 test cases; see [docs/BLOOMRPC_GUIDE.md](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/docs/BLOOMRPC_GUIDE.md))
 
 **To run in Postman or Bruno**:
 1. Open Postman or Bruno.
@@ -585,6 +614,8 @@ A complete 28-test automated suite is provided in the repository under [postman/
    - Disaster Recovery Failover (Admin-only failover, distributed `cluster_state` verification, route reset)
    - Phase 3 Management Metrics (`:9094/metrics`, `:9093/metrics`, `:9092/metrics`, `:9090/metrics`)
    - OpenTelemetry W3C distributed tracing context propagation (`traceparent` and `X-Trace-ID` headers)
+   - Phase 4 True Double-Entry Bookkeeping & SHA-256 Cryptographic Hash Chain Verification (`/audit/verify`)
+   - Phase 4 Wallet Account Operational Status Fencing (`ACTIVE`, `FROZEN`, `CLOSED`) via `/admin/wallet/status`
 
 ## 6. Trace one transaction in logs
 
@@ -776,7 +807,7 @@ The gateway failover and MongoDB replica set solve different problems:
 
 - The gateway switches traffic between the primary wallet on `50051` and standby wallet on `50053` using the distributed `FailoverCoordinator` backed by MongoDB `cluster_state` (`_id: "active_target"`). The active target persists across gateway restarts and synchronizes across replicas.
 - **Standby Write Fencing (GAP-HA-02)**: Mutations (`CreateWallet`, `TransferFunds`) sent to the standby node return `codes.FailedPrecondition`, preventing split-brain writes to standby instances. Read queries (`GetBalance`) and health checks remain fully operational on standby.
-- The current local MongoDB `rs0` has one member. It supports transactions, but multi-AZ database failover requires a multi-node replica set (Phase 4).
+- The current local development MongoDB `rs0` has one member. It supports transactions; a production-ready 3-node HA StatefulSet with automated `rs0` replica-set initialization and dynamic PVCs is provided in [k8s/02-mongodb.yaml](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/k8s/02-mongodb.yaml) (Phase 4).
 
 Both wallet services use the same MongoDB database, so the standby can read data created through the primary.
 

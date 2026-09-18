@@ -324,37 +324,47 @@ Furthermore, **Standby Write Fencing (GAP-HA-02)** guarantees that write operati
 
 ## 9. Kubernetes overview
 
-The `k8s/` files create:
+The complete 10-manifest suite in `k8s/` creates:
 
-- A namespace.
-- A MongoDB StatefulSet and service.
-- A Ledger Service deployment.
-- Primary and standby Wallet Service deployments.
-- An API Gateway exposed through a NodePort.
+- `01-namespace.yaml`: Dedicated `wallet-system` production namespace.
+- `02-mongodb.yaml`: 3-node HA MongoDB StatefulSet (`mongo-0`, `mongo-1`, `mongo-2`) with headless DNS (`mongo-cluster`), automated `rs0` replica-set initialization sidecar, and 10Gi dynamic PVCs.
+- `03-ledger-service.yaml`: Ledger Service deployment with unprivileged securityContext, resource limits, and health probes.
+- `04-wallet-services.yaml`: Primary (active) and standby (passive) Wallet Service deployments with dedicated HTTP health probes.
+- `05-api-gateway.yaml`: API Gateway deployment with liveness (`/healthz`) and readiness (`/readyz`) probes.
+- `06-rabbitmq.yaml`: RabbitMQ 3.13 StatefulSet with management UI (`:15672`), AMQP (`:5672`), and Prometheus metrics (`:15692`).
+- `07-logging-service.yaml`: Centralized asynchronous Logging Service deployment.
+- `08-ingress.yaml`: NGINX Ingress controller with TLS termination and path routing.
+- `09-configmap-secrets.yaml`: Decoupled environment configurations and credentials templates.
+- `10-hpa-pdb.yaml`: HorizontalPodAutoscalers (2–10 replicas) and PodDisruptionBudgets (`minAvailable: 1`).
 
-Build the images before applying the manifests, and make sure the images are available to Minikube or Kind. The Kubernetes MongoDB manifest starts MongoDB with `--replSet rs0`, while the application connection strings expect `replicaSet=rs0`; verify replica-set initialization in your cluster before troubleshooting the application services.
+Build the hardened non-root container images before applying the manifests, and make sure the images are available to Minikube or Kind.
 
 ## 10. Caveats worth knowing
 
-This project is an advanced architectural learning/demo system. The current implementation has several architectural characteristics and boundaries:
+This project is an advanced architectural learning and demonstration platform with enterprise-grade controls:
 
 - `CreateWallet` strictly enforces account uniqueness: creating an existing wallet ID returns HTTP 409 Conflict (`codes.AlreadyExists`) preventing account overwrite.
 - Zero-Trust security is enforced at the API Gateway: HMAC-SHA256 JWT tokens, IDOR ownership verification (`sub == wallet_id`), administrative RBAC for failover, rate limiting (60 rps/100 burst), 1MB payload limits, and security headers.
 - Inter-service gRPC supports mutual TLS (`mTLS`) via `GRPC_TLS_ENABLED=true` (and defaults to plaintext for friction-free local development).
-- Double-entry bookkeeping: A single journal document with source and destination is stored per transfer; full GAAP/IFRS multi-account debit/credit split postings are planned for Phase 4.
-- High Availability & Resilience (Phase 3 Completed): The platform features distributed consensus via `FailoverCoordinator`, Standby Write Fencing, OpenTelemetry W3C distributed tracing, standard `grpc.health.v1` health probes, and Prometheus management metrics on `:9094`/`:9093`/`:9092`. Multi-node cross-AZ replica sets and non-root Kubernetes hardening are scheduled for Phase 4.
+- **GAAP/IFRS True Double-Entry Bookkeeping & Cryptographic Hash Chaining (Phase 4 Completed)**: Implemented balanced journal postings ($\sum \text{Debits} == \sum \text{Credits}$) and SHA-256 cryptographic audit chaining linking ledger entries sequentially back to `GenesisHash`, with online tamper verification via `/audit/verify`.
+- **Account Operational Controls & Fencing (Phase 4 Completed)**: Explicit account operational states (`ACTIVE`, `FROZEN`, `CLOSED`) with atomic transaction fencing blocking fund movements to/from frozen or closed accounts, and administrative management endpoint `/admin/wallet/status` on ports `:9094`/`:9093`.
+- **Container & Kubernetes Hardening (Phase 4 Completed)**: Multi-stage Docker build running under unprivileged `appuser:appgroup` (UID 10001, GID 10001) with deterministic dependency caching, and complete 10-manifest production Kubernetes suite.
+- **High Availability & Resilience (Phase 3 Completed)**: Distributed consensus via `FailoverCoordinator`, Standby Write Fencing, OpenTelemetry W3C distributed tracing, standard `grpc.health.v1` health probes, and Prometheus management metrics on `:9094`/`:9093`/`:9092`.
 
 ## 11. Where to read next
 
 - HTTP routing & OTel middleware: `cmd/api-gateway/main.go`
 - Wallet behavior, outbox worker & write fencing: `cmd/wallet-service/main.go`
+- Ledger double-entry & SHA-256 audit chaining: `cmd/ledger-service/double_entry.go`
 - High-concurrency race suites: `cmd/wallet-service/concurrency_test.go`
 - Ledger persistence & gRPC health: `cmd/ledger-service/main.go`
 - Failover Coordinator: `pkg/coordinator/coordinator.go`
 - OpenTelemetry Tracing & Metrics: `pkg/observability/tracer.go` & `pkg/observability/metrics.go`
 - Wallet gRPC contract: `proto/wallet/wallet.proto`
 - Ledger gRPC contract: `proto/ledger/ledger.proto`
+- Phase 4 Implementation: `docs/PHASE4_IMPLEMENTATION.md`
 - Phase 3 Implementation: `docs/PHASE3_IMPLEMENTATION.md`
+- Production Readiness Audit: `docs/PRODUCTION_READINESS_AUDIT.md`
 - BloomRPC gRPC Testing: `docs/BLOOMRPC_GUIDE.md`
 - MongoDB connection retry: `pkg/db/mongo.go`
 - Local topology: `docker-compose.yml`

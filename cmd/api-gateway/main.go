@@ -233,6 +233,7 @@ func (g *Gateway) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"wallet_id":      resp.WalletId,
 		"balances":       resp.Balances,
+		"status":         resp.Status,
 		"routed_gateway": target,
 		"handled_region": resp.HandledByRegion,
 	})
@@ -254,15 +255,29 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		IdempotencyKey string `json:"idempotency_key"`
-		SourceWallet   string `json:"source_wallet_id"`
-		DestWallet     string `json:"destination_wallet_id"`
-		Amount         int64  `json:"amount"`
-		Currency       string `json:"currency"`
+		IdempotencyKey      string `json:"idempotency_key"`
+		SourceWalletID      string `json:"source_wallet_id"`
+		SourceWallet        string `json:"source_wallet"`
+		DestinationWalletID string `json:"destination_wallet_id"`
+		DestWallet          string `json:"dest_wallet"`
+		Amount              int64  `json:"amount"`
+		Currency            string `json:"currency"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		log.Printf("[TRACE] trace_id=%s step=http_json_decode_failed error=%v", traceID, err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	sourceWallet := strings.TrimSpace(req.SourceWalletID)
+	if sourceWallet == "" {
+		sourceWallet = strings.TrimSpace(req.SourceWallet)
+	}
+	destWallet := strings.TrimSpace(req.DestinationWalletID)
+	if destWallet == "" {
+		destWallet = strings.TrimSpace(req.DestWallet)
+	}
+	if sourceWallet == "" || destWallet == "" {
+		http.Error(w, "source_wallet_id and destination_wallet_id are required", http.StatusBadRequest)
 		return
 	}
 	if req.IdempotencyKey != "" {
@@ -273,8 +288,8 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
-		if err := ValidateWalletOwnership(claims, req.SourceWallet); err != nil {
-			log.Printf("[SECURITY] IDOR blocked: subject %s tried to transfer from %s", claims.Subject, req.SourceWallet)
+		if err := ValidateWalletOwnership(claims, sourceWallet); err != nil {
+			log.Printf("[SECURITY] IDOR blocked: subject %s tried to transfer from %s", claims.Subject, sourceWallet)
 			writeAuthError(w, http.StatusForbidden, fmt.Sprintf("Forbidden: %v", err))
 			return
 		}
@@ -283,17 +298,17 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	// Step 1: api.request.received (INFO)
 	g.emit(ctx, "api.request.received", observability.LevelInfo, "HTTP transfer request received", map[string]any{
 		"operation":     "transfer",
-		"source_wallet": req.SourceWallet,
-		"dest_wallet":   req.DestWallet,
+		"source_wallet": sourceWallet,
+		"dest_wallet":   destWallet,
 		"amount":        req.Amount,
 		"currency":      req.Currency,
 	})
 	traceID = correlation.AssociationID
-	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=transfer source=%s destination=%s amount=%d currency=%s", traceID, req.SourceWallet, req.DestWallet, req.Amount, req.Currency)
+	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=transfer source=%s destination=%s amount=%d currency=%s", traceID, sourceWallet, destWallet, req.Amount, req.Currency)
 	protoReq := &walletv1.TransferFundsRequest{
 		IdempotencyKey:      req.IdempotencyKey,
-		SourceWalletId:      req.SourceWallet,
-		DestinationWalletId: req.DestWallet,
+		SourceWalletId:      sourceWallet,
+		DestinationWalletId: destWallet,
 		Amount:              &walletv1.Money{Currency: req.Currency, Units: req.Amount},
 	}
 	logProto(traceID, "http_json_to_wallet_proto_request", protoReq)

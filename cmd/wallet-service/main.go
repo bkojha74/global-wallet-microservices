@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -95,11 +96,38 @@ func (s *server) emitFull(ctx context.Context, eventType, level, message string,
 	})
 }
 
+const (
+	WalletStatusActive = "ACTIVE"
+	WalletStatusFrozen = "FROZEN"
+	WalletStatusClosed = "CLOSED"
+)
+
 type WalletModel struct {
-	ID        string `bson:"_id"`
-	Currency  string `bson:"currency"`
-	Balance   int64  `bson:"balance"`
-	UpdatedAt string `bson:"updated_at"`
+	ID        string `bson:"_id" json:"id"`
+	Currency  string `bson:"currency" json:"currency"`
+	Balance   int64  `bson:"balance" json:"balance"`
+	Status    string `bson:"status" json:"status"`
+	UpdatedAt string `bson:"updated_at" json:"updated_at"`
+}
+
+func (w *WalletModel) EffectiveStatus() string {
+	if w.Status == "" {
+		return WalletStatusActive
+	}
+	return w.Status
+}
+
+type AdminWalletStatusRequest struct {
+	WalletID string `json:"wallet_id"`
+	Status   string `json:"status"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+type AdminWalletStatusResponse struct {
+	Success  bool   `json:"success"`
+	WalletID string `json:"wallet_id"`
+	Status   string `json:"status,omitempty"`
+	Message  string `json:"message,omitempty"`
 }
 
 type IdempotencyRecord struct {
@@ -147,6 +175,7 @@ func (s *server) CreateWallet(ctx context.Context, req *walletv1.CreateWalletReq
 		ID:        req.WalletId,
 		Currency:  req.Currency,
 		Balance:   req.InitialBalance,
+		Status:    WalletStatusActive,
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 
@@ -193,6 +222,7 @@ func (s *server) GetBalance(ctx context.Context, req *walletv1.GetBalanceRequest
 			{Currency: wallet.Currency, Units: wallet.Balance},
 		},
 		HandledByRegion: s.region,
+		Status:          wallet.EffectiveStatus(),
 	}, nil
 }
 
@@ -318,6 +348,47 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 			"idempotency_key": req.IdempotencyKey,
 			"is_replay":       false,
 		})
+
+		// 1b. Check source and destination wallet account operational status (GAP-FIN-05)
+		var srcWallet WalletModel
+		if err := walletsCol.FindOne(sessCtx, bson.M{"_id": req.SourceWalletId}).Decode(&srcWallet); err != nil {
+			if err == mongo.ErrNoDocuments {
+				txnStatus = walletv1.TransferFundsResponse_FAILED_INSUFFICIENT_FUNDS
+				txnErrMsg = fmt.Sprintf("Source wallet %s not found", req.SourceWalletId)
+				return nil, fmt.Errorf("source wallet not found")
+			}
+			return nil, err
+		}
+		if srcWallet.EffectiveStatus() == WalletStatusFrozen {
+			txnStatus = walletv1.TransferFundsResponse_INTERNAL_ERROR
+			txnErrMsg = fmt.Sprintf("source wallet %s is FROZEN; transfers prohibited", req.SourceWalletId)
+			return nil, fmt.Errorf("source wallet %s is FROZEN", req.SourceWalletId)
+		}
+		if srcWallet.EffectiveStatus() == WalletStatusClosed {
+			txnStatus = walletv1.TransferFundsResponse_INTERNAL_ERROR
+			txnErrMsg = fmt.Sprintf("source wallet %s is CLOSED; transfers prohibited", req.SourceWalletId)
+			return nil, fmt.Errorf("source wallet %s is CLOSED", req.SourceWalletId)
+		}
+
+		var dstWallet WalletModel
+		if err := walletsCol.FindOne(sessCtx, bson.M{"_id": req.DestinationWalletId}).Decode(&dstWallet); err != nil {
+			if err == mongo.ErrNoDocuments {
+				txnStatus = walletv1.TransferFundsResponse_INTERNAL_ERROR
+				txnErrMsg = fmt.Sprintf("Destination wallet %s not found", req.DestinationWalletId)
+				return nil, fmt.Errorf("destination wallet not found")
+			}
+			return nil, err
+		}
+		if dstWallet.EffectiveStatus() == WalletStatusFrozen {
+			txnStatus = walletv1.TransferFundsResponse_INTERNAL_ERROR
+			txnErrMsg = fmt.Sprintf("destination wallet %s is FROZEN; transfers prohibited", req.DestinationWalletId)
+			return nil, fmt.Errorf("destination wallet %s is FROZEN", req.DestinationWalletId)
+		}
+		if dstWallet.EffectiveStatus() == WalletStatusClosed {
+			txnStatus = walletv1.TransferFundsResponse_INTERNAL_ERROR
+			txnErrMsg = fmt.Sprintf("destination wallet %s is CLOSED; transfers prohibited", req.DestinationWalletId)
+			return nil, fmt.Errorf("destination wallet %s is CLOSED", req.DestinationWalletId)
+		}
 
 		// 2. Atomic debit from source wallet (guarantees sufficient balance)
 		filterSource := bson.M{
@@ -526,6 +597,137 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 	}, nil
 }
 
+func (s *server) UpdateWalletStatus(ctx context.Context, walletID, newStatus string) error {
+	col := s.db().Collection("wallets")
+	filter := bson.M{"_id": walletID}
+	update := bson.M{
+		"$set": bson.M{
+			"status":     newStatus,
+			"updated_at": time.Now().UTC().Format(time.RFC3339),
+		},
+	}
+	res, err := col.UpdateOne(ctx, filter, update)
+	if err != nil {
+		return err
+	}
+	if res.MatchedCount == 0 {
+		return mongo.ErrNoDocuments
+	}
+	return nil
+}
+
+func (s *server) handleAdminWalletStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodGet {
+		walletID := strings.TrimSpace(r.URL.Query().Get("wallet_id"))
+		if walletID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(AdminWalletStatusResponse{
+				Success: false,
+				Message: "wallet_id query parameter is required",
+			})
+			return
+		}
+		col := s.db().Collection("wallets")
+		var wallet WalletModel
+		if err := col.FindOne(r.Context(), bson.M{"_id": walletID}).Decode(&wallet); err != nil {
+			if err == mongo.ErrNoDocuments {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(AdminWalletStatusResponse{
+					Success:  false,
+					WalletID: walletID,
+					Message:  "wallet not found",
+				})
+				return
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(AdminWalletStatusResponse{
+				Success:  false,
+				WalletID: walletID,
+				Message:  "failed to fetch wallet: " + err.Error(),
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(AdminWalletStatusResponse{
+			Success:  true,
+			WalletID: wallet.ID,
+			Status:   wallet.EffectiveStatus(),
+			Message:  "wallet status retrieved",
+		})
+		return
+	}
+
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req AdminWalletStatusRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(AdminWalletStatusResponse{
+			Success: false,
+			Message: "invalid JSON body: " + err.Error(),
+		})
+		return
+	}
+	req.WalletID = strings.TrimSpace(req.WalletID)
+	req.Status = strings.ToUpper(strings.TrimSpace(req.Status))
+	if req.WalletID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(AdminWalletStatusResponse{
+			Success: false,
+			Message: "wallet_id is required",
+		})
+		return
+	}
+	if req.Status != WalletStatusActive && req.Status != WalletStatusFrozen && req.Status != WalletStatusClosed {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(AdminWalletStatusResponse{
+			Success: false,
+			Message: fmt.Sprintf("invalid status %q: must be ACTIVE, FROZEN, or CLOSED", req.Status),
+		})
+		return
+	}
+
+	err := s.UpdateWalletStatus(r.Context(), req.WalletID, req.Status)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(AdminWalletStatusResponse{
+				Success:  false,
+				WalletID: req.WalletID,
+				Message:  "wallet not found",
+			})
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(AdminWalletStatusResponse{
+			Success:  false,
+			WalletID: req.WalletID,
+			Message:  "failed to update wallet status: " + err.Error(),
+		})
+		return
+	}
+
+	log.Printf("[WALLET-ADMIN] Wallet status updated: wallet_id=%s status=%s reason=%s region=%s",
+		req.WalletID, req.Status, req.Reason, s.region)
+	s.emit(r.Context(), "wallet.status.updated", observability.LevelInfo, "Wallet operational status updated", map[string]any{
+		"wallet_id": req.WalletID,
+		"status":    req.Status,
+		"reason":    req.Reason,
+	})
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(AdminWalletStatusResponse{
+		Success:  true,
+		WalletID: req.WalletID,
+		Status:   req.Status,
+		Message:  fmt.Sprintf("Wallet %s status updated to %s", req.WalletID, req.Status),
+	})
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -679,6 +881,7 @@ func main() {
 		}
 		fmt.Fprintf(w, `{"status":%q,"region":%q,"is_active":%t}`+"\n", st, region, active)
 	})
+	metricsMux.HandleFunc("/admin/wallet/status", srv.handleAdminWalletStatus)
 	metricsServer := &http.Server{
 		Addr:    ":" + metricsPort,
 		Handler: metricsMux,

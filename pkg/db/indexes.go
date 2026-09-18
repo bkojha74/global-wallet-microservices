@@ -36,6 +36,11 @@ func EnsureLedgerIndexes(ctx context.Context, db *mongo.Database) error {
 			},
 			Options: options.Index().SetName("idx_ledger_dest_wallet_time"),
 		},
+		{
+			// Sequential query optimization for cryptographic hash chain audits
+			Keys:    bson.D{{Key: "sequence_number", Value: 1}},
+			Options: options.Index().SetUnique(true).SetSparse(true).SetName("idx_ledger_sequence_number"),
+		},
 	}
 
 	names, err := col.Indexes().CreateMany(ctx, indexes)

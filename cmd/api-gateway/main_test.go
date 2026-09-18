@@ -274,6 +274,41 @@ func TestHandleTransferRejectsIDORViolation(t *testing.T) {
 	}
 }
 
+func TestHandleTransferFlexibleFieldNames(t *testing.T) {
+	client := &fakeWalletClient{
+		transferFundsResponse: &walletv1.TransferFundsResponse{
+			TransactionId:   "tx-123",
+			Status:          walletv1.TransferFundsResponse_SUCCESS,
+			HandledByRegion: "test-region",
+		},
+	}
+	gateway := &Gateway{activeTarget: "PRIMARY", primaryClient: client}
+
+	// Payload uses source_wallet and dest_wallet shorthand
+	reqBody := `{"idempotency_key":"k-flex-1","source_wallet":"alice","dest_wallet":"bob","amount":25,"currency":"USD"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/transfers", strings.NewReader(reqBody))
+
+	aliceClaims := &auth.Claims{Subject: "alice", Roles: []string{auth.RoleUser}}
+	ctx := ContextWithClaims(req.Context(), aliceClaims)
+	req = req.WithContext(ctx)
+
+	response := httptest.NewRecorder()
+	gateway.handleTransfer(response, req)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", response.Code, response.Body.String())
+	}
+	if client.transferFundsRequest == nil {
+		t.Fatal("expected gRPC transferFundsRequest to be populated")
+	}
+	if client.transferFundsRequest.SourceWalletId != "alice" {
+		t.Fatalf("expected source_wallet_id 'alice', got %q", client.transferFundsRequest.SourceWalletId)
+	}
+	if client.transferFundsRequest.DestinationWalletId != "bob" {
+		t.Fatalf("expected destination_wallet_id 'bob', got %q", client.transferFundsRequest.DestinationWalletId)
+	}
+}
+
 func TestHandleFailoverRestrictedToAdmin(t *testing.T) {
 	gateway := &Gateway{activeTarget: "PRIMARY"}
 

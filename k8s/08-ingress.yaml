@@ -1,0 +1,47 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: wallet-ingress
+  namespace: banking-system
+  labels:
+    app.kubernetes.io/name: wallet-ingress
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "15"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "15"
+spec:
+  tls:
+    - hosts:
+        - wallet.local
+        - api.wallet.company.com
+      secretName: wallet-tls-cert
+  rules:
+    - host: wallet.local
+      http:
+        paths:
+          # Ingress to Logging Service Search and Trace API
+          - path: /api/v1/logs
+            pathType: Prefix
+            backend:
+              service:
+                name: logging-service
+                port:
+                  number: 8090
+          - path: /api/v1/traces
+            pathType: Prefix
+            backend:
+              service:
+                name: logging-service
+                port:
+                  number: 8090
+          # Ingress to API Gateway (default backend for banking endpoints)
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 8080

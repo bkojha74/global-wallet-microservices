@@ -35,6 +35,7 @@ message GetBalanceResponse {
   string wallet_id = 1;
   repeated Money balances = 2;
   string handled_by_region = 3;
+  string status = 4;
 }
 
 message TransferFundsRequest {

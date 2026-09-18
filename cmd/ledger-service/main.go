@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -68,6 +69,7 @@ func (s *server) emitFull(ctx context.Context, eventType, level, message string,
 
 type LedgerDocument struct {
 	ID                  primitive.ObjectID `bson:"_id,omitempty"`
+	SequenceNumber      int64              `bson:"sequence_number,omitempty"`
 	IdempotencyKey      string             `bson:"idempotency_key"`
 	SourceWalletID      string             `bson:"source_wallet_id"`
 	DestinationWalletID string             `bson:"destination_wallet_id"`
@@ -75,6 +77,9 @@ type LedgerDocument struct {
 	Currency            string             `bson:"currency"`
 	Region              string             `bson:"region"`
 	Timestamp           time.Time          `bson:"timestamp"`
+	Postings            []JournalPosting   `bson:"postings,omitempty"`
+	PreviousHash        string             `bson:"previous_hash,omitempty"`
+	EntryHash           string             `bson:"entry_hash,omitempty"`
 }
 
 func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTransactionRequest) (*ledgerv1.RecordTransactionResponse, error) {
@@ -126,15 +131,43 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 		docID = primitive.NewObjectID()
 	}
 
+	// GAAP/IFRS Double-Entry Postings (GAP-FIN-02)
+	postings, postErr := CreateTransferPostings(req.SourceWalletId, req.DestinationWalletId, req.Amount, req.Currency)
+	if postErr != nil {
+		log.Printf("[LEDGER] trace_id=%s step=double_entry_failed reason=%v", req.IdempotencyKey, postErr)
+		durationMS := time.Since(startTime).Milliseconds()
+		s.emitTerminal(ctx, "ledger.record.failed", observability.LevelError, "Double-entry validation failed", durationMS, false, map[string]any{"reason": postErr.Error()})
+		return nil, status.Errorf(codes.InvalidArgument, "double-entry validation failed: %v", postErr)
+	}
+
+	// Cryptographic Hash Chaining (GAP-FIN-02): find the previous entry
+	var seqNumber int64 = 1
+	prevHash := GenesisHash
+	var lastDoc LedgerDocument
+	findLastOpts := options.FindOne().SetSort(bson.D{{Key: "sequence_number", Value: -1}})
+	if findErr := col.FindOne(ctx, bson.M{"sequence_number": bson.M{"$gt": 0}}, findLastOpts).Decode(&lastDoc); findErr == nil {
+		seqNumber = lastDoc.SequenceNumber + 1
+		if lastDoc.EntryHash != "" {
+			prevHash = lastDoc.EntryHash
+		}
+	}
+
+	now := time.Now().UTC()
+	entryHash := ComputeEntryHash(prevHash, seqNumber, docID.Hex(), req.IdempotencyKey, now, postings)
+
 	doc := LedgerDocument{
 		ID:                  docID,
+		SequenceNumber:      seqNumber,
 		IdempotencyKey:      req.IdempotencyKey,
 		SourceWalletID:      req.SourceWalletId,
 		DestinationWalletID: req.DestinationWalletId,
 		Amount:              req.Amount,
 		Currency:            req.Currency,
 		Region:              s.region,
-		Timestamp:           time.Now().UTC(),
+		Timestamp:           now,
+		Postings:            postings,
+		PreviousHash:        prevHash,
+		EntryHash:           entryHash,
 	}
 
 	_, err = col.InsertOne(ctx, doc)
@@ -389,6 +422,21 @@ func main() {
 	metricsMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"status":"UP","region":%q}`+"\n", region)
+	})
+	// Phase 4 (GAP-FIN-02): Ledger Audit Chain & Trial Balance Verification
+	metricsMux.HandleFunc("/audit/verify", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		col := client.Database("banking_db").Collection("ledger_entries")
+		res, err := VerifyAuditChain(r.Context(), col)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{"status": "ERROR", "error": err.Error()})
+			return
+		}
+		if res.Status != "VERIFIED" {
+			w.WriteHeader(http.StatusConflict)
+		}
+		json.NewEncoder(w).Encode(res)
 	})
 	metricsServer := &http.Server{
 		Addr:    ":" + metricsPort,
