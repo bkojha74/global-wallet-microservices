@@ -130,4 +130,3 @@ func TestGetBalanceRejectsMissingWalletID(t *testing.T) {
 		t.Fatalf("expected InvalidArgument for empty wallet ID, got %v", err)
 	}
 }
-

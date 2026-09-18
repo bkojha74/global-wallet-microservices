@@ -1,0 +1,13 @@
+# Auto-detect text files and normalize line endings
+* text=auto
+
+# Enforce LF line endings for Go files and configs to prevent gofmt / CI mismatches
+*.go text eol=lf
+*.proto text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+Makefile text eol=lf
+Dockerfile text eol=lf

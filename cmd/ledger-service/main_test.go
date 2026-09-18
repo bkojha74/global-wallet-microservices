@@ -70,4 +70,3 @@ func TestGetLedgerEntriesRejectsMissingWalletID(t *testing.T) {
 		t.Fatalf("expected InvalidArgument, got %v", err)
 	}
 }
-

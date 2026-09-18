@@ -80,11 +80,11 @@ func NewClientTransportCredentials(certFile, keyFile, caFile, serverName string)
 
 // TestCertBundle holds in-memory generated certificates for testing mTLS.
 type TestCertBundle struct {
-	CACertPEM             []byte
-	ServerCertPEM         []byte
-	ServerKeyPEM          []byte
-	ClientCertPEM         []byte
-	ClientKeyPEM          []byte
+	CACertPEM              []byte
+	ServerCertPEM          []byte
+	ServerKeyPEM           []byte
+	ClientCertPEM          []byte
+	ClientKeyPEM           []byte
 	UntrustedClientCertPEM []byte
 	UntrustedClientKeyPEM  []byte
 }
@@ -250,11 +250,11 @@ func GenerateTestCertificates() (*TestCertBundle, error) {
 	untrustedKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: untrustedKeyBytes})
 
 	return &TestCertBundle{
-		CACertPEM:             caPEM,
-		ServerCertPEM:         serverCertPEM,
-		ServerKeyPEM:          serverKeyPEM,
-		ClientCertPEM:         clientCertPEM,
-		ClientKeyPEM:          clientKeyPEM,
+		CACertPEM:              caPEM,
+		ServerCertPEM:          serverCertPEM,
+		ServerKeyPEM:           serverKeyPEM,
+		ClientCertPEM:          clientCertPEM,
+		ClientKeyPEM:           clientKeyPEM,
 		UntrustedClientCertPEM: untrustedCertPEM,
 		UntrustedClientKeyPEM:  untrustedKeyPEM,
 	}, nil
