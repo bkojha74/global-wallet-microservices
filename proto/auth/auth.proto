@@ -1,0 +1,113 @@
+syntax = "proto3";
+
+package auth.v1;
+option go_package = "wallet-system/proto/auth;authv1";
+
+// AuthService handles the complete identity lifecycle for the Global Wallet platform:
+// token issuance, validation, refresh, revocation, and real-time authorization decisions.
+// All downstream services (wallet, ledger) receive claims forwarded by the API Gateway.
+service AuthService {
+  // IssueToken authenticates credentials and returns a signed JWT access+refresh pair.
+  rpc IssueToken(IssueTokenRequest) returns (IssueTokenResponse);
+
+  // ValidateToken verifies a token signature, expiry, and revocation status.
+  // Called by the API Gateway on every protected HTTP request (cached client-side).
+  rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse);
+
+  // RefreshToken exchanges a valid refresh token for a new access token.
+  rpc RefreshToken(RefreshTokenRequest) returns (IssueTokenResponse);
+
+  // RevokeToken adds a token to the blocklist (logout / forced expiry by admin).
+  rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
+
+  // Authorize makes a real-time RBAC + ABAC decision for a subject/resource/action triple.
+  // Used by wallet-service for ownership (IDOR) checks and by the gateway for admin routes.
+  rpc Authorize(AuthorizeRequest) returns (AuthorizeResponse);
+
+  // HealthCheck for readiness and liveness probing.
+  rpc HealthCheck(AuthHealthRequest) returns (AuthHealthResponse);
+}
+
+// ── Token Issuance ──────────────────────────────────────────────────────────
+
+message IssueTokenRequest {
+  string username          = 1; // wallet owner username / service account id
+  string password          = 2; // plaintext (TLS-protected); bcrypt-compared server-side
+  string client_id         = 3; // for service-to-service machine flows (empty for users)
+  repeated string requested_scopes = 4; // empty = grant default scopes for role
+}
+
+message IssueTokenResponse {
+  string access_token       = 1; // short-lived JWT (15 min)
+  string refresh_token      = 2; // long-lived opaque token (7 days)
+  string token_type         = 3; // always "Bearer"
+  int64  expires_in         = 4; // access token TTL in seconds
+  repeated string granted_scopes = 5;
+  string subject            = 6; // the authenticated identity (username / wallet_id)
+}
+
+// ── Token Validation ────────────────────────────────────────────────────────
+
+message ValidateTokenRequest {
+  string token = 1; // raw JWT string (without "Bearer " prefix)
+}
+
+message ValidateTokenResponse {
+  bool   valid      = 1;
+  string subject    = 2;  // "sub" claim
+  repeated string roles  = 3;
+  repeated string scopes = 4;
+  int64  expires_at = 5;  // Unix timestamp
+  string token_id   = 6;  // "jti" claim — used for revocation lookup
+  TokenErrorCode error = 7;
+}
+
+enum TokenErrorCode {
+  TOKEN_OK            = 0;
+  TOKEN_EXPIRED       = 1;
+  TOKEN_INVALID_SIG   = 2;
+  TOKEN_REVOKED       = 3;
+  TOKEN_MALFORMED     = 4;
+}
+
+// ── Token Refresh ───────────────────────────────────────────────────────────
+
+message RefreshTokenRequest {
+  string refresh_token = 1;
+}
+
+// ── Token Revocation ────────────────────────────────────────────────────────
+
+message RevokeTokenRequest {
+  string token  = 1; // access or refresh token
+  string reason = 2; // "logout", "admin_forced", "suspicious_activity"
+}
+
+message RevokeTokenResponse {
+  bool   success = 1;
+  string message = 2;
+}
+
+// ── Authorization ───────────────────────────────────────────────────────────
+
+message AuthorizeRequest {
+  string subject         = 1; // authenticated user / service identity
+  repeated string roles  = 2;
+  repeated string scopes = 3;
+  string resource        = 4; // e.g. "wallet:wallet-alice-001", "cluster:failover"
+  string action          = 5; // e.g. "read", "transfer", "admin", "audit"
+}
+
+message AuthorizeResponse {
+  bool   allowed = 1;
+  string reason  = 2; // human-readable explanation (for logging)
+}
+
+// ── Health ──────────────────────────────────────────────────────────────────
+
+message AuthHealthRequest {}
+
+message AuthHealthResponse {
+  string status  = 1; // "SERVING" | "NOT_SERVING"
+  string version = 2; // auth-service build version
+}

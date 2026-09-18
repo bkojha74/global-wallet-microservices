@@ -2,13 +2,57 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"google.golang.org/grpc"
+
 	"wallet-system/pkg/auth"
+	authv1 "wallet-system/proto/auth"
 )
+
+// fakeAuthClient is an in-process stub implementing authv1.AuthServiceClient.
+// It validates tokens by parsing them with the same pkg/auth logic.
+type fakeAuthClient struct {
+	secret string
+}
+
+func (f *fakeAuthClient) IssueToken(_ context.Context, _ *authv1.IssueTokenRequest, _ ...grpc.CallOption) (*authv1.IssueTokenResponse, error) {
+	return nil, nil
+}
+func (f *fakeAuthClient) ValidateToken(_ context.Context, req *authv1.ValidateTokenRequest, _ ...grpc.CallOption) (*authv1.ValidateTokenResponse, error) {
+	claims, err := auth.ValidateToken(req.Token, f.secret)
+	if err != nil {
+		code := authv1.TokenErrorCode_TOKEN_MALFORMED
+		if err == auth.ErrTokenExpired {
+			code = authv1.TokenErrorCode_TOKEN_EXPIRED
+		}
+		return &authv1.ValidateTokenResponse{Valid: false, Error: code}, nil
+	}
+	return &authv1.ValidateTokenResponse{
+		Valid:     true,
+		Subject:   claims.Subject,
+		Roles:     claims.Roles,
+		Scopes:    claims.Scopes,
+		ExpiresAt: claims.ExpiresAt,
+		Error:     authv1.TokenErrorCode_TOKEN_OK,
+	}, nil
+}
+func (f *fakeAuthClient) RefreshToken(_ context.Context, _ *authv1.RefreshTokenRequest, _ ...grpc.CallOption) (*authv1.IssueTokenResponse, error) {
+	return nil, nil
+}
+func (f *fakeAuthClient) RevokeToken(_ context.Context, _ *authv1.RevokeTokenRequest, _ ...grpc.CallOption) (*authv1.RevokeTokenResponse, error) {
+	return &authv1.RevokeTokenResponse{Success: true}, nil
+}
+func (f *fakeAuthClient) Authorize(_ context.Context, _ *authv1.AuthorizeRequest, _ ...grpc.CallOption) (*authv1.AuthorizeResponse, error) {
+	return &authv1.AuthorizeResponse{Allowed: true}, nil
+}
+func (f *fakeAuthClient) HealthCheck(_ context.Context, _ *authv1.AuthHealthRequest, _ ...grpc.CallOption) (*authv1.AuthHealthResponse, error) {
+	return &authv1.AuthHealthResponse{Status: "SERVING"}, nil
+}
 
 func TestSecurityHeadersMiddleware(t *testing.T) {
 	handler := SecurityHeadersMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -99,7 +143,10 @@ func TestAuthMiddleware(t *testing.T) {
 		"/healthz": true,
 	}
 
-	handler := AuthMiddleware(secret, publicPaths, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	fakeClient := &fakeAuthClient{secret: secret}
+	cache := newClaimsCache("test-cache-secret")
+
+	handler := AuthMiddleware(fakeClient, cache, publicPaths, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := ClaimsFromContext(r.Context())
 		if ok && claims != nil {
 			w.Header().Set("X-User", claims.Subject)
@@ -150,6 +197,13 @@ func TestAuthMiddleware(t *testing.T) {
 	}
 	if recValid.Header().Get("X-User") != "alice" {
 		t.Fatalf("expected X-User alice, got %s", recValid.Header().Get("X-User"))
+	}
+
+	// 5. Second request with same token: served from cache (same result)
+	recCached := httptest.NewRecorder()
+	handler.ServeHTTP(recCached, reqValid)
+	if recCached.Code != http.StatusOK {
+		t.Fatalf("expected 200 on cached token, got %d", recCached.Code)
 	}
 }
 

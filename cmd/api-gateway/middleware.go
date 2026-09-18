@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -11,11 +14,92 @@ import (
 	"time"
 
 	"wallet-system/pkg/auth"
+	authv1 "wallet-system/proto/auth"
 )
 
 type contextKey string
 
 const ClaimsContextKey contextKey = "jwt_claims"
+
+// ── Token Validation Cache ────────────────────────────────────────────────────
+// claimsCacheEntry stores a validated set of claims with an expiry timestamp.
+type claimsCacheEntry struct {
+	claims    *auth.Claims
+	expiresAt time.Time
+}
+
+// claimsCache is a short-lived in-process cache for token validation responses.
+// It reduces auth-service gRPC calls on hot paths without adding a Redis dependency.
+// Cache TTL is 30 seconds; entries are also bounded by the token's own expiry.
+type claimsCache struct {
+	mu      sync.RWMutex
+	entries map[string]claimsCacheEntry
+	secret  string // HMAC key used only for cache-key fingerprinting
+}
+
+func newClaimsCache(fingerprintSecret string) *claimsCache {
+	c := &claimsCache{
+		entries: make(map[string]claimsCacheEntry),
+		secret:  fingerprintSecret,
+	}
+	// Background cleanup of stale entries every 2 minutes
+	go func() {
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			c.mu.Lock()
+			now := time.Now()
+			for k, v := range c.entries {
+				if now.After(v.expiresAt) {
+					delete(c.entries, k)
+				}
+			}
+			c.mu.Unlock()
+		}
+	}()
+	return c
+}
+
+func (c *claimsCache) key(token string) string {
+	mac := hmac.New(sha256.New, []byte(c.secret))
+	mac.Write([]byte(token))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func (c *claimsCache) get(token string) (*auth.Claims, bool) {
+	k := c.key(token)
+	c.mu.RLock()
+	entry, ok := c.entries[k]
+	c.mu.RUnlock()
+	if !ok || time.Now().After(entry.expiresAt) {
+		return nil, false
+	}
+	return entry.claims, true
+}
+
+func (c *claimsCache) set(token string, claims *auth.Claims) {
+	ttl := 30 * time.Second
+	if claims.ExpiresAt > 0 {
+		tokenExpiry := time.Unix(claims.ExpiresAt, 0)
+		if tokenExpiry.Before(time.Now().Add(ttl)) {
+			ttl = time.Until(tokenExpiry)
+		}
+	}
+	if ttl <= 0 {
+		return
+	}
+	k := c.key(token)
+	c.mu.Lock()
+	c.entries[k] = claimsCacheEntry{claims: claims, expiresAt: time.Now().Add(ttl)}
+	c.mu.Unlock()
+}
+
+func (c *claimsCache) invalidate(token string) {
+	k := c.key(token)
+	c.mu.Lock()
+	delete(c.entries, k)
+	c.mu.Unlock()
+}
 
 // ContextWithClaims stores the verified JWT claims into the request context.
 func ContextWithClaims(ctx context.Context, claims *auth.Claims) context.Context {
@@ -166,9 +250,10 @@ func extractClientIP(r *http.Request) string {
 	return ip
 }
 
-// AuthMiddleware validates JWT Bearer tokens and rejects unauthenticated requests.
-// Public paths bypass token validation.
-func AuthMiddleware(secret string, publicPaths map[string]bool, next http.Handler) http.Handler {
+// AuthMiddleware validates JWT Bearer tokens by delegating to the auth-service via gRPC.
+// Results are cached locally for 30 seconds to avoid an RPC on every protected request.
+// Public paths bypass token validation entirely.
+func AuthMiddleware(authClient authv1.AuthServiceClient, cache *claimsCache, publicPaths map[string]bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		if publicPaths[path] {
@@ -183,15 +268,53 @@ func AuthMiddleware(secret string, publicPaths map[string]bool, next http.Handle
 			return
 		}
 
-		claims, err := auth.ValidateToken(tokenStr, secret)
-		if err != nil {
-			writeAuthError(w, http.StatusUnauthorized, fmt.Sprintf("Invalid token: %v", err))
+		// Fast path: check local cache before making an RPC
+		if cached, ok := cache.get(tokenStr); ok {
+			ctx := ContextWithClaims(r.Context(), cached)
+			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
+
+		// Slow path: delegate to auth-service gRPC
+		validateCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		resp, err := authClient.ValidateToken(validateCtx, &authv1.ValidateTokenRequest{Token: tokenStr})
+		if err != nil {
+			writeAuthError(w, http.StatusUnauthorized, "Authentication service unavailable")
+			return
+		}
+		if !resp.Valid {
+			msg := tokenErrorMessage(resp.Error)
+			writeAuthError(w, http.StatusUnauthorized, fmt.Sprintf("Invalid token: %s", msg))
+			return
+		}
+
+		claims := &auth.Claims{
+			Subject:   resp.Subject,
+			Roles:     resp.Roles,
+			Scopes:    resp.Scopes,
+			ExpiresAt: resp.ExpiresAt,
+		}
+		cache.set(tokenStr, claims)
 
 		ctx := ContextWithClaims(r.Context(), claims)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// tokenErrorMessage converts a proto error code to a human-readable string.
+func tokenErrorMessage(code authv1.TokenErrorCode) string {
+	switch code {
+	case authv1.TokenErrorCode_TOKEN_EXPIRED:
+		return "token has expired"
+	case authv1.TokenErrorCode_TOKEN_REVOKED:
+		return "token has been revoked"
+	case authv1.TokenErrorCode_TOKEN_INVALID_SIG:
+		return "token signature is invalid"
+	default:
+		return "malformed token"
+	}
 }
 
 // RequireRole checks that the authenticated claims have the specified role.
