@@ -17,13 +17,30 @@ func TestRecordTransactionRejectsInvalidPayload(t *testing.T) {
 	}{
 		{
 			name: "missing idempotency key",
-			req:  &ledgerv1.RecordTransactionRequest{Amount: 10},
+			req:  &ledgerv1.RecordTransactionRequest{Amount: 10, Currency: "USD"},
 		},
 		{
 			name: "non-positive amount",
 			req: &ledgerv1.RecordTransactionRequest{
 				IdempotencyKey: "key-1",
 				Amount:         0,
+				Currency:       "USD",
+			},
+		},
+		{
+			name: "negative amount",
+			req: &ledgerv1.RecordTransactionRequest{
+				IdempotencyKey: "key-2",
+				Amount:         -100,
+				Currency:       "USD",
+			},
+		},
+		{
+			name: "unsupported currency",
+			req: &ledgerv1.RecordTransactionRequest{
+				IdempotencyKey: "key-3",
+				Amount:         100,
+				Currency:       "FAKE",
 			},
 		},
 	}
@@ -42,3 +59,15 @@ func TestRecordTransactionRejectsInvalidPayload(t *testing.T) {
 		})
 	}
 }
+
+func TestGetLedgerEntriesRejectsMissingWalletID(t *testing.T) {
+	service := &server{}
+	resp, err := service.GetLedgerEntries(context.Background(), &ledgerv1.GetLedgerRequest{WalletId: ""})
+	if resp != nil {
+		t.Fatalf("expected nil response, got %+v", resp)
+	}
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument, got %v", err)
+	}
+}
+

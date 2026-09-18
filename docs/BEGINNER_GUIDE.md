@@ -42,7 +42,7 @@ The gateway is the public HTTP entry point. It:
 3. Calls the active Wallet Service through gRPC.
 4. Converts the protobuf response back into JSON.
 
-`Gateway.getActiveWalletClient` chooses either the primary or standby wallet client. `handleFailover` changes this choice in memory. The gateway also calls the Ledger Service directly for ledger queries.
+`Gateway.getActiveWalletClient` queries the distributed `FailoverCoordinator` (`pkg/coordinator/coordinator.go`) to route to either the primary or standby wallet client. `handleFailover` atomically records the switch in MongoDB (`cluster_state` collection) under administrative RBAC. The gateway also calls the Ledger Service directly for ledger queries.
 
 ### Wallet Service
 
@@ -188,14 +188,26 @@ The Compose setup starts MongoDB, initializes its single-node replica set, then 
 docker compose logs -f
 ```
 
+### Mint JWT authentication tokens
+
+With Phase 2 security enabled, all operations require a valid JWT token. The API gateway exposes a test token endpoint:
+
+```bash
+ALICE_TOKEN=$(curl -s -X POST "http://localhost:8080/api/v1/auth/token?sub=alice&role=user" | jq -r .token)
+BOB_TOKEN=$(curl -s -X POST "http://localhost:8080/api/v1/auth/token?sub=bob&role=user" | jq -r .token)
+ADMIN_TOKEN=$(curl -s -X POST "http://localhost:8080/api/v1/auth/token?sub=admin&role=admin" | jq -r .token)
+```
+
 ### Create Alice and Bob
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/wallets \
+  -H "Authorization: Bearer $ALICE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"wallet_id":"alice","currency":"USD","initial_balance":1000}'
 
 curl -X POST http://localhost:8080/api/v1/wallets \
+  -H "Authorization: Bearer $BOB_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"wallet_id":"bob","currency":"USD","initial_balance":500}'
 ```
@@ -215,6 +227,7 @@ The gateway routes these calls to the active wallet service. The wallet service 
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/transfers \
+  -H "Authorization: Bearer $ALICE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "idempotency_key":"transfer-alice-bob-001",
@@ -227,16 +240,17 @@ curl -X POST http://localhost:8080/api/v1/transfers \
 
 The request flow is:
 
-1. The client sends HTTP JSON to the gateway.
-2. The gateway selects the active wallet client.
-3. The gateway converts JSON into `TransferFundsRequest` and calls `WalletService.TransferFunds` over gRPC.
-4. Wallet Service checks `idempotency_records` for the key.
-5. It conditionally debits Alice only when Alice has at least 25 USD.
-6. It conditionally credits Bob only when Bob exists with USD currency.
-7. Wallet Service calls `LedgerService.RecordTransaction` over gRPC.
-8. Ledger Service writes an audit entry to `ledger_entries` and returns a transaction ID.
-9. Wallet Service stores the idempotency key and transaction ID.
-10. The gateway returns the result as JSON.
+1. The client sends HTTP JSON with Bearer token to the gateway.
+2. Gateway verifies token signature, expiry, and verifies caller identity (`sub == source_wallet_id` for IDOR protection).
+3. The gateway selects the active wallet client.
+4. The gateway converts JSON into `TransferFundsRequest` and calls `WalletService.TransferFunds` over gRPC.
+5. Wallet Service checks `idempotency_records` for the key.
+6. It conditionally debits Alice only when Alice has at least 25 USD.
+7. It conditionally credits Bob only when Bob exists with USD currency.
+8. Wallet Service saves an outbox task and notifies/calls `LedgerService.RecordTransaction` over gRPC.
+9. Ledger Service writes an audit entry to `ledger_entries` and returns a transaction ID.
+10. Wallet Service stores the idempotency key and transaction ID.
+11. The gateway returns the result as JSON.
 
 Expected balance effect:
 
@@ -256,9 +270,9 @@ The key is the retry identity. A new key represents a new transfer attempt.
 ### Read the results
 
 ```bash
-curl "http://localhost:8080/api/v1/wallets?id=alice"
-curl "http://localhost:8080/api/v1/wallets?id=bob"
-curl "http://localhost:8080/api/v1/ledger?wallet_id=alice"
+curl -H "Authorization: Bearer $ALICE_TOKEN" "http://localhost:8080/api/v1/wallets?id=alice"
+curl -H "Authorization: Bearer $BOB_TOKEN" "http://localhost:8080/api/v1/wallets?id=bob"
+curl -H "Authorization: Bearer $ALICE_TOKEN" "http://localhost:8080/api/v1/ledger?wallet_id=alice"
 ```
 
 ## 6. What MongoDB stores
@@ -297,47 +311,61 @@ Check the current routing target:
 curl http://localhost:8080/api/v1/cluster/status
 ```
 
-Toggle the target:
+Toggle the target (requires Admin authorization token):
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/cluster/failover
+curl -X POST http://localhost:8080/api/v1/cluster/failover \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
-This changes an in-memory value inside the gateway process. It does not automatically detect failures, replicate data between databases, or move traffic between independent regions. Restarting the gateway resets its initial target.
+This invokes the distributed `FailoverCoordinator` (`pkg/coordinator/coordinator.go`) under administrative RBAC (`role=admin` or `scope=cluster:admin`), atomically recording the active target in MongoDB (`banking_db.cluster_state`). Because state is stored centrally in the database and cached with a 1-second TTL, all gateway replicas immediately synchronize, and the target persists across gateway restarts.
+
+Furthermore, **Standby Write Fencing (GAP-HA-02)** guarantees that write operations (`CreateWallet`, `TransferFunds`) sent to the standby node return `codes.FailedPrecondition`, ensuring only the promoted active node can execute balance modifications. Read queries (`GetBalance`) and health checks remain fully operational on standby.
 
 ## 9. Kubernetes overview
 
-The `k8s/` files create:
+The complete 10-manifest suite in `k8s/` creates:
 
-- A namespace.
-- A MongoDB StatefulSet and service.
-- A Ledger Service deployment.
-- Primary and standby Wallet Service deployments.
-- An API Gateway exposed through a NodePort.
+- `01-namespace.yaml`: Dedicated `wallet-system` production namespace.
+- `02-mongodb.yaml`: 3-node HA MongoDB StatefulSet (`mongo-0`, `mongo-1`, `mongo-2`) with headless DNS (`mongo-cluster`), automated `rs0` replica-set initialization sidecar, and 10Gi dynamic PVCs.
+- `03-ledger-service.yaml`: Ledger Service deployment with unprivileged securityContext, resource limits, and health probes.
+- `04-wallet-services.yaml`: Primary (active) and standby (passive) Wallet Service deployments with dedicated HTTP health probes.
+- `05-api-gateway.yaml`: API Gateway deployment with liveness (`/healthz`) and readiness (`/readyz`) probes.
+- `06-rabbitmq.yaml`: RabbitMQ 3.13 StatefulSet with management UI (`:15672`), AMQP (`:5672`), and Prometheus metrics (`:15692`).
+- `07-logging-service.yaml`: Centralized asynchronous Logging Service deployment.
+- `08-ingress.yaml`: NGINX Ingress controller with TLS termination and path routing.
+- `09-configmap-secrets.yaml`: Decoupled environment configurations and credentials templates.
+- `10-hpa-pdb.yaml`: HorizontalPodAutoscalers (2–10 replicas) and PodDisruptionBudgets (`minAvailable: 1`).
 
-Build the images before applying the manifests, and make sure the images are available to Minikube or Kind. The Kubernetes MongoDB manifest starts MongoDB with `--replSet rs0`, while the application connection strings expect `replicaSet=rs0`; verify replica-set initialization in your cluster before troubleshooting the application services.
+Build the hardened non-root container images before applying the manifests, and make sure the images are available to Minikube or Kind.
 
 ## 10. Caveats worth knowing
 
-This project is a learning/demo system. The current implementation has several important boundaries:
+This project is an advanced architectural learning and demonstration platform with enterprise-grade controls:
 
-- `CreateWallet` uses an upsert and `$set`, so creating an existing wallet can overwrite its balance and currency.
-- Request validation is limited. Empty IDs, invalid amounts, and other malformed business inputs are not comprehensively rejected.
-- Idempotency uses lookup-then-insert. Review unique indexes and concurrent retries before treating it as production-grade duplicate protection.
-- The ledger service also uses lookup-then-insert behavior for duplicate keys.
-- A single ledger document is stored per transfer; the project calls this double-entry conceptually, but does not store separate debit and credit documents.
-- Ledger results are not explicitly sorted.
-- Primary and standby share MongoDB in the local deployment.
-- Failover is a manual in-memory route toggle.
-- The project uses insecure gRPC transport inside the local deployment. Production deployments need authentication, authorization, encryption, validation, observability, and stronger failure handling.
+- `CreateWallet` strictly enforces account uniqueness: creating an existing wallet ID returns HTTP 409 Conflict (`codes.AlreadyExists`) preventing account overwrite.
+- Zero-Trust security is enforced at the API Gateway: HMAC-SHA256 JWT tokens, IDOR ownership verification (`sub == wallet_id`), administrative RBAC for failover, rate limiting (60 rps/100 burst), 1MB payload limits, and security headers.
+- Inter-service gRPC supports mutual TLS (`mTLS`) via `GRPC_TLS_ENABLED=true` (and defaults to plaintext for friction-free local development).
+- **GAAP/IFRS True Double-Entry Bookkeeping & Cryptographic Hash Chaining (Phase 4 Completed)**: Implemented balanced journal postings ($\sum \text{Debits} == \sum \text{Credits}$) and SHA-256 cryptographic audit chaining linking ledger entries sequentially back to `GenesisHash`, with online tamper verification via `/audit/verify`.
+- **Account Operational Controls & Fencing (Phase 4 Completed)**: Explicit account operational states (`ACTIVE`, `FROZEN`, `CLOSED`) with atomic transaction fencing blocking fund movements to/from frozen or closed accounts, and administrative management endpoint `/admin/wallet/status` on ports `:9094`/`:9093`.
+- **Container & Kubernetes Hardening (Phase 4 Completed)**: Multi-stage Docker build running under unprivileged `appuser:appgroup` (UID 10001, GID 10001) with deterministic dependency caching, and complete 10-manifest production Kubernetes suite.
+- **High Availability & Resilience (Phase 3 Completed)**: Distributed consensus via `FailoverCoordinator`, Standby Write Fencing, OpenTelemetry W3C distributed tracing, standard `grpc.health.v1` health probes, and Prometheus management metrics on `:9094`/`:9093`/`:9092`.
 
 ## 11. Where to read next
 
-- HTTP routing: `cmd/api-gateway/main.go`
-- Wallet behavior and transfer sequence: `cmd/wallet-service/main.go`
-- Ledger persistence: `cmd/ledger-service/main.go`
+- HTTP routing & OTel middleware: `cmd/api-gateway/main.go`
+- Wallet behavior, outbox worker & write fencing: `cmd/wallet-service/main.go`
+- Ledger double-entry & SHA-256 audit chaining: `cmd/ledger-service/double_entry.go`
+- High-concurrency race suites: `cmd/wallet-service/concurrency_test.go`
+- Ledger persistence & gRPC health: `cmd/ledger-service/main.go`
+- Failover Coordinator: `pkg/coordinator/coordinator.go`
+- OpenTelemetry Tracing & Metrics: `pkg/observability/tracer.go` & `pkg/observability/metrics.go`
 - Wallet gRPC contract: `proto/wallet/wallet.proto`
 - Ledger gRPC contract: `proto/ledger/ledger.proto`
+- Phase 4 Implementation: `docs/PHASE4_IMPLEMENTATION.md`
+- Phase 3 Implementation: `docs/PHASE3_IMPLEMENTATION.md`
+- Production Readiness Audit: `docs/PRODUCTION_READINESS_AUDIT.md`
+- BloomRPC gRPC Testing: `docs/BLOOMRPC_GUIDE.md`
 - MongoDB connection retry: `pkg/db/mongo.go`
 - Local topology: `docker-compose.yml`
 - Kubernetes topology: `k8s/`

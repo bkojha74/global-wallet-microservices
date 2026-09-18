@@ -1,11 +1,16 @@
 package observability
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"sort"
 	"strings"
 	"sync"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/status"
 )
 
 // MetricsRegistry tracks the 6 Prometheus-format metrics specified in the architecture
@@ -23,6 +28,12 @@ type MetricsRegistry struct {
 	queueDepth     map[string]int64   // logging_queue_depth{service}
 	spoolBytes     map[string]int64   // logging_spool_bytes{service}
 	spoolOldestAge map[string]float64 // logging_spool_oldest_event_age_seconds{service}
+
+	// Phase 3 (GAP-OBS-02): gRPC & cluster metrics
+	grpcRequests        map[string]int64   // grpc_requests_total{service,method,code}
+	grpcLatencySum      map[string]float64 // grpc_request_duration_seconds_sum{service,method}
+	grpcLatencyCount    map[string]int64   // grpc_request_duration_seconds_count{service,method}
+	clusterActiveTarget map[string]int64   // cluster_active_target{service,target}
 }
 
 // DefaultMetrics is the process-wide singleton registry used by all AsyncLogger instances.
@@ -30,13 +41,17 @@ var DefaultMetrics = NewMetricsRegistry()
 
 func NewMetricsRegistry() *MetricsRegistry {
 	return &MetricsRegistry{
-		eventsEmitted:   make(map[string]int64),
-		publishFailures: make(map[string]int64),
-		eventsDropped:   make(map[string]int64),
-		spoolReplayed:   make(map[string]int64),
-		queueDepth:      make(map[string]int64),
-		spoolBytes:      make(map[string]int64),
-		spoolOldestAge:  make(map[string]float64),
+		eventsEmitted:       make(map[string]int64),
+		publishFailures:     make(map[string]int64),
+		eventsDropped:       make(map[string]int64),
+		spoolReplayed:       make(map[string]int64),
+		queueDepth:          make(map[string]int64),
+		spoolBytes:          make(map[string]int64),
+		spoolOldestAge:      make(map[string]float64),
+		grpcRequests:        make(map[string]int64),
+		grpcLatencySum:      make(map[string]float64),
+		grpcLatencyCount:    make(map[string]int64),
+		clusterActiveTarget: make(map[string]int64),
 	}
 }
 
@@ -91,6 +106,46 @@ func (m *MetricsRegistry) SetSpoolOldestAge(service string, seconds float64) {
 	m.mu.Lock()
 	m.spoolOldestAge[key] = seconds
 	m.mu.Unlock()
+}
+
+func (m *MetricsRegistry) ObserveGRPCRequest(service, method, code string, durationSeconds float64) {
+	reqKey := fmt.Sprintf("service=%q,method=%q,code=%q", service, method, code)
+	latKey := fmt.Sprintf("service=%q,method=%q", service, method)
+
+	m.mu.Lock()
+	m.grpcRequests[reqKey]++
+	m.grpcLatencySum[latKey] += durationSeconds
+	m.grpcLatencyCount[latKey]++
+	m.mu.Unlock()
+}
+
+func (m *MetricsRegistry) SetClusterActiveTarget(service, target string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k := range m.clusterActiveTarget {
+		if strings.HasPrefix(k, fmt.Sprintf("service=%q,", service)) {
+			m.clusterActiveTarget[k] = 0
+		}
+	}
+	key := fmt.Sprintf("service=%q,target=%q", service, target)
+	m.clusterActiveTarget[key] = 1
+}
+
+// UnaryServerMetricsInterceptor returns a gRPC server interceptor recording metrics.
+func (m *MetricsRegistry) UnaryServerMetricsInterceptor(serviceName string) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		start := time.Now()
+		resp, err := handler(ctx, req)
+		duration := time.Since(start).Seconds()
+
+		code := "OK"
+		if err != nil {
+			s, _ := status.FromError(err)
+			code = s.Code().String()
+		}
+		m.ObserveGRPCRequest(serviceName, info.FullMethod, code, duration)
+		return resp, err
+	}
 }
 
 // Handler returns an http.Handler that renders metrics in Prometheus text exposition format.
@@ -151,6 +206,32 @@ func (m *MetricsRegistry) Handler() http.Handler {
 		b.WriteString("# TYPE logging_spool_oldest_event_age_seconds gauge\n")
 		for _, k := range sortedFloatKeys(m.spoolOldestAge) {
 			fmt.Fprintf(&b, "logging_spool_oldest_event_age_seconds{%s} %.2f\n", k, m.spoolOldestAge[k])
+		}
+
+		// 7. grpc_requests_total (Counter)
+		b.WriteString("# HELP grpc_requests_total Total gRPC requests by service, method, and response status code.\n")
+		b.WriteString("# TYPE grpc_requests_total counter\n")
+		for _, k := range sortedKeys(m.grpcRequests) {
+			fmt.Fprintf(&b, "grpc_requests_total{%s} %d\n", k, m.grpcRequests[k])
+		}
+
+		// 8. grpc_request_duration_seconds (Summary/Counters)
+		b.WriteString("# HELP grpc_request_duration_seconds_sum Total duration of gRPC requests in seconds.\n")
+		b.WriteString("# TYPE grpc_request_duration_seconds_sum counter\n")
+		for _, k := range sortedFloatKeys(m.grpcLatencySum) {
+			fmt.Fprintf(&b, "grpc_request_duration_seconds_sum{%s} %.4f\n", k, m.grpcLatencySum[k])
+		}
+		b.WriteString("# HELP grpc_request_duration_seconds_count Total count of recorded gRPC requests.\n")
+		b.WriteString("# TYPE grpc_request_duration_seconds_count counter\n")
+		for _, k := range sortedKeys(m.grpcLatencyCount) {
+			fmt.Fprintf(&b, "grpc_request_duration_seconds_count{%s} %d\n", k, m.grpcLatencyCount[k])
+		}
+
+		// 9. cluster_active_target (Gauge)
+		b.WriteString("# HELP cluster_active_target Cluster active routing target (1 for active, 0 for standby).\n")
+		b.WriteString("# TYPE cluster_active_target gauge\n")
+		for _, k := range sortedKeys(m.clusterActiveTarget) {
+			fmt.Fprintf(&b, "cluster_active_target{%s} %d\n", k, m.clusterActiveTarget[k])
 		}
 
 		_, _ = w.Write([]byte(b.String()))

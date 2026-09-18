@@ -1,19 +1,19 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: ledger-service
+  name: logging-service
   namespace: banking-system
   labels:
-    app: ledger-service
+    app: logging-service
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
-      app: ledger-service
+      app: logging-service
   template:
     metadata:
       labels:
-        app: ledger-service
+        app: logging-service
     spec:
       securityContext:
         runAsNonRoot: true
@@ -22,34 +22,32 @@ spec:
         fsGroup: 10001
       terminationGracePeriodSeconds: 20
       containers:
-        - name: ledger-service
-          image: wallet-system/ledger-service:latest
+        - name: logging-service
+          image: wallet-system/logging-service:latest
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
           ports:
-            - containerPort: 50052
-              name: grpc
-            - containerPort: 9092
+            - containerPort: 8090
+              name: http
+            - containerPort: 9090
               name: metrics
           envFrom:
             - configMapRef:
                 name: wallet-config
           env:
-            - name: PORT
-              value: "50052"
+            - name: HTTP_PORT
+              value: "8090"
             - name: METRICS_PORT
-              value: "9092"
-            - name: REGION_NAME
-              value: "global-k8s"
+              value: "9090"
             - name: MONGO_URI
               valueFrom:
                 secretKeyRef:
                   name: wallet-secrets
                   key: MONGO_URI
-            - name: LOGGING_RABBITMQ_URL
+            - name: RABBITMQ_URL
               valueFrom:
                 secretKeyRef:
                   name: wallet-secrets
@@ -60,37 +58,37 @@ spec:
               memory: 128Mi
             limits:
               cpu: 500m
-              memory: 512Mi
+              memory: 256Mi
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 9092
+              port: 8090
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 3
           readinessProbe:
             httpGet:
-              path: /healthz
-              port: 9092
-            initialDelaySeconds: 3
+              path: /readyz
+              port: 8090
+            initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 3
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: ledger-service
+  name: logging-service
   namespace: banking-system
   labels:
-    app: ledger-service
+    app: logging-service
 spec:
   type: ClusterIP
   ports:
-    - port: 50052
-      targetPort: 50052
-      name: grpc
-    - port: 9092
-      targetPort: 9092
+    - port: 8090
+      targetPort: 8090
+      name: http
+    - port: 9090
+      targetPort: 9090
       name: metrics
   selector:
-    app: ledger-service
+    app: logging-service
