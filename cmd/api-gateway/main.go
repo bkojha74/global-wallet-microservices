@@ -613,6 +613,85 @@ func (g *Gateway) handleLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": "logged out successfully"})
 }
 
+// handleAuthToken provides backward-compatible token minting (/api/v1/auth/token)
+// supporting legacy Bruno/Postman collections and rapid development testing.
+func (g *Gateway) handleAuthToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	sub := r.URL.Query().Get("sub")
+	role := r.URL.Query().Get("role")
+	scope := r.URL.Query().Get("scope")
+
+	if r.Method == http.MethodPost && r.Body != nil {
+		var req struct {
+			Subject string   `json:"subject"`
+			Roles   []string `json:"roles"`
+			Scopes  []string `json:"scopes"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+			if req.Subject != "" {
+				sub = req.Subject
+			}
+			if len(req.Roles) > 0 {
+				role = req.Roles[0]
+			}
+			if len(req.Scopes) > 0 {
+				scope = strings.Join(req.Scopes, ",")
+			}
+		}
+	}
+
+	if sub == "" {
+		sub = "alice"
+	}
+	if role == "" {
+		role = auth.RoleUser
+	}
+
+	var roles []string
+	if role != "" {
+		roles = []string{role}
+	}
+	var scopes []string
+	if scope != "" {
+		scopes = strings.Split(scope, ",")
+	} else if role == auth.RoleAdmin {
+		scopes = []string{auth.ScopeClusterAdmin, auth.ScopeLedgerAudit, auth.ScopeWalletTransfer, auth.ScopeWalletRead}
+	} else {
+		scopes = []string{auth.ScopeWalletTransfer, auth.ScopeWalletRead}
+	}
+
+	claims := auth.Claims{
+		Subject: sub,
+		Roles:   roles,
+		Scopes:  scopes,
+	}
+
+	secret := os.Getenv("JWT_SECRET")
+	if secret == "" {
+		secret = defaultJWTSecret
+	}
+
+	token, err := auth.GenerateToken(claims, secret)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to generate token: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"token":        token,
+		"access_token": token,
+		"token_type":   "Bearer",
+		"subject":      sub,
+		"roles":        roles,
+		"scopes":       scopes,
+		"expires_in":   3600,
+	})
+}
+
 // isUnauthenticated returns true if the gRPC error code is Unauthenticated.
 func isUnauthenticated(err error) bool {
 	if st, ok := status.FromError(err); ok {
@@ -790,6 +869,7 @@ func main() {
 	mux.HandleFunc("/api/v1/auth/login", gw.handleLogin)
 	mux.HandleFunc("/api/v1/auth/refresh", gw.handleRefresh)
 	mux.HandleFunc("/api/v1/auth/logout", gw.handleLogout)
+	mux.HandleFunc("/api/v1/auth/token", gw.handleAuthToken)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "UP"})
 	})
@@ -822,6 +902,7 @@ func main() {
 		"/metrics":               true,
 		"/api/v1/auth/login":     true,
 		"/api/v1/auth/refresh":   true,
+		"/api/v1/auth/token":     true,
 		"/api/v1/cluster/status": true,
 	}
 

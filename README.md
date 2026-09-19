@@ -64,10 +64,12 @@ The system decomposes financial operations into autonomous, loosely-coupled micr
 | Microservice Component | Protocol & Ports | Architectural Role | Bounded Context & Persistence |
 |---|---|---|---|
 | **API Gateway** | HTTP `:8080`<br>Prometheus `:8081` | • Edge ingress & HTTP REST-to-gRPC translation<br>• 6-layer defense-in-depth security pipeline<br>• Distributed `FailoverCoordinator` dynamic router | Stateless |
+| **Auth Service (global-auth-service)** | gRPC `:50054`<br>Management `:9095` | • Standalone SaaS-ready authentication & IAM service<br>• Pluggable Identity Providers (Keycloak OIDC + Local MongoDB)<br>• Token issuance, signature verification, token revocation blocklist | `auth_db.users`<br>`auth_db.token_revocations` |
+| **Keycloak IdP (global-auth-service)** | HTTP `:8085` | • OpenID Connect (OIDC) / OAuth 2.0 Identity Provider<br>• Realm `wallet-realm`, user/role management, JWKS public key distribution | Embedded H2 / Postgres |
 | **Wallet Service (Primary)** | gRPC `:50051`<br>Management `:9094` | • Core banking engine for `us-east-1-primary`<br>• Multi-document ACID transactions (`Majority`/`Snapshot`)<br>• Atomic Transactional Outbox relay for ledger decoupling<br>• OTel W3C tracing, gRPC health, Prometheus metrics | `banking_db.wallets`<br>`banking_db.idempotency_records`<br>`banking_db.ledger_tasks` (Outbox) |
 | **Wallet Service (Standby)** | gRPC `:50053`<br>Management `:9093` | • Hot disaster recovery replica for `eu-west-1-standby`<br>• Real-time takeover target with Standby Write Fencing<br>• OTel W3C tracing, gRPC health, Prometheus metrics | Shared replica set `rs0`<br>(instant failover target) |
 | **Ledger Service** | gRPC `:50052`<br>Management `:9092` | • Immutable financial journal & audit ledger<br>• Reverse-chronological cursor-based queries<br>• Compound and unique indexing eliminating COLLSCAN<br>• OTel W3C tracing, gRPC health, Prometheus metrics | `banking_db.ledger_entries` |
-| **Logging Service** | HTTP `:8090`<br>Prometheus `:9090` | • High-throughput AMQP event consumer & deduplicator<br>• Operational log search API & trace reconstruction<br>• Dead-letter queue governance (`wallet.logging.dead.v1`) | `logging_db.events` |
+| **Logging Service (global-logging-service)** | HTTP `:8090`<br>Prometheus `:9090` | • Standalone SaaS centralized logging & tracing service<br>• High-throughput AMQP consumer, deduplicator & retention scheduler<br>• Log Search API, Trace Reconstruction (`/api/v1/traces`), optional API key auth | `logging_db.events` |
 
 * **Strict Contract-First Communication**: Internal inter-service communication operates exclusively over gRPC using Protobuf v3 contracts (`proto/wallet/wallet.proto` and `proto/ledger/ledger.proto`), guaranteeing type safety, high throughput, and backward compatibility.
 * **Decoupled Transactional Outbox Pattern**: Prevents distributed transaction deadlocks by eliminating cross-service RPCs from inside database transactions. Debit/credit updates and an outbox task are committed atomically; an asynchronous relay delivers ledger records with guaranteed at-least-once semantics.
@@ -383,17 +385,21 @@ graph TD
 
 ## Microservice Directory & Port Matrix
 
-| Service | Container Name | Protocol / Ports | Role & Responsibilities |
-|---|---|---|---|
-| **API Gateway** | `wallet_api_gateway` | HTTP `:8080`<br/>Prometheus `:8081` | REST ingress, request validation, gRPC reverse proxy, distributed failover coordinator router. |
-| **Wallet Service (Primary)** | `wallet_primary_active` | gRPC `:50051`<br/>Management `:9094` | Primary active banking engine (`us-east-1`). ACID multi-doc transactions, balance management, `LedgerRelay` outbox worker, gRPC health probe, Prometheus `/metrics` and `/healthz`. |
-| **Wallet Service (Standby)** | `wallet_standby_hot_dr` | gRPC `:50053`<br/>Management `:9093` | Hot standby disaster recovery replica (`eu-west-1`). Identical engine with Standby Write Fencing ready for instant promotion, gRPC health probe, Prometheus `/metrics` and `/healthz`. |
-| **Ledger Service** | `wallet_ledger_service` | gRPC `:50052`<br/>Management `:9092` | Immutable financial ledger, transaction journal recording, reverse-chronological cursor-based queries, gRPC health probe, Prometheus `/metrics` and `/healthz`. |
-| **Logging Service** | `wallet_logging_service` | HTTP `:8090`<br/>Prometheus `:9090` | AMQP log consumer, validation, deduplication, Log Search API (`/api/v1/logs`), Trace Reconstruction (`/api/v1/traces/{id}`). |
-| **MongoDB** | `wallet_mongodb` | TCP `:27017` | Multi-document ACID transactional datastore running replica set `rs0`. Hosts `banking_db` (including `cluster_state`) and `logging_db`. |
-| **RabbitMQ** | `wallet_rabbitmq` | AMQP `:5672`<br/>Management `:15672` | High-throughput asynchronous message broker with management UI, direct exchange, and dead-letter exchanges. |
-| **Prometheus** | `wallet_prometheus` | HTTP `:9091` | Time-series metrics collection server scraping gateway (:8081), primary wallet (:9094), standby wallet (:9093), ledger (:9092), and logging (:9090). |
-| **Grafana** | `wallet_grafana` | HTTP `:3000` | Observability dashboards auto-provisioned with logging health, throughput, and error metrics. |
+The platform is structured into **6 modular Docker Compose projects** that can be started, stopped, or scaled independently:
+
+| Service | Docker Compose Project | Container Name | Protocol / Ports | Role & Responsibilities |
+|---|---|---|---|---|
+| **API Gateway** | `global-wallet-microservices` | `wallet_api_gateway` | HTTP `:8080`<br/>Prometheus `:8081` | REST ingress, request validation, gRPC reverse proxy, distributed failover coordinator router. |
+| **Wallet Service (Primary)** | `global-wallet-microservices` | `wallet_primary_active` | gRPC `:50051`<br/>Management `:9094` | Primary active banking engine (`us-east-1`). ACID multi-doc transactions, balance management, `LedgerRelay` outbox worker, gRPC health probe, Prometheus `/metrics` and `/healthz`. |
+| **Wallet Service (Standby)** | `global-wallet-microservices` | `wallet_standby_hot_dr` | gRPC `:50053`<br/>Management `:9093` | Hot standby disaster recovery replica (`eu-west-1`). Identical engine with Standby Write Fencing ready for instant promotion, gRPC health probe, Prometheus `/metrics` and `/healthz`. |
+| **Ledger Service** | `global-wallet-microservices` | `wallet_ledger_service` | gRPC `:50052`<br/>Management `:9092` | Immutable financial ledger, transaction journal recording, reverse-chronological cursor-based queries, gRPC health probe, Prometheus `/metrics` and `/healthz`. |
+| **Auth Service** | `global-auth-service` | `wallet_auth_service` | gRPC `:50054`<br/>Metrics `:9095` | Standalone SaaS-ready authentication microservice. Pluggable hybrid identity provider, MongoDB user repository, HMAC/RSA token engine, TTL token blocklist. |
+| **Keycloak IdP** | `global-auth-service` | `wallet_keycloak` | HTTP `:8085` | Enterprise OIDC / OAuth2 Identity Provider. Self-service account portal, admin console, realm import, and JWKS public key distribution. |
+| **Logging Service** | `global-logging-service` | `wallet_logging_service` | HTTP `:8090`<br/>Prometheus `:9090` | Standalone SaaS-ready centralized logging microservice. AMQP log consumer, validation, deduplication, Log Search API (`/api/v1/logs`), Trace Reconstruction (`/api/v1/traces/{id}`), retention scheduler. |
+| **Async Queue (RabbitMQ)** | `global-async-queue` | `wallet_rabbitmq` | AMQP `:5672`<br/>Management `:15672` | High-throughput asynchronous message broker (`docker-compose.rabbitmq.yml`). Direct and dead-letter exchanges, quorum queues, and management UI. |
+| **Prometheus** | `global-monitoring` | `wallet_prometheus` | HTTP `:9091` | Time-series metrics collection server (`docker-compose.monitoring.yml`) scraping gateway, primary/standby wallets, ledger, logging, and rabbitmq. |
+| **Grafana** | `global-monitoring` | `wallet_grafana` | HTTP `:3000` | Observability dashboards auto-provisioned with metrics visualization (`docker-compose.monitoring.yml`). |
+| **MongoDB** | `wallet-mongodb` | `wallet_mongodb` | TCP `:27017` | Multi-document ACID transactional datastore running replica set `rs0` (`docker-compose.mongodb.yml`). Hosts `banking_db` (including `cluster_state`) and `logging_db`. |
 
 ---
 
@@ -485,20 +491,23 @@ The project uses modular Docker Compose stacks connected via a shared external n
 docker network create wallet_shared_net 2>/dev/null || true
 docker volume create global-wallet-microservices_mongo_data >/dev/null 2>&1 || true
 
-# 2. Start the MongoDB 7.0 Replica Set (rs0)
+# 2. Start MongoDB Replica Set (Project: wallet-mongodb)
 docker compose -f docker-compose.mongodb.yml up -d
 
-# 3. Start RabbitMQ Message Broker
+# 3. Start Async Message Queue (Project: global-async-queue)
 docker compose -f docker-compose.rabbitmq.yml up -d
 
-# 4. Start Core Application Microservices (Gateway, Primary Wallet, Standby Wallet, Ledger)
-docker compose -f docker-compose.yml up --build -d
+# 4. Start Identity & Auth Service (Project: global-auth-service)
+docker compose -f docker-compose.auth.yml up --build -d
 
-# 5. Start Centralized Logging Microservice
+# 5. Start Centralized Logging Microservice (Project: global-logging-service)
 docker compose -f docker-compose.logging.yml up --build -d
 
-# 6. Start Observability Monitoring (Prometheus & Grafana)
+# 6. Start Observability & Telemetry Monitoring (Project: global-monitoring)
 docker compose -f docker-compose.monitoring.yml up -d
+
+# 7. Start Core Application Microservices (Project: global-wallet-microservices)
+docker compose -f docker-compose.yml up --build -d
 ```
 
 Verify that all containers are healthy:
@@ -511,26 +520,40 @@ docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 A convenient `Makefile` is provided in the repository root:
 
 ```bash
-make up          # Start all stacks in dependency order
-make down        # Stop application services safely
-make test        # Run Go unit and race detector tests
-make e2e         # Execute automated end-to-end integration test
-make status      # Check container health and status
+make up            # Start all stacks in dependency order (MongoDB -> Queue -> Auth -> Logging -> Core App)
+make up-queue      # Start standalone global-async-queue (RabbitMQ)
+make up-auth       # Start standalone global-auth-service (Keycloak + Auth Service)
+make up-logging    # Start standalone global-logging-service
+make up-monitoring # Start standalone global-monitoring (Prometheus & Grafana)
+make up-mongodb    # Start MongoDB replica set
+make up-app        # Start core wallet application microservices
+make down          # Stop all application, platform, and infrastructure stacks safely
+make down-queue    # Stop async queue stack
+make down-auth     # Stop auth service stack
+make down-logging  # Stop logging service stack
+make down-monitoring # Stop monitoring stack
+make test          # Run Go unit and race detector tests
+make e2e           # Execute automated end-to-end integration test
+make clean         # Tear down containers, networks, and persistent volumes
 ```
 
 ---
 
 ## Interactive API Verification Guide (cURL)
 
-### 0. Mint JWT Authentication Tokens (Phase 2)
-Generate signed test tokens for Alice (user) and Ops Admin:
+### 0. Obtain JWT Authentication Tokens
+Authenticate credentials against `global-auth-service` via API Gateway for Alice (Keycloak OIDC user) and Admin:
 
 ```bash
-# Mint user token for Alice
-ALICE_TOKEN=$(curl -s -X POST "http://localhost:8080/api/v1/auth/token?sub=alice&role=user" | jq -r .token)
+# Obtain token for Alice (Keycloak user)
+ALICE_TOKEN=$(curl -s -X POST "http://localhost:8080/api/v1/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"alice123"}' | jq -r .access_token)
 
-# Mint admin token for Ops
-ADMIN_TOKEN=$(curl -s -X POST "http://localhost:8080/api/v1/auth/token?sub=ops-admin&role=admin" | jq -r .token)
+# Obtain token for Admin (change-me-in-production)
+ADMIN_TOKEN=$(curl -s -X POST "http://localhost:8080/api/v1/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"change-me-in-production"}' | jq -r .access_token)
 ```
 
 ### 1. Create Wallets

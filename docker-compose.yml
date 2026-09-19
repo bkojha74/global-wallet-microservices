@@ -1,3 +1,5 @@
+name: global-wallet-microservices
+
 services:
   ledger-service:
     build:
@@ -75,57 +77,6 @@ services:
     networks:
       - banking_net
 
-  keycloak:
-    image: quay.io/keycloak/keycloak:latest
-    container_name: wallet_keycloak
-    command: start-dev --import-realm
-    environment:
-      - KEYCLOAK_ADMIN=admin
-      - KEYCLOAK_ADMIN_PASSWORD=admin
-      - KC_HEALTH_ENABLED=true
-    volumes:
-      - ./deploy/keycloak/wallet-realm-realm.json:/opt/keycloak/data/import/wallet-realm-realm.json:ro
-    ports:
-      - "8085:8080"
-    networks:
-      - banking_net
-
-  auth-service:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: auth-service
-    container_name: wallet_auth_service
-    restart: always
-    environment:
-      - AUTH_SERVICE_PORT=50054
-      - MONGO_URI=mongodb://mongodb:27017/?replicaSet=rs0&directConnection=true
-      - ENVIRONMENT=local
-      - METRICS_PORT=9095
-      - INSTANCE_ID=auth-service-1
-      - LOGGING_RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
-      - LOGGING_SPOOL_PATH=data/logging/auth-service.jsonl
-      # Set AUTH_PRIVATE_KEY_PATH and AUTH_PUBLIC_KEY_PATH for RS256 (recommended for production)
-      # - AUTH_PRIVATE_KEY_PATH=/app/certs/auth_private.pem
-      # - AUTH_PUBLIC_KEY_PATH=/app/certs/auth_public.pem
-      # For development: falls back to JWT_SECRET for HS256
-      - JWT_SECRET=${JWT_SECRET:-development-wallet-insecure-secret-key-change-in-prod}
-      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-change-me-in-production}
-      # Keycloak / External OIDC configuration:
-      - AUTH_PROVIDER=${AUTH_PROVIDER:-hybrid}
-      - KEYCLOAK_URL=${KEYCLOAK_URL:-http://keycloak:8080}
-      - KEYCLOAK_REALM=${KEYCLOAK_REALM:-wallet-realm}
-      - KEYCLOAK_CLIENT_ID=${KEYCLOAK_CLIENT_ID:-wallet-api}
-      - KEYCLOAK_CLIENT_SECRET=${KEYCLOAK_CLIENT_SECRET:-wallet-client-secret-12345}
-    ports:
-      - "50054:50054"
-      - "9095:9095"
-    depends_on:
-      - keycloak
-    networks:
-      - banking_net
-
   api-gateway:
     build:
       context: .
@@ -144,10 +95,10 @@ services:
       - ENVIRONMENT=local
       - LOGGING_RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - LOGGING_SPOOL_PATH=data/logging/api-gateway.jsonl
+      - JWT_SECRET=${JWT_SECRET:-development-wallet-insecure-secret-key-change-in-prod}
     ports:
       - "8080:8080"
     depends_on:
-      - auth-service
       - wallet-primary
       - wallet-standby
       - ledger-service

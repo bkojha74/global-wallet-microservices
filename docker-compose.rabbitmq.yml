@@ -1,4 +1,4 @@
-name: wallet-rabbitmq
+name: global-async-queue
 
 services:
   rabbitmq:
@@ -29,7 +29,9 @@ services:
       # TLS certs — uncomment when Phase 5 TLS is enabled:
       # - ./config/rabbitmq/tls:/etc/rabbitmq/tls:ro
     networks:
-      - wallet_shared_net
+      wallet_shared_net:
+        aliases:
+          - rabbitmq
 
 # ─── Phase 5: 3-node HA cluster (production) ─────────────────────────────────
 # Uncomment this block and the rabbitmq-2 / rabbitmq-3 services to run a
@@ -72,11 +74,14 @@ services:
 volumes:
   rabbitmq_data:
     name: wallet_rabbitmq_data
+    external: true
   # HA volumes (uncomment with cluster nodes above):
   rabbitmq_data_2:
     name: wallet_rabbitmq_data_2
+    external: true
   rabbitmq_data_3:
     name: wallet_rabbitmq_data_3
+    external: true
 
 networks:
   wallet_shared_net:
