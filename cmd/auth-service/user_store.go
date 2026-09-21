@@ -27,25 +27,25 @@ const maxFailedLogins = 5
 
 // UserRecord mirrors the MongoDB document stored in auth_db.users.
 type UserRecord struct {
-	ID                primitive.ObjectID `bson:"_id,omitempty"`
-	Username          string             `bson:"username"`
-	Email             string             `bson:"email,omitempty"`
-	PasswordHash      string             `bson:"password_hash"`
-	Roles             []string           `bson:"roles"`
-	Scopes            []string           `bson:"scopes"`
-	WalletIDs         []string           `bson:"wallet_ids,omitempty"` // for IDOR/ABAC ownership checks
-	Status            string             `bson:"status"`
-	FailedLoginCount  int                `bson:"failed_login_count"`
-	LastLoginAt       *time.Time         `bson:"last_login_at,omitempty"`
-	CreatedAt         time.Time          `bson:"created_at"`
-	UpdatedAt         time.Time          `bson:"updated_at"`
+	ID               primitive.ObjectID `bson:"_id,omitempty"`
+	Username         string             `bson:"username"`
+	Email            string             `bson:"email,omitempty"`
+	PasswordHash     string             `bson:"password_hash"`
+	Roles            []string           `bson:"roles"`
+	Scopes           []string           `bson:"scopes"`
+	WalletIDs        []string           `bson:"wallet_ids,omitempty"` // for IDOR/ABAC ownership checks
+	Status           string             `bson:"status"`
+	FailedLoginCount int                `bson:"failed_login_count"`
+	LastLoginAt      *time.Time         `bson:"last_login_at,omitempty"`
+	CreatedAt        time.Time          `bson:"created_at"`
+	UpdatedAt        time.Time          `bson:"updated_at"`
 }
 
 // RefreshTokenRecord represents a stored refresh token in auth_db.refresh_tokens.
 type RefreshTokenRecord struct {
 	ID        primitive.ObjectID `bson:"_id,omitempty"`
-	Token     string             `bson:"token"`    // opaque random string
-	Subject   string             `bson:"subject"`  // username
+	Token     string             `bson:"token"`   // opaque random string
+	Subject   string             `bson:"subject"` // username
 	Roles     []string           `bson:"roles"`
 	Scopes    []string           `bson:"scopes"`
 	IssuedAt  time.Time          `bson:"issued_at"`
@@ -197,8 +197,8 @@ func (s *UserStore) StoreRefreshToken(ctx context.Context, token, subject string
 func (s *UserStore) FindRefreshToken(ctx context.Context, token string) (*RefreshTokenRecord, error) {
 	var rec RefreshTokenRecord
 	filter := bson.M{
-		"token":   token,
-		"revoked": false,
+		"token":      token,
+		"revoked":    false,
 		"expires_at": bson.M{"$gt": time.Now().UTC()},
 	}
 	err := s.refreshTokens().FindOne(ctx, filter).Decode(&rec)
