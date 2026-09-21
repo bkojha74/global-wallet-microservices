@@ -37,15 +37,15 @@ type JSONWebKeySet struct {
 
 // JWKSCache provides a thread-safe, TTL-cached in-memory store for remote JWKS keys.
 type JWKSCache struct {
-	mu           sync.RWMutex
-	jwksURL      string
-	httpClient   *http.Client
-	keys         map[string]*rsa.PublicKey
-	keysList     []*rsa.PublicKey // fallback if kid is missing
-	lastFetched  time.Time
-	ttl          time.Duration
-	minRefresh   time.Duration // rate limit rapid refreshes on cache misses
-	lastAttempt  time.Time
+	mu          sync.RWMutex
+	jwksURL     string
+	httpClient  *http.Client
+	keys        map[string]*rsa.PublicKey
+	keysList    []*rsa.PublicKey // fallback if kid is missing
+	lastFetched time.Time
+	ttl         time.Duration
+	minRefresh  time.Duration // rate limit rapid refreshes on cache misses
+	lastAttempt time.Time
 }
 
 // NewJWKSCache creates a JWKS cache targeting an external OIDC JWKS endpoint.

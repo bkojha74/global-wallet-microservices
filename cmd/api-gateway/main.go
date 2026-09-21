@@ -897,8 +897,8 @@ func main() {
 	mux.Handle("/metrics", observability.DefaultMetrics.Handler())
 
 	publicPaths := map[string]bool{
-		"/healthz":                true,
-		"/readyz":                 true,
+		"/healthz":               true,
+		"/readyz":                true,
 		"/metrics":               true,
 		"/api/v1/auth/login":     true,
 		"/api/v1/auth/refresh":   true,
