@@ -14,10 +14,10 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"wallet-system/pkg/auth"
+	authv1 "wallet-system/proto/auth"
 	ledgerv1 "wallet-system/proto/ledger"
 	walletv1 "wallet-system/proto/wallet"
-
-	"wallet-system/pkg/auth"
 )
 
 type fakeWalletClient struct {
@@ -235,23 +235,64 @@ func TestHandleLedgerRejectsMissingWalletID(t *testing.T) {
 	}
 }
 
-func TestHandleAuthTokenMinting(t *testing.T) {
-	gateway := &Gateway{}
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/token?sub=alice&role=user", strings.NewReader(`{}`))
+// fakeMainAuthClient is a test stub for authv1.AuthServiceClient used in main_test.go.
+type fakeMainAuthClient struct {
+	issueResponse *authv1.IssueTokenResponse
+	issueErr      error
+}
+
+func (f *fakeMainAuthClient) IssueToken(_ context.Context, _ *authv1.IssueTokenRequest, _ ...grpc.CallOption) (*authv1.IssueTokenResponse, error) {
+	return f.issueResponse, f.issueErr
+}
+func (f *fakeMainAuthClient) ValidateToken(_ context.Context, _ *authv1.ValidateTokenRequest, _ ...grpc.CallOption) (*authv1.ValidateTokenResponse, error) {
+	return &authv1.ValidateTokenResponse{Valid: true}, nil
+}
+func (f *fakeMainAuthClient) RefreshToken(_ context.Context, _ *authv1.RefreshTokenRequest, _ ...grpc.CallOption) (*authv1.IssueTokenResponse, error) {
+	return nil, nil
+}
+func (f *fakeMainAuthClient) RevokeToken(_ context.Context, _ *authv1.RevokeTokenRequest, _ ...grpc.CallOption) (*authv1.RevokeTokenResponse, error) {
+	return &authv1.RevokeTokenResponse{Success: true}, nil
+}
+func (f *fakeMainAuthClient) Authorize(_ context.Context, _ *authv1.AuthorizeRequest, _ ...grpc.CallOption) (*authv1.AuthorizeResponse, error) {
+	return &authv1.AuthorizeResponse{Allowed: true}, nil
+}
+func (f *fakeMainAuthClient) HealthCheck(_ context.Context, _ *authv1.AuthHealthRequest, _ ...grpc.CallOption) (*authv1.AuthHealthResponse, error) {
+	return &authv1.AuthHealthResponse{Status: "SERVING"}, nil
+}
+
+func TestHandleLoginSuccess(t *testing.T) {
+	fakeAC := &fakeMainAuthClient{
+		issueResponse: &authv1.IssueTokenResponse{
+			AccessToken:   "test-access-token",
+			RefreshToken:  "test-refresh-token",
+			TokenType:     "Bearer",
+			ExpiresIn:     900,
+			GrantedScopes: []string{auth.ScopeWalletRead, auth.ScopeWalletTransfer},
+			Subject:       "alice",
+		},
+	}
+	gateway := &Gateway{authClient: fakeAC}
+
+	body := strings.NewReader(`{"username":"alice","password":"secret"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", body)
+	req.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 
-	gateway.handleAuthToken(response, req)
+	gateway.handleLogin(response, req)
 
 	if response.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
 	}
 
-	var body map[string]interface{}
-	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+	var resp map[string]interface{}
+	if err := json.Unmarshal(response.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("failed to decode json: %v", err)
 	}
-	if body["token"] == "" || body["subject"] != "alice" {
-		t.Fatalf("unexpected token response: %+v", body)
+	if resp["access_token"] != "test-access-token" {
+		t.Fatalf("unexpected access_token: %v", resp["access_token"])
+	}
+	if resp["subject"] != "alice" {
+		t.Fatalf("unexpected subject: %v", resp["subject"])
 	}
 }
 

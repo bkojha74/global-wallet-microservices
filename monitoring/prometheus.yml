@@ -8,7 +8,7 @@ scrape_configs:
   # Exposes all 6 Phase-5 GAP-07 SDK metrics on :9090/metrics.
   - job_name: "logging-service"
     static_configs:
-      - targets: ["host.docker.internal:9090"]
+      - targets: ["host.docker.internal:9090", "wallet_logging_service:9090", "logging-service:9090"]
     metrics_path: /metrics
 
   # ── RabbitMQ ─────────────────────────────────────────────────────────────────

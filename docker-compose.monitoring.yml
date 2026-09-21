@@ -1,4 +1,4 @@
-name: wallet-monitoring
+name: global-monitoring
 
 services:
   prometheus:
@@ -21,7 +21,9 @@ services:
       retries: 5
       start_period: 10s
     networks:
-      - shared_net
+      wallet_shared_net:
+        aliases:
+          - prometheus
 
   grafana:
     image: grafana/grafana:11.1.0
@@ -41,13 +43,16 @@ services:
       prometheus:
         condition: service_healthy
     networks:
-      - shared_net
+      wallet_shared_net:
+        aliases:
+          - grafana
 
 volumes:
   grafana_data:
     name: wallet_grafana_data
+    external: true
 
 networks:
-  shared_net:
+  wallet_shared_net:
     name: wallet_shared_net
     external: true

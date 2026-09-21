@@ -1,0 +1,125 @@
+{
+  "realm": "wallet-realm",
+  "enabled": true,
+  "displayName": "Global Wallet Platform",
+  "accessTokenLifespan": 900,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "roles": {
+    "realm": [
+      {
+        "name": "admin",
+        "description": "Platform administrator with full cluster access"
+      },
+      {
+        "name": "user",
+        "description": "Standard wallet account holder"
+      },
+      {
+        "name": "auditor",
+        "description": "Compliance and ledger auditor"
+      }
+    ]
+  },
+  "clientScopes": [
+    {
+      "name": "wallet:read",
+      "description": "Read wallet balances and transaction history",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true"
+      }
+    },
+    {
+      "name": "wallet:transfer",
+      "description": "Initiate funds transfers between wallets",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true"
+      }
+    },
+    {
+      "name": "cluster:admin",
+      "description": "Trigger cluster failover and administrative operations",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true"
+      }
+    },
+    {
+      "name": "ledger:audit",
+      "description": "Access immutable ledger audit trails",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true"
+      }
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "wallet-api",
+      "name": "Global Wallet API Gateway & Auth Service",
+      "enabled": true,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "wallet-client-secret-12345",
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": true,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "defaultClientScopes": [
+        "web-origins",
+        "acr",
+        "profile",
+        "roles",
+        "email"
+      ],
+      "optionalClientScopes": [
+        "wallet:read",
+        "wallet:transfer",
+        "cluster:admin",
+        "ledger:audit"
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "admin",
+      "enabled": true,
+      "email": "admin@wallet.local",
+      "firstName": "Platform",
+      "lastName": "Admin",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "admin123",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "admin"
+      ]
+    },
+    {
+      "username": "alice",
+      "enabled": true,
+      "email": "alice@wallet.local",
+      "firstName": "Alice",
+      "lastName": "Smith",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "alice123",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "user"
+      ]
+    }
+  ]
+}
