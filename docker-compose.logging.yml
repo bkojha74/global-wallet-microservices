@@ -1,22 +1,32 @@
-version: '3.8'
+name: global-logging-service
 
 services:
   logging-service:
     build:
       context: .
+      dockerfile: Dockerfile
+      target: logging-service
     container_name: wallet_logging_service
+    restart: always
     environment:
-      - MONGO_URI=mongodb://wallet_mongodb:27017/?replicaSet=rs0
-      - RABBITMQ_URL=amqp://guest:guest@wallet_rabbitmq:5672/
+      - MONGO_URI=mongodb://mongodb:27017/?replicaSet=rs0&directConnection=true
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - HTTP_PORT=8090
+      - METRICS_PORT=9090
+      - ENVIRONMENT=local
+      - LOGGING_RETENTION_DAYS=90
+      - LOGGING_RETENTION_INTERVAL_HOURS=24
+      # Optional: set LOGGING_API_KEY for SaaS API key authentication
+      # - LOGGING_API_KEY=your-secret-api-key
     ports:
       - "8090:8090"
       - "9090:9090"
     networks:
-      - shared_net
-    restart: unless-stopped
+      wallet_shared_net:
+        aliases:
+          - logging-service
 
 networks:
-  shared_net:
+  wallet_shared_net:
     name: wallet_shared_net
     external: true

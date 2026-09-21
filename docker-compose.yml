@@ -1,3 +1,5 @@
+name: global-wallet-microservices
+
 services:
   ledger-service:
     build:
@@ -88,10 +90,12 @@ services:
       - PRIMARY_WALLET_ADDR=wallet-primary:50051
       - STANDBY_WALLET_ADDR=wallet-standby:50053
       - LEDGER_ADDR=ledger-service:50052
+      - AUTH_SERVICE_ADDR=auth-service:50054
       - INSTANCE_ID=api-gateway-1
       - ENVIRONMENT=local
       - LOGGING_RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - LOGGING_SPOOL_PATH=data/logging/api-gateway.jsonl
+      - JWT_SECRET=${JWT_SECRET:-development-wallet-insecure-secret-key-change-in-prod}
     ports:
       - "8080:8080"
     depends_on:

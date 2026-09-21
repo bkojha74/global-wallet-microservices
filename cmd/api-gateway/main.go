@@ -28,12 +28,14 @@ import (
 	"wallet-system/pkg/db"
 	"wallet-system/pkg/observability"
 	"wallet-system/pkg/tlsutil"
+	authv1 "wallet-system/proto/auth"
 	ledgerv1 "wallet-system/proto/ledger"
 	walletv1 "wallet-system/proto/wallet"
 )
 
 const defaultJWTSecret = "development-wallet-insecure-secret-key-change-in-prod"
 
+// Gateway routes incoming HTTP requests to the appropriate gRPC backend service.
 type Gateway struct {
 	mu             sync.RWMutex
 	activeTarget   string // "PRIMARY" or "STANDBY" (cached fallback)
@@ -41,6 +43,7 @@ type Gateway struct {
 	primaryClient  walletv1.WalletServiceClient
 	standbyClient  walletv1.WalletServiceClient
 	ledgerClient   ledgerv1.LedgerServiceClient
+	authClient     authv1.AuthServiceClient // auth-service gRPC client
 	primaryAddress string
 	standbyAddress string
 	logger         observability.Logger
@@ -502,6 +505,116 @@ func (g *Gateway) handleFailover(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleLogin authenticates user credentials via the auth-service and returns a JWT token pair.
+// This replaces the old in-process handleAuthToken which issued tokens without credential verification.
+func (g *Gateway) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Username string   `json:"username"`
+		Password string   `json:"password"`
+		Scopes   []string `json:"scopes,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Username == "" {
+		http.Error(w, "username and password are required", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	resp, err := g.authClient.IssueToken(ctx, &authv1.IssueTokenRequest{
+		Username:        req.Username,
+		Password:        req.Password,
+		RequestedScopes: req.Scopes,
+	})
+	if err != nil {
+		if isUnauthenticated(err) {
+			writeAuthError(w, http.StatusUnauthorized, "Invalid credentials")
+			return
+		}
+		http.Error(w, fmt.Sprintf("Login failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"access_token":  resp.AccessToken,
+		"refresh_token": resp.RefreshToken,
+		"token_type":    resp.TokenType,
+		"expires_in":    resp.ExpiresIn,
+		"scopes":        resp.GrantedScopes,
+		"subject":       resp.Subject,
+	})
+}
+
+// handleRefresh exchanges a refresh token for a new access token.
+func (g *Gateway) handleRefresh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.RefreshToken == "" {
+		http.Error(w, "refresh_token is required", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	resp, err := g.authClient.RefreshToken(ctx, &authv1.RefreshTokenRequest{RefreshToken: req.RefreshToken})
+	if err != nil {
+		if isUnauthenticated(err) {
+			writeAuthError(w, http.StatusUnauthorized, "Invalid or expired refresh token")
+			return
+		}
+		http.Error(w, fmt.Sprintf("Token refresh failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"access_token":  resp.AccessToken,
+		"refresh_token": resp.RefreshToken,
+		"token_type":    resp.TokenType,
+		"expires_in":    resp.ExpiresIn,
+		"scopes":        resp.GrantedScopes,
+		"subject":       resp.Subject,
+	})
+}
+
+// handleLogout revokes the caller's token via the auth-service.
+func (g *Gateway) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	authHeader := r.Header.Get("Authorization")
+	tokenStr, err := auth.ExtractBearerToken(authHeader)
+	if err != nil {
+		writeAuthError(w, http.StatusUnauthorized, "Bearer token required for logout")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	_, _ = g.authClient.RevokeToken(ctx, &authv1.RevokeTokenRequest{
+		Token:  tokenStr,
+		Reason: "logout",
+	})
+
+	writeJSON(w, http.StatusOK, map[string]string{"message": "logged out successfully"})
+}
+
+// handleAuthToken provides backward-compatible token minting (/api/v1/auth/token)
+// supporting legacy Bruno/Postman collections and rapid development testing.
 func (g *Gateway) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -569,13 +682,22 @@ func (g *Gateway) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"token":      token,
-		"token_type": "Bearer",
-		"subject":    sub,
-		"roles":      roles,
-		"scopes":     scopes,
-		"expires_in": 3600,
+		"token":        token,
+		"access_token": token,
+		"token_type":   "Bearer",
+		"subject":      sub,
+		"roles":        roles,
+		"scopes":       scopes,
+		"expires_in":   3600,
 	})
+}
+
+// isUnauthenticated returns true if the gRPC error code is Unauthenticated.
+func isUnauthenticated(err error) bool {
+	if st, ok := status.FromError(err); ok {
+		return st.Code() == codes.Unauthenticated
+	}
+	return false
 }
 
 func getClientDialOption() (grpc.DialOption, error) {
@@ -637,6 +759,15 @@ func main() {
 		}
 	}
 
+	authAddr := os.Getenv("AUTH_SERVICE_ADDR")
+	if authAddr == "" {
+		if _, err := net.LookupHost("auth-service"); err == nil {
+			authAddr = "auth-service:50054"
+		} else {
+			authAddr = "127.0.0.1:50054"
+		}
+	}
+
 	log.Println("[API-GATEWAY] Establishing gRPC connections...")
 	environment := os.Getenv("ENVIRONMENT")
 	if environment == "" {
@@ -658,6 +789,12 @@ func main() {
 		dialOpt,
 		grpc.WithUnaryInterceptor(observability.UnaryClientTraceInterceptor("api-gateway")),
 	}
+
+	aConn, err := grpc.NewClient(authAddr, dialOpts...)
+	if err != nil {
+		log.Fatalf("Failed to dial auth-service: %v", err)
+	}
+	defer aConn.Close()
 
 	pConn, err := grpc.NewClient(primaryAddr, dialOpts...)
 	if err != nil {
@@ -703,6 +840,7 @@ func main() {
 		primaryClient:  walletv1.NewWalletServiceClient(pConn),
 		standbyClient:  walletv1.NewWalletServiceClient(sConn),
 		ledgerClient:   ledgerv1.NewLedgerServiceClient(lConn),
+		authClient:     authv1.NewAuthServiceClient(aConn),
 		primaryAddress: primaryAddr,
 		standbyAddress: standbyAddr,
 		logger:         logger,
@@ -727,6 +865,10 @@ func main() {
 	mux.HandleFunc("/api/v1/ledger", gw.handleLedger)
 	mux.HandleFunc("/api/v1/cluster/status", gw.handleClusterStatus)
 	mux.HandleFunc("/api/v1/cluster/failover", gw.handleFailover)
+	// Auth endpoints — proxied to auth-service via gRPC
+	mux.HandleFunc("/api/v1/auth/login", gw.handleLogin)
+	mux.HandleFunc("/api/v1/auth/refresh", gw.handleRefresh)
+	mux.HandleFunc("/api/v1/auth/logout", gw.handleLogout)
 	mux.HandleFunc("/api/v1/auth/token", gw.handleAuthToken)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "UP"})
@@ -754,19 +896,22 @@ func main() {
 	// Expose Prometheus metrics (GAP-07)
 	mux.Handle("/metrics", observability.DefaultMetrics.Handler())
 
-	jwtSecret := os.Getenv("JWT_SECRET")
-	if jwtSecret == "" {
-		jwtSecret = defaultJWTSecret
-		log.Println("[SECURITY-WARNING] JWT_SECRET not set in environment, using default development secret!")
-	}
-
 	publicPaths := map[string]bool{
 		"/healthz":               true,
 		"/readyz":                true,
 		"/metrics":               true,
+		"/api/v1/auth/login":     true,
+		"/api/v1/auth/refresh":   true,
 		"/api/v1/auth/token":     true,
 		"/api/v1/cluster/status": true,
 	}
+
+	// Cache fingerprint secret — any stable random value works; does not sign tokens.
+	cacheFingerprintSecret := os.Getenv("CACHE_FINGERPRINT_SECRET")
+	if cacheFingerprintSecret == "" {
+		cacheFingerprintSecret = "gateway-cache-fingerprint-key"
+	}
+	claimsC := newClaimsCache(cacheFingerprintSecret)
 
 	rateLimiter := NewRateLimiter(60, 100)
 
@@ -775,7 +920,7 @@ func main() {
 	handler = CORSMiddleware(handler)
 	handler = SecurityHeadersMiddleware(handler)
 	handler = RateLimitMiddleware(rateLimiter, handler)
-	handler = AuthMiddleware(jwtSecret, publicPaths, handler)
+	handler = AuthMiddleware(gw.authClient, claimsC, publicPaths, handler)
 	handler = observability.TraceHTTPMiddleware("api-gateway", handler) // Phase 3 (GAP-OBS-01)
 
 	server := &http.Server{

@@ -18,7 +18,8 @@ COPY proto ./proto
 RUN protoc --go_out=. --go_opt=paths=source_relative \
            --go-grpc_out=. --go-grpc_opt=paths=source_relative \
            proto/wallet/wallet.proto \
-           proto/ledger/ledger.proto
+           proto/ledger/ledger.proto \
+           proto/auth/auth.proto
 
 COPY pkg ./pkg
 COPY cmd ./cmd
@@ -27,6 +28,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/wallet-service ./
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/ledger-service ./cmd/ledger-service
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/api-gateway ./cmd/api-gateway
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/logging-service ./cmd/logging-service
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/auth-service ./cmd/auth-service
 
 # Stage 2: Wallet Service Minimal Runtime (GAP-OPS-01)
 FROM alpine:3.20 AS wallet-service
@@ -75,3 +77,16 @@ COPY --from=builder /bin/logging-service /app/logging-service
 USER appuser
 EXPOSE 8090 9090
 ENTRYPOINT ["/app/logging-service"]
+
+# Stage 6: Auth Service Minimal Runtime
+# Isolated identity service — holds the JWT signing key, never co-located with business logic.
+FROM alpine:3.20 AS auth-service
+RUN apk add --no-cache ca-certificates curl && \
+    addgroup -g 10001 -S appgroup && \
+    adduser -u 10001 -S appuser -G appgroup
+WORKDIR /app
+RUN mkdir -p /app/data/logging /app/certs && chown -R appuser:appgroup /app
+COPY --from=builder /bin/auth-service /app/auth-service
+USER appuser
+EXPOSE 50054 9095
+ENTRYPOINT ["/app/auth-service"]

@@ -2,9 +2,9 @@ name: Go CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 permissions:
   contents: read
@@ -36,7 +36,9 @@ jobs:
           protoc --version
           protoc --go_out=. --go_opt=paths=source_relative \
             --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-            proto/wallet/wallet.proto proto/ledger/ledger.proto
+            proto/wallet/wallet.proto \
+            proto/ledger/ledger.proto \
+            proto/auth/auth.proto
 
       - name: Check formatting
         shell: bash
