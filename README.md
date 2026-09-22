@@ -1,6 +1,7 @@
 # Global Multi-Currency Digital Wallet & Ledger Service
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![CI/CD Pipeline](https://github.com/bkojha74/global-wallet-microservices/actions/workflows/ci.yml/badge.svg)](https://github.com/bkojha74/global-wallet-microservices/actions/workflows/ci.yml)
 [![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go&logoColor=white)](https://golang.org)
 [![Microservices](https://img.shields.io/badge/Architecture-Event--Driven_Microservices-blueviolet)](README.md#key-architectural-pillars)
 [![Zero-Trust Security](https://img.shields.io/badge/Security-Zero--Trust_mTLS_%26_JWT-success?logo=security&logoColor=white)](SECURITY.md)
@@ -29,6 +30,11 @@ A production-grade, distributed microservices platform for atomic multi-currency
 - [Implementation Status & Production Readiness Roadmap](#implementation-status--production-readiness-roadmap)
   - [Completed Implementations](#completed-implementations)
   - [Planned Roadmap (Yet to be Implemented)](#planned-roadmap-yet-to-be-implemented)
+- [CI/CD Pipeline & Automated Deployment](#cicd-pipeline--automated-deployment)
+  - [Pipeline Architecture & Workflows](#pipeline-architecture--workflows)
+  - [Pipeline Stages](#pipeline-stages)
+  - [Secrets & Configuration](#secrets--configuration)
+  - [Container Registry & Images](#container-registry--images)
 - [Quickstart & Deployment Guide](#quickstart--deployment-guide)
   - [Prerequisites](#prerequisites)
   - [Starting the Modular Stacks](#starting-the-modular-stacks)
@@ -416,11 +422,13 @@ graph TD
     P2["Phase 2: Zero-Trust Security & Identity<br/>(COMPLETED)"]:::completed
     P3["Phase 3: High Availability & Tracing<br/>(COMPLETED)"]:::completed
     P4["Phase 4: Cloud-Native & Double-Entry<br/>(COMPLETED)"]:::completed
+    P5["Phase 5: Automated CI/CD & Deployment<br/>(COMPLETED)"]:::completed
 
     P1 --> P2
     L15 --> P2
     P2 --> P3
     P3 --> P4
+    P4 --> P5
 ```
 
 ### Completed Implementations
@@ -468,10 +476,135 @@ graph TD
 
 ---
 
+#### 6. Continuous Integration & Continuous Deployment (Phase 5 / CI/CD)
+- [x] **Automated Go Quality Gates & Contract Verification**: Automated GitHub Actions workflow (`.github/workflows/ci.yml`) compiling Protobuf v3 contracts (`wallet`, `ledger`, `auth`), verifying `gofmt` code formatting, and executing full unit tests and race condition detector (`go test -race ./...`).
+- [x] **Multi-Stage Matrix Docker Builds**: Automated parallel builds across 5 microservices using Docker Buildx and GitHub Actions cache (`type=gha`), creating optimized production container images.
+- [x] **Docker Hub Distribution & Semantic Tagging**: Automatic container image publishing to Docker Hub with `latest` (from `main`), semantic release versions (`v*`), and Git SHA tags.
+- [x] **Continuous Deployment via Self-Hosted Runner**: Automated deployment pipeline targeting self-hosted environments (`[self-hosted, Windows]`) using native `cmd` scripts to pull updated images and perform zero-downtime rolling updates of all modular Docker Compose stacks.
+
+---
+
 ### Future Enhancements Roadmap
 
 - [ ] **Foreign Exchange (FX) Engine (GAP-FIN-03)**: Support cross-currency transfers with guaranteed quote validity windows (30–60s) and multi-currency journal legs.
 - [ ] **Circuit Breaking & Mesh Telemetry (GAP-REL-04)**: Dynamic circuit breaking (e.g., `sony/gobreaker` or Envoy service mesh) for automatic fast-failing during degraded downstream network conditions.
+
+---
+
+## CI/CD Pipeline & Automated Deployment
+
+The platform implements an automated CI/CD pipeline powered by **GitHub Actions** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) providing end-to-end quality assurance, container image publication to Docker Hub, and zero-downtime continuous deployment to self-hosted environments.
+
+### Pipeline Architecture & Workflows
+
+```mermaid
+flowchart TD
+    subgraph Triggers["Trigger Events"]
+        PR["Pull Request<br/>(main, develop)"]
+        Push["Git Push<br/>(main, develop)"]
+        Tag["Release Tag<br/>(v*)"]
+    end
+
+    subgraph CI["Job 1: test (Go CI)"]
+        Checkout1["Checkout Code"]
+        GoSetup["Setup Go (go.mod)"]
+        Protoc["Install protoc & Plugins"]
+        GenProto["Generate Protobuf (.pb.go)"]
+        Fmt["gofmt Format Verification"]
+        UnitTest["Unit Tests (go test ./...)"]
+        RaceTest["Race Detector (go test -race ./...)"]
+
+        Checkout1 --> GoSetup --> Protoc --> GenProto --> Fmt --> UnitTest --> RaceTest
+    end
+
+    subgraph CD_Build["Job 2: docker-publish (Docker Hub)"]
+        Gate1{"Branch == main<br/>OR Tag == v*?"}
+        Buildx["Docker Buildx Setup"]
+        DHLogin["Docker Hub Auth"]
+        Matrix["Parallel Matrix Build<br/>(5 Microservices)"]
+        Cache["GHA Layer Caching (type=gha)"]
+        PushDH["Push Images to Docker Hub"]
+
+        Gate1 -->|Yes| Buildx --> DHLogin --> Matrix --> Cache --> PushDH
+    end
+
+    subgraph CD_Deploy["Job 3: deploy (Self-Hosted Runner)"]
+        Runner["Self-Hosted Runner<br/>[self-hosted, Windows]"]
+        PullImg["Pull Latest Microservices<br/>(cmd shell)"]
+        NetVol["Validate Network & Volumes<br/>(wallet_shared_net)"]
+        StackUp["Deploy Modular Stacks<br/>(MongoDB -> RabbitMQ -> Auth -> Logging -> Core)"]
+        HealthCheck["Verify Containers<br/>(docker ps)"]
+
+        PushDH --> Runner --> PullImg --> NetVol --> StackUp --> HealthCheck
+    end
+
+    PR --> CI
+    Push --> CI
+    Tag --> CI
+    RaceTest --> Gate1
+```
+
+### Pipeline Stages
+
+#### 1. Continuous Integration & Quality Gates (`test`)
+- **Execution Target**: `ubuntu-latest`
+- **Trigger**: Every pull request and push to `main` and `develop`, as well as release tags (`v*`).
+- **Protobuf Compilation**: Installs `protobuf-compiler`, `protoc-gen-go@v1.36.11`, and `protoc-gen-go-grpc@v1.6.0`, compiling `.proto` definitions (`proto/wallet/wallet.proto`, `proto/ledger/ledger.proto`, `proto/auth/auth.proto`) to guarantee strict API contract adherence.
+- **Formatting Enforcement**: Runs `test -z "$(gofmt -l .)"` to ensure standard Go formatting and clean diffs.
+- **Unit & Concurrency Race Detection**: Executes all tests with `-count=1` and `-race` (`go test -race ./...`) to catch race conditions, goroutine leaks, or transactional concurrency regressions.
+
+#### 2. Multi-Target Container Packaging & Publishing (`docker-publish`)
+- **Execution Target**: `ubuntu-latest`
+- **Trigger**: Pushes to `main` and release tags (`refs/tags/v*`) upon successful completion of the `test` job.
+- **Docker Buildx & Layer Caching**: Configures `docker/setup-buildx-action@v3` with GitHub Actions cache backend (`cache-from: type=gha`, `cache-to: type=gha,mode=max`) for blazing fast incremental image builds.
+- **Matrix Parallelization**: Concurrently builds and pushes 5 production microservice targets using the hardened multi-stage `Dockerfile`:
+  1. `wallet-api-gateway` (target: `api-gateway`)
+  2. `wallet-service` (target: `wallet-service`) — powers both Primary and Standby instances
+  3. `wallet-ledger-service` (target: `ledger-service`)
+  4. `wallet-auth-service` (target: `auth-service`)
+  5. `wallet-logging-service` (target: `logging-service`)
+- **Automated Version Tagging**: Automatically tags images using `docker/metadata-action@v5`:
+  - `latest` on branch `main`
+  - Semantic versions `vX.Y.Z` and `vX.Y` on Git tags
+  - Short commit SHA (`sha-xxxxxxx`) for granular audit traceability
+
+#### 3. Continuous Deployment to Self-Hosted Environment (`deploy`)
+- **Execution Target**: Self-hosted Windows runner (`[self-hosted, Windows]`).
+- **Execution Shell**: Leverages native `cmd` shell to guarantee predictable execution regardless of local PowerShell execution policies.
+- **Network & Volume Primitives**: Verifies and creates the shared Docker bridge network (`wallet_shared_net`) and MongoDB data volume (`global-wallet-microservices_mongo_data`).
+- **Rolling Compose Updates**: Pulls the newly pushed images and restarts the modular stacks in strict dependency order:
+  1. `docker-compose.mongodb.yml` (Primary transactional datastore replica set)
+  2. `docker-compose.rabbitmq.yml` (AMQP async broker & exchanges)
+  3. `docker-compose.auth.yml` (Keycloak IdP & Auth Service)
+  4. `docker-compose.logging.yml` (Centralized Logging Service & AMQP consumer)
+  5. `docker-compose.yml` (API Gateway, Primary Wallet, Standby Wallet, Ledger Service)
+- **Post-Deploy Health Validation**: Executes `docker ps` to display live container statuses and bound ports.
+
+### Secrets & Configuration
+
+To enable automated image publishing and self-hosted deployment, configure the following secrets in **GitHub Repository Settings -> Secrets and variables -> Actions**:
+
+| Secret Name | Description | Required For |
+|---|---|---|
+| `DOCKERHUB_USERNAME` | Docker Hub username or organization handle (e.g. `bkojha74`) | Registry authentication and image namespace |
+| `DOCKERHUB_TOKEN` | Docker Hub Personal Access Token (PAT) with `Read & Write` scope | Automated image pushing and pulling |
+
+### Container Registry & Images
+
+All microservices are published to Docker Hub and can be referenced directly or overridden via environment variables:
+
+| Microservice Component | Docker Hub Repository | Compose Image Reference |
+|---|---|---|
+| **API Gateway** | `bkojha74/wallet-api-gateway` | `${DOCKERHUB_USERNAME:-bkojha74}/wallet-api-gateway:latest` |
+| **Wallet Service (Primary & Standby)** | `bkojha74/wallet-service` | `${DOCKERHUB_USERNAME:-bkojha74}/wallet-service:latest` |
+| **Ledger Service** | `bkojha74/wallet-ledger-service` | `${DOCKERHUB_USERNAME:-bkojha74}/wallet-ledger-service:latest` |
+| **Auth Service** | `bkojha74/wallet-auth-service` | `${DOCKERHUB_USERNAME:-bkojha74}/wallet-auth-service:latest` |
+| **Logging Service** | `bkojha74/wallet-logging-service` | `${DOCKERHUB_USERNAME:-bkojha74}/wallet-logging-service:latest` |
+
+```bash
+# Example: Manually pull and run any microservice container
+docker pull bkojha74/wallet-api-gateway:latest
+```
 
 ---
 
@@ -699,6 +832,7 @@ Both Postman and Bruno test runners validate:
 | [docs/LOCAL_DEVELOPMENT.md](docs/LOCAL_DEVELOPMENT.md) | Guide for native local development on Windows/macOS/Linux without full Docker Compose dependencies. |
 | [docs/BLOOMRPC_GUIDE.md](docs/BLOOMRPC_GUIDE.md) | Instructions for interacting directly with gRPC microservices using BloomRPC or Postman gRPC client. |
 | [docs/KEYCLOAK_GUIDE.md](docs/KEYCLOAK_GUIDE.md) | Administrator and developer guide for Keycloak OIDC integration, login portals, user/role/client provisioning, and custom scopes. |
+| [.github/workflows/ci.yml](.github/workflows/ci.yml) | Automated GitHub Actions CI/CD pipeline: Protobuf verification, Go formatting/race test quality gates, Docker Hub matrix builds, and self-hosted deployment. |
 | [postman/](postman/) | Automated 28-test integration collection, environment, and BloomRPC JSON presets. |
 | [SECURITY.md](SECURITY.md) | Security policy, vulnerability reporting guidelines, and development boundaries. |
 
