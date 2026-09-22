@@ -548,14 +548,15 @@ flowchart TD
 
 #### 1. Continuous Integration & Quality Gates (`test`)
 - **Execution Target**: `ubuntu-latest`
-- **Trigger**: Every pull request and push to `main` and `develop`, as well as release tags (`v*`).
+- **Trigger**: Every pull request and push to `main` and `develop`, release tags (`v*`), or manual dispatch (`workflow_dispatch`).
+- **Path Filtering (`paths-ignore`)**: Automatically skips workflow runs when only documentation, markdown files (`*.md`), or configuration guides are modified, preventing redundant CI/CD executions.
 - **Protobuf Compilation**: Installs `protobuf-compiler`, `protoc-gen-go@v1.36.11`, and `protoc-gen-go-grpc@v1.6.0`, compiling `.proto` definitions (`proto/wallet/wallet.proto`, `proto/ledger/ledger.proto`, `proto/auth/auth.proto`) to guarantee strict API contract adherence.
 - **Formatting Enforcement**: Runs `test -z "$(gofmt -l .)"` to ensure standard Go formatting and clean diffs.
 - **Unit & Concurrency Race Detection**: Executes all tests with `-count=1` and `-race` (`go test -race ./...`) to catch race conditions, goroutine leaks, or transactional concurrency regressions.
 
 #### 2. Multi-Target Container Packaging & Publishing (`docker-publish`)
 - **Execution Target**: `ubuntu-latest`
-- **Trigger**: Pushes to `main` and release tags (`refs/tags/v*`) upon successful completion of the `test` job.
+- **Trigger**: Pushes to `main`, release tags (`refs/tags/v*`), or manual workflow dispatches upon successful completion of the `test` job.
 - **Docker Buildx & Layer Caching**: Configures `docker/setup-buildx-action@v3` with GitHub Actions cache backend (`cache-from: type=gha`, `cache-to: type=gha,mode=max`) for blazing fast incremental image builds.
 - **Matrix Parallelization**: Concurrently builds and pushes 5 production microservice targets using the hardened multi-stage `Dockerfile`:
   1. `wallet-api-gateway` (target: `api-gateway`)
@@ -571,6 +572,8 @@ flowchart TD
 #### 3. Continuous Deployment to Self-Hosted Environment (`deploy`)
 - **Execution Target**: Self-hosted Windows runner (`[self-hosted, Windows]`).
 - **Execution Shell**: Leverages native `cmd` shell to guarantee predictable execution regardless of local PowerShell execution policies.
+- **Docker Pre-Flight Health Check**: Automatically verifies if the Docker daemon is accessible (`docker info`). If Docker Desktop is closed or not running on the runner machine, it issues a helpful GitHub Actions warning and gracefully skips deployment without failing the pipeline.
+- **Non-Blocking Fault Tolerance (`continue-on-error`)**: Guarantees that local environment issues (such as an offline runner or stopped Docker daemon) do not block or fail code merge workflows.
 - **Network & Volume Primitives**: Verifies and creates the shared Docker bridge network (`wallet_shared_net`) and MongoDB data volume (`global-wallet-microservices_mongo_data`).
 - **Rolling Compose Updates**: Pulls the newly pushed images and restarts the modular stacks in strict dependency order:
   1. `docker-compose.mongodb.yml` (Primary transactional datastore replica set)
