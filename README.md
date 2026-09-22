@@ -835,6 +835,7 @@ Both Postman and Bruno test runners validate:
 | [docs/LOCAL_DEVELOPMENT.md](docs/LOCAL_DEVELOPMENT.md) | Guide for native local development on Windows/macOS/Linux without full Docker Compose dependencies. |
 | [docs/BLOOMRPC_GUIDE.md](docs/BLOOMRPC_GUIDE.md) | Instructions for interacting directly with gRPC microservices using BloomRPC or Postman gRPC client. |
 | [docs/KEYCLOAK_GUIDE.md](docs/KEYCLOAK_GUIDE.md) | Administrator and developer guide for Keycloak OIDC integration, login portals, user/role/client provisioning, and custom scopes. |
+| [docs/CICD_PIPELINE_GUIDE.md](docs/CICD_PIPELINE_GUIDE.md) | Comprehensive CI/CD pipeline implementation guide: quality gates, Docker Hub matrix builds, secret configuration, runner setup, and troubleshooting. |
 | [.github/workflows/ci.yml](.github/workflows/ci.yml) | Automated GitHub Actions CI/CD pipeline: Protobuf verification, Go formatting/race test quality gates, Docker Hub matrix builds, and self-hosted deployment. |
 | [postman/](postman/) | Automated 28-test integration collection, environment, and BloomRPC JSON presets. |
 | [SECURITY.md](SECURITY.md) | Security policy, vulnerability reporting guidelines, and development boundaries. |
