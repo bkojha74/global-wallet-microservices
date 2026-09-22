@@ -19,6 +19,7 @@ services:
           - keycloak
 
   auth-service:
+    image: ${DOCKERHUB_USERNAME:-bkojha74}/wallet-auth-service:latest
     build:
       context: .
       dockerfile: Dockerfile
