@@ -121,7 +121,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Pull latest microservice images
-        shell: powershell
+        shell: cmd
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
@@ -132,32 +132,19 @@ jobs:
           docker compose -f docker-compose.yml pull
 
       - name: Start or update services
-        shell: powershell
+        shell: cmd
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
-          # 1. Ensure shared network exists
-          docker network inspect wallet_shared_net 2>$null
-          if ($LASTEXITCODE -ne 0) {
-            docker network create wallet_shared_net
-          }
-          
-          # 2. Ensure MongoDB volume exists
-          docker volume inspect global-wallet-microservices_mongo_data 2>$null
-          if ($LASTEXITCODE -ne 0) {
-            docker volume create global-wallet-microservices_mongo_data
-          }
-
-          # 3. Start supporting infrastructure
+          docker network inspect wallet_shared_net >nul 2>&1 || docker network create wallet_shared_net
+          docker volume inspect global-wallet-microservices_mongo_data >nul 2>&1 || docker volume create global-wallet-microservices_mongo_data
           docker compose -f docker-compose.mongodb.yml up -d
           docker compose -f docker-compose.rabbitmq.yml up -d
           docker compose -f docker-compose.auth.yml up -d
           docker compose -f docker-compose.logging.yml up -d
-
-          # 4. Start microservices with latest images
           docker compose -f docker-compose.yml up -d
 
       - name: Verify Running Services
-        shell: powershell
+        shell: cmd
         run: |
           docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
