@@ -2,6 +2,7 @@ name: global-wallet-microservices
 
 services:
   ledger-service:
+    image: ${DOCKERHUB_USERNAME:-bkojha74}/wallet-ledger-service:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -24,6 +25,7 @@ services:
       - banking_net
 
   wallet-primary:
+    image: ${DOCKERHUB_USERNAME:-bkojha74}/wallet-service:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -51,6 +53,7 @@ services:
       - banking_net
 
   wallet-standby:
+    image: ${DOCKERHUB_USERNAME:-bkojha74}/wallet-service:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -78,6 +81,7 @@ services:
       - banking_net
 
   api-gateway:
+    image: ${DOCKERHUB_USERNAME:-bkojha74}/wallet-api-gateway:latest
     build:
       context: .
       dockerfile: Dockerfile
