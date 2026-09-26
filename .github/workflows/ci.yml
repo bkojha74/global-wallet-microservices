@@ -517,3 +517,4 @@ jobs:
             echo.
             echo Cluster is healthy and responding after deployment!
           )
+          exit /b 0
