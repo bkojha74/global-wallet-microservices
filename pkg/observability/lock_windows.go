@@ -17,6 +17,7 @@ func acquireFileLock(path string) (*fileLock, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return nil, err
 	}
+	// #nosec G304 -- internal spool lock path
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err

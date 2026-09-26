@@ -20,7 +20,7 @@ func main() {
 	if len(os.Args) > 1 {
 		outDir = filepath.Clean(os.Args[1])
 	}
-	// #nosec G301 -- certificate output directory with restricted 0750 permissions
+	// #nosec G301,G304,G703 -- certificate output directory with restricted 0750 permissions
 	if err := os.MkdirAll(outDir, 0750); err != nil {
 		fmt.Printf("Failed to create output dir: %v\n", err)
 		os.Exit(1)
