@@ -454,11 +454,16 @@ jobs:
         shell: cmd
         continue-on-error: true
         run: |
-          docker info >nul 2>&1
+          echo Checking Docker daemon status...
+          docker info
           if errorlevel 1 (
-            echo ::warning::Docker daemon is not running or accessible on this Windows runner. Skipping local deployment.
+            echo.
+            echo Checking docker version...
+            docker version
+            echo ::warning::Docker daemon is not running or accessible on this Windows runner context. Skipping local deployment.
             echo DOCKER_READY=false>> "%GITHUB_ENV%"
           ) else (
+            echo.
             echo Docker daemon is running and accessible.
             echo DOCKER_READY=true>> "%GITHUB_ENV%"
           )
