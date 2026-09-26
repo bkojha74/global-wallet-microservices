@@ -352,11 +352,11 @@ func TestTransferFundsEdgeCasesLive(t *testing.T) {
 		t.Skipf("MongoDB not reachable: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	database := client.Database("test_wallet_edge_cases_db")
 	_ = database.Drop(ctx)
-	defer database.Drop(ctx)
+	defer func() { _ = database.Drop(ctx) }()
 
 	_ = db.EnsureWalletIndexes(ctx, database)
 

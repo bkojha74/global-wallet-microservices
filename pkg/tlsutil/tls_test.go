@@ -53,7 +53,7 @@ func TestMutualTLSHandshakeSuccess(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	conn, err := grpc.DialContext(ctx, lis.Addr().String(), grpc.WithTransportCredentials(credentials.NewTLS(clientTLS)), grpc.WithBlock())
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(credentials.NewTLS(clientTLS)))
 	if err != nil {
 		t.Fatalf("mTLS dial failed: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestMutualTLSRejectsUntrustedClient(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	conn, err := grpc.DialContext(ctx, lis.Addr().String(), grpc.WithTransportCredentials(credentials.NewTLS(untrustedTLS)), grpc.WithBlock())
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(credentials.NewTLS(untrustedTLS)))
 	if err == nil {
 		// If dial succeeded (lazy handshake), RPC must fail
 		client := walletv1.NewWalletServiceClient(conn)

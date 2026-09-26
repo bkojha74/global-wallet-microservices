@@ -315,7 +315,7 @@ func TestLedgerServiceLive(t *testing.T) {
 		t.Skipf("MongoDB not reachable for live ledger test: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	srv := &server{
 		mongoClient: client,
@@ -399,7 +399,7 @@ func TestRecordTransactionValidationBranches(t *testing.T) {
 		t.Skipf("MongoDB not reachable: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	srv := &server{
 		mongoClient: client,

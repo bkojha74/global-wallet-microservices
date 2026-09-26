@@ -450,7 +450,7 @@ func runLedgerServer(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("could not connect to MongoDB: %w", err)
 		}
-		defer client.Disconnect(context.Background())
+		defer func() { _ = client.Disconnect(context.Background()) }()
 
 		// Phase 1: Ensure MongoDB indexes
 		idxCtx, idxCancel := context.WithTimeout(subCtx, 10*time.Second)

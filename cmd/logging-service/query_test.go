@@ -271,7 +271,7 @@ func TestHandleTrace_Returns12EventsInOrder(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 	var resp traceResponse
-	json.NewDecoder(rec.Body).Decode(&resp)
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
 
 	if resp.AssociationID != assocID {
 		t.Errorf("expected assocID %q, got %q", assocID, resp.AssociationID)
@@ -334,7 +334,7 @@ func TestHandleTrace_EmptyResult_ReturnsDurationZero(t *testing.T) {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 	var resp traceResponse
-	json.NewDecoder(rec.Body).Decode(&resp)
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
 	if resp.TotalEvents != 0 {
 		t.Errorf("expected 0 events, got %d", resp.TotalEvents)
 	}
