@@ -47,27 +47,19 @@ type JournalPosting struct {
 	Currency    string           `bson:"currency" json:"currency"`
 }
 
-// ValidatePostings enforces GAAP/IFRS financial equilibrium:
-// 1. Must contain at least two postings.
-// 2. Each posting amount must be strictly positive.
-// 3. For each currency, sum(DEBIT) must exactly equal sum(CREDIT).
-func ValidatePostings(postings []JournalPosting) error {
-	if len(postings) < 2 {
-		return fmt.Errorf("double-entry journal entry must have at least 2 postings (got %d)", len(postings))
-	}
-
+func accumulatePostingTotals(postings []JournalPosting) (map[string]int64, map[string]int64, error) {
 	debits := make(map[string]int64)
 	credits := make(map[string]int64)
 
 	for i, p := range postings {
 		if p.AccountID == "" {
-			return fmt.Errorf("posting [%d]: account_id is required", i)
+			return nil, nil, fmt.Errorf("posting [%d]: account_id is required", i)
 		}
 		if p.Amount <= 0 {
-			return fmt.Errorf("posting [%d]: amount must be positive, got %d", i, p.Amount)
+			return nil, nil, fmt.Errorf("posting [%d]: amount must be positive, got %d", i, p.Amount)
 		}
 		if p.Currency == "" {
-			return fmt.Errorf("posting [%d]: currency is required", i)
+			return nil, nil, fmt.Errorf("posting [%d]: currency is required", i)
 		}
 
 		switch p.Direction {
@@ -76,10 +68,13 @@ func ValidatePostings(postings []JournalPosting) error {
 		case PostingCredit:
 			credits[p.Currency] += p.Amount
 		default:
-			return fmt.Errorf("posting [%d]: invalid direction %q (must be DEBIT or CREDIT)", i, p.Direction)
+			return nil, nil, fmt.Errorf("posting [%d]: invalid direction %q (must be DEBIT or CREDIT)", i, p.Direction)
 		}
 	}
+	return debits, credits, nil
+}
 
+func checkCurrencyEquilibrium(debits, credits map[string]int64) error {
 	for curr, debitSum := range debits {
 		creditSum := credits[curr]
 		if debitSum != creditSum {
@@ -93,8 +88,24 @@ func ValidatePostings(postings []JournalPosting) error {
 			return fmt.Errorf("unbalanced double-entry entry for currency %s: debits=0 credits=%d", curr, creditSum)
 		}
 	}
-
 	return nil
+}
+
+// ValidatePostings enforces GAAP/IFRS financial equilibrium:
+// 1. Must contain at least two postings.
+// 2. Each posting amount must be strictly positive.
+// 3. For each currency, sum(DEBIT) must exactly equal sum(CREDIT).
+func ValidatePostings(postings []JournalPosting) error {
+	if len(postings) < 2 {
+		return fmt.Errorf("double-entry journal entry must have at least 2 postings (got %d)", len(postings))
+	}
+
+	debits, credits, err := accumulatePostingTotals(postings)
+	if err != nil {
+		return err
+	}
+
+	return checkCurrencyEquilibrium(debits, credits)
 }
 
 // CreateTransferPostings creates balanced GAAP double-entry postings for a transfer:
@@ -156,10 +167,52 @@ type AuditVerificationResult struct {
 	ErrorMessage     string           `json:"error_message,omitempty"`
 }
 
+func verifyDocIntegrity(doc LedgerDocument, expectedSeq int64, expectedPrevHash string) string {
+	if doc.SequenceNumber != expectedSeq {
+		return fmt.Sprintf("sequence gap detected: expected %d, got %d", expectedSeq, doc.SequenceNumber)
+	}
+	if doc.PreviousHash != expectedPrevHash {
+		return fmt.Sprintf("hash chain broken at sequence %d: expected previous_hash %q, got %q",
+			doc.SequenceNumber, expectedPrevHash, doc.PreviousHash)
+	}
+	computed := ComputeEntryHash(doc.PreviousHash, doc.SequenceNumber, doc.ID.Hex(), doc.IdempotencyKey, doc.Timestamp, doc.Postings)
+	if doc.EntryHash != computed {
+		return fmt.Sprintf("tamper detected at sequence %d: recorded hash %q does not match computed hash %q",
+			doc.SequenceNumber, doc.EntryHash, computed)
+	}
+	if err := ValidatePostings(doc.Postings); err != nil {
+		return fmt.Sprintf("unbalanced posting at sequence %d: %v", doc.SequenceNumber, err)
+	}
+	return ""
+}
+
+func accumulateDocPostings(doc LedgerDocument, result *AuditVerificationResult) {
+	for _, p := range doc.Postings {
+		if p.Direction == PostingDebit {
+			result.TotalDebits[p.Currency] += p.Amount
+		} else if p.Direction == PostingCredit {
+			result.TotalCredits[p.Currency] += p.Amount
+		}
+	}
+}
+
+func checkTrialBalanceEquilibrium(result *AuditVerificationResult) {
+	for curr, debitTotal := range result.TotalDebits {
+		creditTotal := result.TotalCredits[curr]
+		if debitTotal != creditTotal {
+			result.IsBalanced = false
+			result.Status = "TRIAL_BALANCE_UNBALANCED"
+			result.ErrorMessage = fmt.Sprintf("ledger-wide trial balance discrepancy in %s: debits=%d, credits=%d",
+				curr, debitTotal, creditTotal)
+			return
+		}
+	}
+}
+
 // VerifyAuditChain traverses the entire immutable ledger in ascending sequence order,
 // recomputing cryptographic SHA-256 hashes and verifying trial balance equilibrium.
 func VerifyAuditChain(ctx context.Context, col *mongo.Collection) (*AuditVerificationResult, error) {
-	findOpts := options.Find().SetSort(bson.D{{Key: "sequence_number", Value: 1}})
+	findOpts := options.Find().SetSort(bson.D{bson.E{Key: "sequence_number", Value: 1}})
 	cursor, err := col.Find(ctx, bson.M{"sequence_number": bson.M{"$gt": 0}}, findOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query ledger entries for verification: %w", err)
@@ -183,49 +236,14 @@ func VerifyAuditChain(ctx context.Context, col *mongo.Collection) (*AuditVerific
 			return nil, fmt.Errorf("failed to decode ledger document: %w", err)
 		}
 
-		// Verify sequence continuity
-		if doc.SequenceNumber != expectedSeq {
+		if errMsg := verifyDocIntegrity(doc, expectedSeq, expectedPrevHash); errMsg != "" {
 			result.Status = "CORRUPTED"
 			result.TamperedEntrySeq = doc.SequenceNumber
-			result.ErrorMessage = fmt.Sprintf("sequence gap detected: expected %d, got %d", expectedSeq, doc.SequenceNumber)
+			result.ErrorMessage = errMsg
 			return result, nil
 		}
 
-		// Verify previous hash chain linkage
-		if doc.PreviousHash != expectedPrevHash {
-			result.Status = "CORRUPTED"
-			result.TamperedEntrySeq = doc.SequenceNumber
-			result.ErrorMessage = fmt.Sprintf("hash chain broken at sequence %d: expected previous_hash %q, got %q",
-				doc.SequenceNumber, expectedPrevHash, doc.PreviousHash)
-			return result, nil
-		}
-
-		// Recompute hash and verify integrity
-		computed := ComputeEntryHash(doc.PreviousHash, doc.SequenceNumber, doc.ID.Hex(), doc.IdempotencyKey, doc.Timestamp, doc.Postings)
-		if doc.EntryHash != computed {
-			result.Status = "CORRUPTED"
-			result.TamperedEntrySeq = doc.SequenceNumber
-			result.ErrorMessage = fmt.Sprintf("tamper detected at sequence %d: recorded hash %q does not match computed hash %q",
-				doc.SequenceNumber, doc.EntryHash, computed)
-			return result, nil
-		}
-
-		// Validate double-entry postings equilibrium on the record
-		if err := ValidatePostings(doc.Postings); err != nil {
-			result.Status = "CORRUPTED"
-			result.TamperedEntrySeq = doc.SequenceNumber
-			result.ErrorMessage = fmt.Sprintf("unbalanced posting at sequence %d: %v", doc.SequenceNumber, err)
-			return result, nil
-		}
-
-		// Accumulate trial balance
-		for _, p := range doc.Postings {
-			if p.Direction == PostingDebit {
-				result.TotalDebits[p.Currency] += p.Amount
-			} else if p.Direction == PostingCredit {
-				result.TotalCredits[p.Currency] += p.Amount
-			}
-		}
+		accumulateDocPostings(doc, result)
 
 		expectedPrevHash = doc.EntryHash
 		expectedSeq++
@@ -234,17 +252,6 @@ func VerifyAuditChain(ctx context.Context, col *mongo.Collection) (*AuditVerific
 		result.LastSequence = doc.SequenceNumber
 	}
 
-	// Verify ledger-wide trial balance equilibrium
-	for curr, debitTotal := range result.TotalDebits {
-		creditTotal := result.TotalCredits[curr]
-		if debitTotal != creditTotal {
-			result.IsBalanced = false
-			result.Status = "TRIAL_BALANCE_UNBALANCED"
-			result.ErrorMessage = fmt.Sprintf("ledger-wide trial balance discrepancy in %s: debits=%d, credits=%d",
-				curr, debitTotal, creditTotal)
-			return result, nil
-		}
-	}
-
+	checkTrialBalanceEquilibrium(result)
 	return result, nil
 }

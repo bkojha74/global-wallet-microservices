@@ -45,10 +45,71 @@ func AppendLedgerTask(sessCtx mongo.SessionContext, col *mongo.Collection, task 
 	return err
 }
 
+type LedgerTaskStore interface {
+	FindPending(ctx context.Context, limit int64) ([]LedgerTask, error)
+	MarkCompleted(ctx context.Context, id primitive.ObjectID, processedAt time.Time) error
+	MarkFailed(ctx context.Context, id primitive.ObjectID, errMsg string) error
+}
+
+type mongoLedgerTaskStore struct {
+	col *mongo.Collection
+}
+
+func (m *mongoLedgerTaskStore) FindPending(ctx context.Context, limit int64) ([]LedgerTask, error) {
+	if m.col == nil {
+		return nil, nil
+	}
+	opts := options.Find().
+		SetSort(bson.D{bson.E{Key: "created_at", Value: 1}}).
+		SetLimit(limit)
+	cursor, err := m.col.Find(ctx, bson.M{"status": LedgerTaskStatusPending}, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+	var tasks []LedgerTask
+	if err := cursor.All(ctx, &tasks); err != nil {
+		return nil, err
+	}
+	return tasks, nil
+}
+
+func (m *mongoLedgerTaskStore) MarkCompleted(ctx context.Context, id primitive.ObjectID, processedAt time.Time) error {
+	if m.col == nil {
+		return nil
+	}
+	_, err := m.col.UpdateOne(ctx,
+		bson.M{"_id": id},
+		bson.M{
+			"$set": bson.M{
+				"status":       LedgerTaskStatusCompleted,
+				"processed_at": processedAt,
+				"error":        "",
+			},
+		},
+	)
+	return err
+}
+
+func (m *mongoLedgerTaskStore) MarkFailed(ctx context.Context, id primitive.ObjectID, errMsg string) error {
+	if m.col == nil {
+		return nil
+	}
+	_, err := m.col.UpdateOne(ctx,
+		bson.M{"_id": id},
+		bson.M{
+			"$inc": bson.M{"retries": 1},
+			"$set": bson.M{"error": errMsg},
+		},
+	)
+	return err
+}
+
 // LedgerRelay polls pending ledger tasks and guarantees reliable asynchronous delivery
 // to the Ledger Service.
 type LedgerRelay struct {
 	col          *mongo.Collection
+	store        LedgerTaskStore
 	ledgerClient ledgerv1.LedgerServiceClient
 	pollInterval time.Duration
 	batchSize    int64
@@ -63,8 +124,13 @@ func NewLedgerRelay(db *mongo.Database, client ledgerv1.LedgerServiceClient, pol
 	if batchSize <= 0 {
 		batchSize = 50
 	}
+	var col *mongo.Collection
+	if db != nil {
+		col = db.Collection("ledger_tasks")
+	}
 	return &LedgerRelay{
-		col:          db.Collection("ledger_tasks"),
+		col:          col,
+		store:        &mongoLedgerTaskStore{col: col},
 		ledgerClient: client,
 		pollInterval: pollInterval,
 		batchSize:    batchSize,
@@ -98,17 +164,10 @@ func (r *LedgerRelay) DispatchImmediate(ctx context.Context, task LedgerTask) er
 	}
 
 	now := time.Now().UTC()
-	_, updateErr := r.col.UpdateOne(ctx,
-		bson.M{"_id": task.ID},
-		bson.M{
-			"$set": bson.M{
-				"status":       LedgerTaskStatusCompleted,
-				"processed_at": now,
-				"error":        "",
-			},
-		},
-	)
-	return updateErr
+	if r.store != nil {
+		return r.store.MarkCompleted(ctx, task.ID, now)
+	}
+	return nil
 }
 
 // Start begins the background relay loop until context cancellation.
@@ -146,24 +205,17 @@ func (r *LedgerRelay) Stop() {
 
 // ProcessBatch finds and dispatches up to batchSize pending ledger tasks.
 func (r *LedgerRelay) ProcessBatch(ctx context.Context) (int, error) {
-	opts := options.Find().
-		SetSort(bson.D{{Key: "created_at", Value: 1}}).
-		SetLimit(r.batchSize)
+	if r.store == nil {
+		return 0, nil
+	}
 
-	filter := bson.M{"status": LedgerTaskStatusPending}
-	cursor, err := r.col.Find(ctx, filter, opts)
+	tasks, err := r.store.FindPending(ctx, r.batchSize)
 	if err != nil {
 		return 0, fmt.Errorf("failed to query pending ledger tasks: %w", err)
 	}
-	defer cursor.Close(ctx)
 
 	processedCount := 0
-	for cursor.Next(ctx) {
-		var task LedgerTask
-		if err := cursor.Decode(&task); err != nil {
-			continue
-		}
-
+	for _, task := range tasks {
 		callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		resp, err := r.ledgerClient.RecordTransaction(callCtx, &ledgerv1.RecordTransactionRequest{
 			TransactionId:       task.TransactionID,
@@ -186,26 +238,11 @@ func (r *LedgerRelay) ProcessBatch(ctx context.Context) (int, error) {
 			}
 			log.Printf("[LEDGER-RELAY] Failed to dispatch task %s (idemp: %s): %s", task.ID.Hex(), task.IdempotencyKey, errMsg)
 
-			_, _ = r.col.UpdateOne(ctx,
-				bson.M{"_id": task.ID},
-				bson.M{
-					"$inc": bson.M{"retries": 1},
-					"$set": bson.M{"error": errMsg},
-				},
-			)
+			_ = r.store.MarkFailed(ctx, task.ID, errMsg)
 			continue
 		}
 
-		_, updateErr := r.col.UpdateOne(ctx,
-			bson.M{"_id": task.ID},
-			bson.M{
-				"$set": bson.M{
-					"status":       LedgerTaskStatusCompleted,
-					"processed_at": now,
-					"error":        "",
-				},
-			},
-		)
+		updateErr := r.store.MarkCompleted(ctx, task.ID, now)
 		if updateErr == nil {
 			processedCount++
 		}

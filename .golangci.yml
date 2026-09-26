@@ -1,0 +1,31 @@
+run:
+  timeout: 5m
+  concurrency: 4
+  tests: true
+
+linters:
+  enable:
+    - govet
+    - errcheck
+    - staticcheck
+    - unused
+    - gosimple
+    - ineffassign
+    - gosec
+
+linters-settings:
+  govet:
+    enable-all: false
+  gosec:
+    severity: medium
+    confidence: medium
+    excludes:
+      - G104 # Audit errors not checked (covered by errcheck)
+
+issues:
+  exclude-dirs:
+    - proto/wallet
+    - proto/ledger
+    - proto/auth
+  exclude-files:
+    - ".*\\.pb\\.go$"

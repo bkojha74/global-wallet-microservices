@@ -88,13 +88,13 @@ func (o *MongoOutbox) EnsureIndexes(ctx context.Context) error {
 		{
 			// Primary relay query: fetch pending entries in creation order.
 			Keys: bson.D{
-				{Key: "status", Value: 1},
-				{Key: "created_at", Value: 1},
+				bson.E{Key: "status", Value: 1},
+				bson.E{Key: "created_at", Value: 1},
 			},
 		},
 		{
 			// Deduplication: if event_id was already published, skip.
-			Keys:    bson.D{{Key: "event.event_id", Value: 1}},
+			Keys:    bson.D{bson.E{Key: "event.event_id", Value: 1}},
 			Options: options.Index().SetUnique(true),
 		},
 	}
@@ -161,10 +161,10 @@ func (r *OutboxRelay) Start(ctx context.Context) {
 // relay fetches a batch of pending entries and publishes them.
 func (r *OutboxRelay) relay(ctx context.Context) error {
 	filter := bson.D{
-		{Key: "status", Value: OutboxStatusPending},
-		{Key: "attempts", Value: bson.D{{Key: "$lt", Value: r.maxAttempts}}},
+		bson.E{Key: "status", Value: OutboxStatusPending},
+		bson.E{Key: "attempts", Value: bson.D{bson.E{Key: "$lt", Value: r.maxAttempts}}},
 	}
-	sort := bson.D{{Key: "created_at", Value: 1}}
+	sort := bson.D{bson.E{Key: "created_at", Value: 1}}
 	findOpts := options.Find().SetSort(sort).SetLimit(r.batchSize)
 
 	cursor, err := r.col.Find(ctx, filter, findOpts)
@@ -194,21 +194,21 @@ func (r *OutboxRelay) relay(ctx context.Context) error {
 				log.Printf("[OUTBOX-RELAY] event %s failed after %d attempts: %v", entry.Event.EventID, attempts, pubErr)
 			}
 			_, _ = r.col.UpdateOne(ctx,
-				bson.D{{Key: "_id", Value: entry.ID}},
-				bson.D{{Key: "$set", Value: bson.D{
-					{Key: "status", Value: newStatus},
-					{Key: "attempts", Value: attempts},
+				bson.D{bson.E{Key: "_id", Value: entry.ID}},
+				bson.D{bson.E{Key: "$set", Value: bson.D{
+					bson.E{Key: "status", Value: newStatus},
+					bson.E{Key: "attempts", Value: attempts},
 				}}},
 			)
 			continue
 		}
 		// Mark published.
 		_, _ = r.col.UpdateOne(ctx,
-			bson.D{{Key: "_id", Value: entry.ID}},
-			bson.D{{Key: "$set", Value: bson.D{
-				{Key: "status", Value: OutboxStatusPublished},
-				{Key: "attempts", Value: entry.Attempts + 1},
-				{Key: "published_at", Value: now},
+			bson.D{bson.E{Key: "_id", Value: entry.ID}},
+			bson.D{bson.E{Key: "$set", Value: bson.D{
+				bson.E{Key: "status", Value: OutboxStatusPublished},
+				bson.E{Key: "attempts", Value: entry.Attempts + 1},
+				bson.E{Key: "published_at", Value: now},
 			}}},
 		)
 		published++

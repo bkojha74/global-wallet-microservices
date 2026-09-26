@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -113,22 +114,21 @@ func (g *Gateway) getActiveWalletClient(ctx context.Context) (walletv1.WalletSer
 	return g.primaryClient, coordinator.TargetPrimary
 }
 
-func (g *Gateway) handleCreateWallet(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+const (
+	apiGatewayServiceName   = "api-gateway"
+	errMethodNotAllowed     = "Method not allowed"
+	msgForbiddenFmt         = "Forbidden: %v"
+	eventAPIRequestReceived = "api.request.received"
+	eventAPIResponseSent    = "api.response.sent"
+	traceWalletGRPCReqFmt   = "[TRACE] trace_id=%s step=wallet_grpc_request target=%s"
+	traceWalletGRPCRespFmt  = "[TRACE] trace_id=%s step=wallet_grpc_response error=%v"
+)
 
-	correlation := observability.FromHTTPRequest(r)
-	ctx := observability.WithCorrelation(r.Context(), correlation)
-	traceID := correlation.AssociationID
-	g.emit(ctx, "api.request.received", observability.LevelInfo, "HTTP request received", map[string]any{"operation": "create_wallet"})
+func parseCreateWalletRequest(r *http.Request, traceID string) (*walletv1.CreateWalletRequest, error) {
 	body, err := readClientJSON(traceID, r.Body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return nil, err
 	}
-
 	var req struct {
 		WalletID       string `json:"wallet_id"`
 		Currency       string `json:"currency"`
@@ -136,53 +136,75 @@ func (g *Gateway) handleCreateWallet(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		log.Printf("[TRACE] trace_id=%s step=http_json_decode_failed error=%v", traceID, err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return nil, err
 	}
 	if !db.IsValidCurrency(req.Currency) {
-		http.Error(w, fmt.Sprintf("Invalid or unsupported currency: %s", req.Currency), http.StatusBadRequest)
-		return
+		return nil, fmt.Errorf("Invalid or unsupported currency: %s", req.Currency)
 	}
 	if req.InitialBalance < 0 {
-		http.Error(w, "Initial balance cannot be negative", http.StatusBadRequest)
-		return
+		return nil, errors.New("Initial balance cannot be negative")
 	}
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
 		if err := ValidateWalletOwnership(claims, req.WalletID); err != nil {
 			log.Printf("[SECURITY] IDOR blocked: subject %s tried to create wallet for %s", claims.Subject, req.WalletID)
-			writeAuthError(w, http.StatusForbidden, fmt.Sprintf("Forbidden: %v", err))
+			return nil, fmt.Errorf("forbidden: %w", err)
+		}
+	}
+	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=create_wallet wallet_id=%s", traceID, req.WalletID)
+	return &walletv1.CreateWalletRequest{WalletId: req.WalletID, Currency: req.Currency, InitialBalance: req.InitialBalance}, nil
+}
+
+func handleWalletGRPCError(w http.ResponseWriter, err error, action string) {
+	if st, ok := status.FromError(err); ok {
+		if st.Code() == codes.AlreadyExists {
+			http.Error(w, st.Message(), http.StatusConflict)
+			return
+		}
+		if st.Code() == codes.InvalidArgument {
+			http.Error(w, st.Message(), http.StatusBadRequest)
 			return
 		}
 	}
+	http.Error(w, fmt.Sprintf("Error %s: %v", action, err), http.StatusInternalServerError)
+}
 
-	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=create_wallet wallet_id=%s", traceID, req.WalletID)
-	protoReq := &walletv1.CreateWalletRequest{WalletId: req.WalletID, Currency: req.Currency, InitialBalance: req.InitialBalance}
+func (g *Gateway) handleCreateWallet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	correlation := observability.FromHTTPRequest(r)
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	traceID := correlation.AssociationID
+	g.emit(ctx, eventAPIRequestReceived, observability.LevelInfo, "HTTP request received", map[string]any{"operation": "create_wallet"})
+
+	protoReq, err := parseCreateWalletRequest(r, traceID)
+	if err != nil {
+		if strings.HasPrefix(err.Error(), "forbidden:") {
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	logProto(traceID, "http_json_to_wallet_proto_request", protoReq)
 
 	client, target := g.getActiveWalletClient(ctx)
-	log.Printf("[TRACE] trace_id=%s step=wallet_grpc_request target=%s", traceID, target)
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	log.Printf(traceWalletGRPCReqFmt, traceID, target)
+	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	ctx = observability.WithOutgoingMetadata(ctx, correlation)
-	resp, err := client.CreateWallet(ctx, protoReq)
+	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	resp, err := client.CreateWallet(callCtx, protoReq)
 	if err != nil {
-		log.Printf("[TRACE] trace_id=%s step=wallet_grpc_response error=%v", traceID, err)
-		if st, ok := status.FromError(err); ok {
-			if st.Code() == codes.AlreadyExists {
-				http.Error(w, st.Message(), http.StatusConflict)
-				return
-			}
-			if st.Code() == codes.InvalidArgument {
-				http.Error(w, st.Message(), http.StatusBadRequest)
-				return
-			}
-		}
-		http.Error(w, fmt.Sprintf("Error creating wallet: %v", err), http.StatusInternalServerError)
+		log.Printf(traceWalletGRPCRespFmt, traceID, err)
+		handleWalletGRPCError(w, err, "creating wallet")
 		return
 	}
 	logProto(traceID, "wallet_proto_response_received", resp)
-	g.emit(ctx, "api.response.sent", observability.LevelInfo, "Wallet creation response sent", map[string]any{"operation": "create_wallet", "routed_target": target})
+	g.emit(ctx, eventAPIResponseSent, observability.LevelInfo, "Wallet creation response sent", map[string]any{"operation": "create_wallet", "routed_target": target})
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":        resp.Success,
@@ -194,7 +216,7 @@ func (g *Gateway) handleCreateWallet(w http.ResponseWriter, r *http.Request) {
 
 func (g *Gateway) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -206,32 +228,32 @@ func (g *Gateway) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
 		if err := ValidateWalletOwnership(claims, walletID); err != nil {
 			log.Printf("[SECURITY] IDOR blocked: subject %s tried to view balance of %s", claims.Subject, walletID)
-			writeAuthError(w, http.StatusForbidden, fmt.Sprintf("Forbidden: %v", err))
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
 			return
 		}
 	}
 	correlation := observability.FromHTTPRequest(r)
 	ctx := observability.WithCorrelation(r.Context(), correlation)
 	traceID := correlation.AssociationID
-	g.emit(ctx, "api.request.received", observability.LevelInfo, "HTTP request received", map[string]any{"operation": "get_balance"})
+	g.emit(ctx, eventAPIRequestReceived, observability.LevelInfo, "HTTP request received", map[string]any{"operation": "get_balance"})
 	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=get_balance wallet_id=%s", traceID, walletID)
 	protoReq := &walletv1.GetBalanceRequest{WalletId: walletID}
 	logProto(traceID, "http_json_to_wallet_proto_request", protoReq)
 
 	client, target := g.getActiveWalletClient(ctx)
-	log.Printf("[TRACE] trace_id=%s step=wallet_grpc_request target=%s", traceID, target)
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	log.Printf(traceWalletGRPCReqFmt, traceID, target)
+	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	ctx = observability.WithOutgoingMetadata(ctx, correlation)
-	resp, err := client.GetBalance(ctx, protoReq)
+	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	resp, err := client.GetBalance(callCtx, protoReq)
 	if err != nil {
-		log.Printf("[TRACE] trace_id=%s step=wallet_grpc_response error=%v", traceID, err)
+		log.Printf(traceWalletGRPCRespFmt, traceID, err)
 		http.Error(w, fmt.Sprintf("Error retrieving balance: %v", err), http.StatusInternalServerError)
 		return
 	}
 	logProto(traceID, "wallet_proto_response_received", resp)
-	g.emit(ctx, "api.response.sent", observability.LevelInfo, "Balance response sent", map[string]any{"operation": "get_balance", "routed_target": target})
+	g.emit(ctx, eventAPIResponseSent, observability.LevelInfo, "Balance response sent", map[string]any{"operation": "get_balance", "routed_target": target})
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"wallet_id":      resp.WalletId,
@@ -245,7 +267,7 @@ func (g *Gateway) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -293,13 +315,13 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
 		if err := ValidateWalletOwnership(claims, sourceWallet); err != nil {
 			log.Printf("[SECURITY] IDOR blocked: subject %s tried to transfer from %s", claims.Subject, sourceWallet)
-			writeAuthError(w, http.StatusForbidden, fmt.Sprintf("Forbidden: %v", err))
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
 			return
 		}
 	}
 	ctx := observability.WithCorrelation(r.Context(), correlation)
 	// Step 1: api.request.received (INFO)
-	g.emit(ctx, "api.request.received", observability.LevelInfo, "HTTP transfer request received", map[string]any{
+	g.emit(ctx, eventAPIRequestReceived, observability.LevelInfo, "HTTP transfer request received", map[string]any{
 		"operation":     "transfer",
 		"source_wallet": sourceWallet,
 		"dest_wallet":   destWallet,
@@ -325,16 +347,16 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		"idempotency_key": req.IdempotencyKey,
 	})
 
-	log.Printf("[TRACE] trace_id=%s step=wallet_grpc_request target=%s", traceID, target)
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	log.Printf(traceWalletGRPCReqFmt, traceID, target)
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	ctx = observability.WithOutgoingMetadata(ctx, correlation)
-	resp, err := client.TransferFunds(ctx, protoReq)
+	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	resp, err := client.TransferFunds(callCtx, protoReq)
 	durationMS := time.Since(startTime).Milliseconds()
 	if err != nil {
-		log.Printf("[TRACE] trace_id=%s step=wallet_grpc_response error=%v", traceID, err)
-		g.emitTerminal(ctx, "api.response.sent", observability.LevelError, "Transfer gRPC failure", durationMS, false, map[string]any{
+		log.Printf(traceWalletGRPCRespFmt, traceID, err)
+		g.emitTerminal(ctx, eventAPIResponseSent, observability.LevelError, "Transfer gRPC failure", durationMS, false, map[string]any{
 			"operation": "transfer",
 			"error":     err.Error(),
 		})
@@ -349,7 +371,7 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 
 	// Step 12: api.response.sent (INFO)
 	isSuccess := resp.Status == walletv1.TransferFundsResponse_SUCCESS
-	g.emitTerminal(ctx, "api.response.sent", observability.LevelInfo, "Transfer response sent", durationMS, isSuccess, map[string]any{
+	g.emitTerminal(ctx, eventAPIResponseSent, observability.LevelInfo, "Transfer response sent", durationMS, isSuccess, map[string]any{
 		"operation":      "transfer",
 		"routed_target":  target,
 		"status":         resp.Status.String(),
@@ -367,7 +389,7 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 
 func (g *Gateway) handleLedger(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -379,7 +401,7 @@ func (g *Gateway) handleLedger(w http.ResponseWriter, r *http.Request) {
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
 		if err := ValidateWalletOwnership(claims, walletID); err != nil {
 			log.Printf("[SECURITY] IDOR blocked: subject %s tried to view ledger of %s", claims.Subject, walletID)
-			writeAuthError(w, http.StatusForbidden, fmt.Sprintf("Forbidden: %v", err))
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
 			return
 		}
 	}
@@ -395,11 +417,11 @@ func (g *Gateway) handleLedger(w http.ResponseWriter, r *http.Request) {
 
 	correlation := observability.FromHTTPRequest(r)
 	ctx := observability.WithCorrelation(r.Context(), correlation)
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	ctx = observability.WithOutgoingMetadata(ctx, correlation)
-	resp, err := g.ledgerClient.GetLedgerEntries(ctx, &ledgerv1.GetLedgerRequest{
+	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	resp, err := g.ledgerClient.GetLedgerEntries(callCtx, &ledgerv1.GetLedgerRequest{
 		WalletId:  walletID,
 		Limit:     limit,
 		PageToken: pageToken,
@@ -420,16 +442,16 @@ func (g *Gateway) handleLedger(w http.ResponseWriter, r *http.Request) {
 func (g *Gateway) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	correlation := observability.FromHTTPRequest(r)
 	ctx := observability.WithCorrelation(r.Context(), correlation)
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	ctx = observability.WithOutgoingMetadata(ctx, correlation)
-	pHealth, _ := g.primaryClient.HealthCheck(ctx, &walletv1.HealthRequest{})
-	sHealth, _ := g.standbyClient.HealthCheck(ctx, &walletv1.HealthRequest{})
+	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	pHealth, _ := g.primaryClient.HealthCheck(callCtx, &walletv1.HealthRequest{})
+	sHealth, _ := g.standbyClient.HealthCheck(callCtx, &walletv1.HealthRequest{})
 
 	currentActive := coordinator.TargetPrimary
 	if g.coordinator != nil {
-		if t, err := g.coordinator.GetActiveTarget(ctx); err == nil && t != "" {
+		if t, err := g.coordinator.GetActiveTarget(callCtx); err == nil && t != "" {
 			currentActive = t
 		}
 	} else {
@@ -453,9 +475,35 @@ func (g *Gateway) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (g *Gateway) resolveCurrentTarget(ctx context.Context) string {
+	if g.coordinator != nil {
+		if t, err := g.coordinator.GetActiveTarget(ctx); err == nil && t != "" {
+			return t
+		}
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if g.activeTarget != "" {
+		return g.activeTarget
+	}
+	return coordinator.TargetPrimary
+}
+
+func (g *Gateway) updateFailoverTarget(ctx context.Context, newTarget string) error {
+	if g.coordinator != nil {
+		if err := g.coordinator.SetActiveTarget(ctx, newTarget); err != nil {
+			return err
+		}
+	}
+	g.mu.Lock()
+	g.activeTarget = newTarget
+	g.mu.Unlock()
+	return nil
+}
+
 func (g *Gateway) handleFailover(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -467,37 +515,19 @@ func (g *Gateway) handleFailover(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	currentTarget := coordinator.TargetPrimary
-	if g.coordinator != nil {
-		if t, err := g.coordinator.GetActiveTarget(r.Context()); err == nil && t != "" {
-			currentTarget = t
-		}
-	} else {
-		g.mu.RLock()
-		if g.activeTarget != "" {
-			currentTarget = g.activeTarget
-		}
-		g.mu.RUnlock()
-	}
-
+	currentTarget := g.resolveCurrentTarget(r.Context())
 	newTarget := coordinator.TargetStandby
 	if currentTarget == coordinator.TargetStandby {
 		newTarget = coordinator.TargetPrimary
 	}
 
-	if g.coordinator != nil {
-		if err := g.coordinator.SetActiveTarget(r.Context(), newTarget); err != nil {
-			log.Printf("[GATEWAY-FAILOVER] Failed to persist failover target: %v", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to persist failover target"})
-			return
-		}
+	if err := g.updateFailoverTarget(r.Context(), newTarget); err != nil {
+		log.Printf("[GATEWAY-FAILOVER] Failed to persist failover target: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to persist failover target"})
+		return
 	}
 
-	g.mu.Lock()
-	g.activeTarget = newTarget
-	g.mu.Unlock()
-
-	observability.DefaultMetrics.SetClusterActiveTarget("api-gateway", newTarget)
+	observability.DefaultMetrics.SetClusterActiveTarget(apiGatewayServiceName, newTarget)
 	log.Printf("[GATEWAY-FAILOVER] Switched traffic route to: %s", newTarget)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"message":              "Failover routing triggered",
@@ -509,7 +539,7 @@ func (g *Gateway) handleFailover(w http.ResponseWriter, r *http.Request) {
 // This replaces the old in-process handleAuthToken which issued tokens without credential verification.
 func (g *Gateway) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -553,7 +583,7 @@ func (g *Gateway) handleLogin(w http.ResponseWriter, r *http.Request) {
 // handleRefresh exchanges a refresh token for a new access token.
 func (g *Gateway) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -591,7 +621,7 @@ func (g *Gateway) handleRefresh(w http.ResponseWriter, r *http.Request) {
 // handleLogout revokes the caller's token via the auth-service.
 func (g *Gateway) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -613,14 +643,7 @@ func (g *Gateway) handleLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": "logged out successfully"})
 }
 
-// handleAuthToken provides backward-compatible token minting (/api/v1/auth/token)
-// supporting legacy Bruno/Postman collections and rapid development testing.
-func (g *Gateway) handleAuthToken(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost && r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
+func parseAuthTokenParams(r *http.Request) (string, string, string) {
 	sub := r.URL.Query().Get("sub")
 	role := r.URL.Query().Get("role")
 	scope := r.URL.Query().Get("scope")
@@ -650,7 +673,10 @@ func (g *Gateway) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 	if role == "" {
 		role = auth.RoleUser
 	}
+	return sub, role, scope
+}
 
+func buildAuthTokenClaims(sub, role, scope string) (auth.Claims, []string, []string) {
 	var roles []string
 	if role != "" {
 		roles = []string{role}
@@ -664,11 +690,23 @@ func (g *Gateway) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 		scopes = []string{auth.ScopeWalletTransfer, auth.ScopeWalletRead}
 	}
 
-	claims := auth.Claims{
+	return auth.Claims{
 		Subject: sub,
 		Roles:   roles,
 		Scopes:  scopes,
+	}, roles, scopes
+}
+
+// handleAuthToken provides backward-compatible token minting (/api/v1/auth/token)
+// supporting legacy Bruno/Postman collections and rapid development testing.
+func (g *Gateway) handleAuthToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
 	}
+
+	sub, role, scope := parseAuthTokenParams(r)
+	claims, roles, scopes := buildAuthTokenClaims(sub, role, scope)
 
 	secret := os.Getenv("JWT_SECRET")
 	if secret == "" {
@@ -729,110 +767,179 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	_, _ = w.Write(append(payload, '\n'))
 }
 
-func main() {
+func resolveServiceAddress(envVar, hostName, defaultPort string) string {
+	if addr := os.Getenv(envVar); addr != "" {
+		return addr
+	}
+	if _, err := net.LookupHost(hostName); err == nil {
+		return hostName + ":" + defaultPort
+	}
+	return "127.0.0.1:" + defaultPort
+}
+
+func resolveGatewayServiceAddresses() (primary, standby, ledger, auth string) {
+	primary = resolveServiceAddress("PRIMARY_WALLET_ADDR", "wallet-primary", "50051")
+	standby = resolveServiceAddress("STANDBY_WALLET_ADDR", "wallet-standby", "50053")
+	ledger = resolveServiceAddress("LEDGER_ADDR", "ledger-service", "50052")
+	auth = resolveServiceAddress("AUTH_SERVICE_ADDR", "auth-service", "50054")
+	return primary, standby, ledger, auth
+}
+
+func initFailoverCoordinator(mongoURI string) (coordinator.FailoverCoordinator, func()) {
+	if mongoURI != "" {
+		mCtx, mCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		mClient, mErr := db.ConnectWithRetry(mCtx, mongoURI, 3)
+		mCancel()
+		if mErr == nil {
+			coord := coordinator.NewMongoFailoverCoordinator(mClient.Database("banking_db"), 1*time.Second)
+			log.Println("[API-GATEWAY] Distributed MongoFailoverCoordinator connected")
+			return coord, func() {
+				coord.Close()
+				_ = mClient.Disconnect(context.Background())
+			}
+		}
+		log.Printf("[API-GATEWAY] Mongo connection failed for failover coordinator (%v), falling back to in-memory coordinator", mErr)
+	}
+	coord := coordinator.NewMemoryFailoverCoordinator(coordinator.TargetPrimary)
+	return coord, func() { coord.Close() }
+}
+
+func (gw *Gateway) handleWallets(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		gw.handleCreateWallet(w, r)
+	} else if r.Method == http.MethodGet {
+		gw.handleGetBalance(w, r)
+	} else {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+	}
+}
+
+func (gw *Gateway) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	client, activeTarget := gw.getActiveWalletClient(ctx)
+	wHealth, wErr := client.HealthCheck(ctx, &walletv1.HealthRequest{})
+	if wErr != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"status":        "DEGRADED",
+			"active_target": activeTarget,
+			"error":         fmt.Sprintf("active wallet health check failed: %v", wErr),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":        "READY",
+		"active_target": activeTarget,
+		"wallet_status": wHealth.Status,
+	})
+}
+
+func registerGatewayRoutes(mux *http.ServeMux, gw *Gateway) {
+	mux.HandleFunc("/api/v1/wallets", gw.handleWallets)
+	mux.HandleFunc("/api/v1/transfers", gw.handleTransfer)
+	mux.HandleFunc("/api/v1/ledger", gw.handleLedger)
+	mux.HandleFunc("/api/v1/cluster/status", gw.handleClusterStatus)
+	mux.HandleFunc("/api/v1/cluster/failover", gw.handleFailover)
+	mux.HandleFunc("/api/v1/auth/login", gw.handleLogin)
+	mux.HandleFunc("/api/v1/auth/refresh", gw.handleRefresh)
+	mux.HandleFunc("/api/v1/auth/logout", gw.handleLogout)
+	mux.HandleFunc("/api/v1/auth/token", gw.handleAuthToken)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "UP"})
+	})
+	mux.HandleFunc("/readyz", gw.handleReadyz)
+	mux.Handle("/metrics", observability.DefaultMetrics.Handler())
+}
+
+func wrapGatewayMiddleware(handler http.Handler, authClient authv1.AuthServiceClient) http.Handler {
+	publicPaths := map[string]bool{
+		"/healthz":               true,
+		"/readyz":                true,
+		"/metrics":               true,
+		"/api/v1/auth/login":     true,
+		"/api/v1/auth/refresh":   true,
+		"/api/v1/auth/token":     true,
+		"/api/v1/cluster/status": true,
+	}
+
+	cacheFingerprintSecret := os.Getenv("CACHE_FINGERPRINT_SECRET")
+	if cacheFingerprintSecret == "" {
+		cacheFingerprintSecret = "gateway-cache-fingerprint-key"
+	}
+	claimsC := newClaimsCache(cacheFingerprintSecret)
+	rateLimiter := NewRateLimiter(60, 100)
+
+	wrapped := MaxBytesMiddleware(1<<20, handler)
+	wrapped = CORSMiddleware(wrapped)
+	wrapped = SecurityHeadersMiddleware(wrapped)
+	wrapped = RateLimitMiddleware(rateLimiter, wrapped)
+	wrapped = AuthMiddleware(authClient, claimsC, publicPaths, wrapped)
+	return observability.TraceHTTPMiddleware(apiGatewayServiceName, wrapped)
+}
+
+func buildGatewayRouter(gw *Gateway) http.Handler {
+	mux := http.NewServeMux()
+	registerGatewayRoutes(mux, gw)
+	return wrapGatewayMiddleware(mux, gw.authClient)
+}
+
+func runGatewayServer(ctx context.Context) error {
 	httpPort := os.Getenv("HTTP_PORT")
 	if httpPort == "" {
 		httpPort = "8080"
 	}
-	primaryAddr := os.Getenv("PRIMARY_WALLET_ADDR")
-	if primaryAddr == "" {
-		if _, err := net.LookupHost("wallet-primary"); err == nil {
-			primaryAddr = "wallet-primary:50051"
-		} else {
-			primaryAddr = "127.0.0.1:50051"
-		}
-	}
-	standbyAddr := os.Getenv("STANDBY_WALLET_ADDR")
-	if standbyAddr == "" {
-		if _, err := net.LookupHost("wallet-standby"); err == nil {
-			standbyAddr = "wallet-standby:50053"
-		} else {
-			standbyAddr = "127.0.0.1:50053"
-		}
-	}
-	ledgerAddr := os.Getenv("LEDGER_ADDR")
-	if ledgerAddr == "" {
-		if _, err := net.LookupHost("ledger-service"); err == nil {
-			ledgerAddr = "ledger-service:50052"
-		} else {
-			ledgerAddr = "127.0.0.1:50052"
-		}
-	}
-
-	authAddr := os.Getenv("AUTH_SERVICE_ADDR")
-	if authAddr == "" {
-		if _, err := net.LookupHost("auth-service"); err == nil {
-			authAddr = "auth-service:50054"
-		} else {
-			authAddr = "127.0.0.1:50054"
-		}
-	}
+	primaryAddr, standbyAddr, ledgerAddr, authAddr := resolveGatewayServiceAddresses()
 
 	log.Println("[API-GATEWAY] Establishing gRPC connections...")
 	environment := os.Getenv("ENVIRONMENT")
 	if environment == "" {
 		environment = "local"
 	}
-	logger := observability.LoggerFromEnvironment("api-gateway", environment, "", os.Stdout)
+	logger := observability.LoggerFromEnvironment(apiGatewayServiceName, environment, "", os.Stdout)
 
-	// Phase 3 (GAP-OBS-01): OpenTelemetry W3C distributed tracing
-	shutdownTracer, err := observability.InitTracer("api-gateway")
+	subCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	shutdownTracer, err := observability.InitTracer(apiGatewayServiceName)
 	if err == nil && shutdownTracer != nil {
 		defer func() { _ = shutdownTracer(context.Background()) }()
 	}
 
 	dialOpt, err := getClientDialOption()
 	if err != nil {
-		log.Fatalf("Failed to initialize gRPC dial credentials: %v", err)
+		return fmt.Errorf("failed to initialize gRPC dial credentials: %w", err)
 	}
 	dialOpts := []grpc.DialOption{
 		dialOpt,
-		grpc.WithUnaryInterceptor(observability.UnaryClientTraceInterceptor("api-gateway")),
+		grpc.WithUnaryInterceptor(observability.UnaryClientTraceInterceptor(apiGatewayServiceName)),
 	}
 
 	aConn, err := grpc.NewClient(authAddr, dialOpts...)
 	if err != nil {
-		log.Fatalf("Failed to dial auth-service: %v", err)
+		return fmt.Errorf("failed to dial auth-service: %w", err)
 	}
 	defer aConn.Close()
 
 	pConn, err := grpc.NewClient(primaryAddr, dialOpts...)
 	if err != nil {
-		log.Fatalf("Failed to dial primary wallet: %v", err)
+		return fmt.Errorf("failed to dial primary wallet: %w", err)
 	}
 	defer pConn.Close()
 
 	sConn, err := grpc.NewClient(standbyAddr, dialOpts...)
 	if err != nil {
-		log.Fatalf("Failed to dial standby wallet: %v", err)
+		return fmt.Errorf("failed to dial standby wallet: %w", err)
 	}
 	defer sConn.Close()
 
 	lConn, err := grpc.NewClient(ledgerAddr, dialOpts...)
 	if err != nil {
-		log.Fatalf("Failed to dial ledger: %v", err)
+		return fmt.Errorf("failed to dial ledger: %w", err)
 	}
 	defer lConn.Close()
 
-	// Phase 3 (GAP-HA-01): Distributed Failover Coordinator
-	var coord coordinator.FailoverCoordinator
-	mongoURI := os.Getenv("MONGO_URI")
-	if mongoURI != "" {
-		mCtx, mCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		mClient, mErr := db.ConnectWithRetry(mCtx, mongoURI, 3)
-		mCancel()
-		if mErr == nil {
-			coord = coordinator.NewMongoFailoverCoordinator(mClient.Database("banking_db"), 1*time.Second)
-			defer mClient.Disconnect(context.Background())
-			log.Println("[API-GATEWAY] Distributed MongoFailoverCoordinator connected")
-		} else {
-			log.Printf("[API-GATEWAY] Mongo connection failed for failover coordinator (%v), falling back to in-memory coordinator", mErr)
-			coord = coordinator.NewMemoryFailoverCoordinator(coordinator.TargetPrimary)
-		}
-	} else {
-		coord = coordinator.NewMemoryFailoverCoordinator(coordinator.TargetPrimary)
-	}
-	defer coord.Close()
+	coord, cleanupCoord := initFailoverCoordinator(os.Getenv("MONGO_URI"))
+	defer cleanupCoord()
 
 	gw := &Gateway{
 		activeTarget:   "PRIMARY",
@@ -846,87 +953,16 @@ func main() {
 		logger:         logger,
 	}
 
-	// Update active target metric initially
-	if initTarget, err := coord.GetActiveTarget(context.Background()); err == nil {
-		observability.DefaultMetrics.SetClusterActiveTarget("api-gateway", initTarget)
+	if initTarget, err := coord.GetActiveTarget(subCtx); err == nil {
+		observability.DefaultMetrics.SetClusterActiveTarget(apiGatewayServiceName, initTarget)
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/wallets", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			gw.handleCreateWallet(w, r)
-		} else if r.Method == http.MethodGet {
-			gw.handleGetBalance(w, r)
-		} else {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		}
-	})
-	mux.HandleFunc("/api/v1/transfers", gw.handleTransfer)
-	mux.HandleFunc("/api/v1/ledger", gw.handleLedger)
-	mux.HandleFunc("/api/v1/cluster/status", gw.handleClusterStatus)
-	mux.HandleFunc("/api/v1/cluster/failover", gw.handleFailover)
-	// Auth endpoints — proxied to auth-service via gRPC
-	mux.HandleFunc("/api/v1/auth/login", gw.handleLogin)
-	mux.HandleFunc("/api/v1/auth/refresh", gw.handleRefresh)
-	mux.HandleFunc("/api/v1/auth/logout", gw.handleLogout)
-	mux.HandleFunc("/api/v1/auth/token", gw.handleAuthToken)
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "UP"})
-	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		defer cancel()
-		client, activeTarget := gw.getActiveWalletClient(ctx)
-		wHealth, wErr := client.HealthCheck(ctx, &walletv1.HealthRequest{})
-		if wErr != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
-				"status":        "DEGRADED",
-				"active_target": activeTarget,
-				"error":         fmt.Sprintf("active wallet health check failed: %v", wErr),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"status":        "READY",
-			"active_target": activeTarget,
-			"wallet_status": wHealth.Status,
-		})
-	})
-
-	// Expose Prometheus metrics (GAP-07)
-	mux.Handle("/metrics", observability.DefaultMetrics.Handler())
-
-	publicPaths := map[string]bool{
-		"/healthz":               true,
-		"/readyz":                true,
-		"/metrics":               true,
-		"/api/v1/auth/login":     true,
-		"/api/v1/auth/refresh":   true,
-		"/api/v1/auth/token":     true,
-		"/api/v1/cluster/status": true,
-	}
-
-	// Cache fingerprint secret — any stable random value works; does not sign tokens.
-	cacheFingerprintSecret := os.Getenv("CACHE_FINGERPRINT_SECRET")
-	if cacheFingerprintSecret == "" {
-		cacheFingerprintSecret = "gateway-cache-fingerprint-key"
-	}
-	claimsC := newClaimsCache(cacheFingerprintSecret)
-
-	rateLimiter := NewRateLimiter(60, 100)
-
-	var handler http.Handler = mux
-	handler = MaxBytesMiddleware(1<<20, handler) // 1MB payload limit (GAP-SEC-05)
-	handler = CORSMiddleware(handler)
-	handler = SecurityHeadersMiddleware(handler)
-	handler = RateLimitMiddleware(rateLimiter, handler)
-	handler = AuthMiddleware(gw.authClient, claimsC, publicPaths, handler)
-	handler = observability.TraceHTTPMiddleware("api-gateway", handler) // Phase 3 (GAP-OBS-01)
+	handler := buildGatewayRouter(gw)
 
 	server := &http.Server{
 		Addr:              ":" + httpPort,
 		Handler:           handler,
-		ReadHeaderTimeout: 3 * time.Second, // Slowloris mitigation (GAP-REL-02)
+		ReadHeaderTimeout: 3 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
@@ -935,21 +971,27 @@ func main() {
 	go func() {
 		log.Printf("[API-GATEWAY] HTTP REST Gateway listening on :%s (Zero-Trust Security, Distributed Failover & OTel enabled)", httpPort)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Gateway server failure: %v", err)
+			log.Printf("Gateway server error: %v", err)
 		}
 	}()
 
-	// Phase 3 (GAP-REL-01): Graceful Shutdown on SIGINT / SIGTERM
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	sig := <-sigChan
-	log.Printf("[API-GATEWAY] Received signal %v, initiating graceful shutdown...", sig)
+	<-subCtx.Done()
+	log.Printf("[API-GATEWAY] Context cancelled, initiating graceful shutdown...")
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("[API-GATEWAY] HTTP server graceful shutdown error: %v", err)
 	}
 	log.Println("[API-GATEWAY] Graceful shutdown completed cleanly.")
+	return nil
+}
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := runGatewayServer(ctx); err != nil {
+		log.Fatalf("[FATAL] %v", err)
+	}
 }

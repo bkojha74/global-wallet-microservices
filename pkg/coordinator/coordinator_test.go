@@ -77,11 +77,11 @@ func TestMongoFailoverCoordinatorLiveIfAvailable(t *testing.T) {
 		t.Skipf("MongoDB not available for live coordinator test: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	database := client.Database("test_banking_coord_db")
 	_ = database.Drop(ctx)
-	defer database.Drop(ctx)
+	defer func() { _ = database.Drop(ctx) }()
 
 	coord := NewMongoFailoverCoordinator(database, 100*time.Millisecond)
 

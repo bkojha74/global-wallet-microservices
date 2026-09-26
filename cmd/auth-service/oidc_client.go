@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const contentTypeJSON = "application/json"
+
 // OIDCDiscoveryResponse holds standard OpenID Connect configuration metadata.
 type OIDCDiscoveryResponse struct {
 	Issuer                string `json:"issuer"`
@@ -55,12 +57,14 @@ func NewOIDCClient(ctx context.Context, issuerURL, clientID, clientSecret string
 
 	// Fetch discovery document
 	discoveryURL := cleanIssuer + "/.well-known/openid-configuration"
+	// #nosec G704 -- discoveryURL is constructed from cleanIssuer validated against trusted identity provider config
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, discoveryURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("oidc: create discovery request: %w", err)
 	}
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", contentTypeJSON)
 
+	// #nosec G704 -- outbound OIDC discovery call to configured Keycloak/OIDC issuer
 	resp, err := client.httpClient.Do(req)
 	if err != nil {
 		// If discovery fails at startup (e.g. Keycloak starting up or explicit JWKS provided), allow manual fallback
@@ -141,7 +145,7 @@ func (c *OIDCClient) AuthenticatePassword(ctx context.Context, username, passwor
 		return nil, fmt.Errorf("oidc: create login request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", contentTypeJSON)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -187,7 +191,7 @@ func (c *OIDCClient) RefreshToken(ctx context.Context, refreshToken string) (*OI
 		return nil, fmt.Errorf("oidc: create refresh request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", contentTypeJSON)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

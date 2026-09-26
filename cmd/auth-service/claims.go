@@ -77,34 +77,58 @@ func MapKeycloakClaims(kc *KeycloakTokenClaims, clientID string) *UnifiedClaims 
 		subject = kc.Subject
 	}
 
-	// Aggregate roles with deduplication
-	roleMap := make(map[string]struct{})
-	for _, r := range kc.RealmAccess.Roles {
+	return &UnifiedClaims{
+		Subject:   subject,
+		Roles:     extractKeycloakRoles(kc, clientID),
+		Scopes:    extractKeycloakScopes(kc.Scope),
+		ExpiresAt: kc.ExpiresAt,
+		IssuedAt:  kc.IssuedAt,
+		TokenID:   kc.TokenID,
+		Issuer:    kc.Issuer,
+		Audience:  normalizeAudience(kc.Audience),
+		Email:     kc.Email,
+		Provider:  "keycloak",
+	}
+}
+
+func addRealmRoles(roleMap map[string]struct{}, realmRoles []string) {
+	for _, r := range realmRoles {
 		rClean := strings.TrimSpace(r)
 		if rClean != "" && !isStandardKeycloakNoiseRole(rClean) {
 			roleMap[rClean] = struct{}{}
 		}
 	}
+}
 
-	// Also pull client-specific roles if target clientID is configured
-	if clientID != "" && kc.ResourceAccess != nil {
-		if clientRes, ok := kc.ResourceAccess[clientID]; ok {
-			for _, r := range clientRes.Roles {
-				rClean := strings.TrimSpace(r)
-				if rClean != "" {
-					roleMap[rClean] = struct{}{}
-				}
-			}
+func addClientRoles(roleMap map[string]struct{}, resAccess map[string]KeycloakResourceAccess, clientID string) {
+	if clientID == "" || resAccess == nil {
+		return
+	}
+	clientRes, ok := resAccess[clientID]
+	if !ok {
+		return
+	}
+	for _, r := range clientRes.Roles {
+		rClean := strings.TrimSpace(r)
+		if rClean != "" {
+			roleMap[rClean] = struct{}{}
 		}
 	}
+}
 
+func extractKeycloakRoles(kc *KeycloakTokenClaims, clientID string) []string {
+	roleMap := make(map[string]struct{})
+	addRealmRoles(roleMap, kc.RealmAccess.Roles)
+	addClientRoles(roleMap, kc.ResourceAccess, clientID)
 	roles := make([]string, 0, len(roleMap))
 	for r := range roleMap {
 		roles = append(roles, r)
 	}
+	return roles
+}
 
-	// Parse space-delimited scopes
-	scopeList := strings.Fields(kc.Scope)
+func extractKeycloakScopes(scopeStr string) []string {
+	scopeList := strings.Fields(scopeStr)
 	scopeMap := make(map[string]struct{})
 	for _, s := range scopeList {
 		sClean := strings.TrimSpace(s)
@@ -116,12 +140,13 @@ func MapKeycloakClaims(kc *KeycloakTokenClaims, clientID string) *UnifiedClaims 
 	for s := range scopeMap {
 		scopes = append(scopes, s)
 	}
+	return scopes
+}
 
-	// Normalize audience
-	var audStr string
-	switch v := kc.Audience.(type) {
+func normalizeAudience(rawAudience interface{}) string {
+	switch v := rawAudience.(type) {
 	case string:
-		audStr = v
+		return v
 	case []interface{}:
 		var auds []string
 		for _, item := range v {
@@ -129,20 +154,9 @@ func MapKeycloakClaims(kc *KeycloakTokenClaims, clientID string) *UnifiedClaims 
 				auds = append(auds, s)
 			}
 		}
-		audStr = strings.Join(auds, ",")
-	}
-
-	return &UnifiedClaims{
-		Subject:   subject,
-		Roles:     roles,
-		Scopes:    scopes,
-		ExpiresAt: kc.ExpiresAt,
-		IssuedAt:  kc.IssuedAt,
-		TokenID:   kc.TokenID,
-		Issuer:    kc.Issuer,
-		Audience:  audStr,
-		Email:     kc.Email,
-		Provider:  "keycloak",
+		return strings.Join(auds, ",")
+	default:
+		return ""
 	}
 }
 

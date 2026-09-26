@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"os"
+	"path/filepath"
 )
 
 // RSAKeyPair holds an RSA private key (for signing) and its corresponding public key (for verification).
@@ -18,7 +19,9 @@ type RSAKeyPair struct {
 
 // LoadRSAPrivateKey reads and parses a PKCS#8 or PKCS#1 PEM-encoded RSA private key from disk.
 func LoadRSAPrivateKey(path string) (*rsa.PrivateKey, error) {
-	data, err := os.ReadFile(path)
+	cleanPath := filepath.Clean(path)
+	// #nosec G304 -- RSA private key path is loaded from trusted configuration
+	data, err := os.ReadFile(cleanPath)
 	if err != nil {
 		return nil, err
 	}
@@ -27,7 +30,9 @@ func LoadRSAPrivateKey(path string) (*rsa.PrivateKey, error) {
 
 // LoadRSAPublicKey reads and parses a PEM-encoded RSA public key from disk.
 func LoadRSAPublicKey(path string) (*rsa.PublicKey, error) {
-	data, err := os.ReadFile(path)
+	cleanPath := filepath.Clean(path)
+	// #nosec G304 -- RSA public key path is loaded from trusted configuration
+	data, err := os.ReadFile(cleanPath)
 	if err != nil {
 		return nil, err
 	}

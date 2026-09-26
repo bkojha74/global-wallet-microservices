@@ -73,12 +73,14 @@ func (c *JWKSCache) Refresh(ctx context.Context) error {
 	}
 	c.lastAttempt = time.Now()
 
+	// #nosec G704 -- c.jwksURL is validated during OIDC discovery
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.jwksURL, nil)
 	if err != nil {
 		return fmt.Errorf("jwks: request create error: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
 
+	// #nosec G704 -- outbound request to fetch Keycloak public signing JWKS
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("jwks: fetch failed from %s: %w", c.jwksURL, err)

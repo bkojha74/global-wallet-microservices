@@ -3,6 +3,8 @@ package tlsutil
 import (
 	"context"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -39,7 +41,7 @@ func TestMutualTLSHandshakeSuccess(t *testing.T) {
 
 	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
 	walletv1.RegisterWalletServiceServer(grpcServer, &dummyWalletServer{})
-	go grpcServer.Serve(lis)
+	go func() { _ = grpcServer.Serve(lis) }()
 	defer grpcServer.Stop()
 
 	// Connect with trusted client cert
@@ -51,7 +53,7 @@ func TestMutualTLSHandshakeSuccess(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	conn, err := grpc.DialContext(ctx, lis.Addr().String(), grpc.WithTransportCredentials(credentials.NewTLS(clientTLS)), grpc.WithBlock())
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(credentials.NewTLS(clientTLS)))
 	if err != nil {
 		t.Fatalf("mTLS dial failed: %v", err)
 	}
@@ -86,7 +88,7 @@ func TestMutualTLSRejectsUntrustedClient(t *testing.T) {
 
 	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
 	walletv1.RegisterWalletServiceServer(grpcServer, &dummyWalletServer{})
-	go grpcServer.Serve(lis)
+	go func() { _ = grpcServer.Serve(lis) }()
 	defer grpcServer.Stop()
 
 	// Connect with untrusted rogue client cert
@@ -98,7 +100,7 @@ func TestMutualTLSRejectsUntrustedClient(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	conn, err := grpc.DialContext(ctx, lis.Addr().String(), grpc.WithTransportCredentials(credentials.NewTLS(untrustedTLS)), grpc.WithBlock())
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(credentials.NewTLS(untrustedTLS)))
 	if err == nil {
 		// If dial succeeded (lazy handshake), RPC must fail
 		client := walletv1.NewWalletServiceClient(conn)
@@ -107,5 +109,59 @@ func TestMutualTLSRejectsUntrustedClient(t *testing.T) {
 		if rpcErr == nil {
 			t.Fatal("expected RPC failure for untrusted client certificate, but it succeeded")
 		}
+	}
+}
+
+func TestFileBasedTransportCredentials(t *testing.T) {
+	bundle, err := GenerateTestCertificates()
+	if err != nil {
+		t.Fatalf("generate test certs: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	caPath := filepath.Join(tmpDir, "ca.pem")
+	srvCertPath := filepath.Join(tmpDir, "server.pem")
+	srvKeyPath := filepath.Join(tmpDir, "server.key")
+	cliCertPath := filepath.Join(tmpDir, "client.pem")
+	cliKeyPath := filepath.Join(tmpDir, "client.key")
+
+	_ = os.WriteFile(caPath, bundle.CACertPEM, 0o600)
+	_ = os.WriteFile(srvCertPath, bundle.ServerCertPEM, 0o600)
+	_ = os.WriteFile(srvKeyPath, bundle.ServerKeyPEM, 0o600)
+	_ = os.WriteFile(cliCertPath, bundle.ClientCertPEM, 0o600)
+	_ = os.WriteFile(cliKeyPath, bundle.ClientKeyPEM, 0o600)
+
+	// Server credentials with CA
+	srvCreds, err := NewServerTransportCredentials(srvCertPath, srvKeyPath, caPath)
+	if err != nil || srvCreds == nil {
+		t.Fatalf("expected server transport credentials, got %v", err)
+	}
+
+	// Client credentials with CA and client cert
+	cliCreds, err := NewClientTransportCredentials(cliCertPath, cliKeyPath, caPath, "localhost")
+	if err != nil || cliCreds == nil {
+		t.Fatalf("expected client transport credentials, got %v", err)
+	}
+}
+
+func TestCACertAppendErrors(t *testing.T) {
+	bundle, err := GenerateTestCertificates()
+	if err != nil {
+		t.Fatalf("generate certs: %v", err)
+	}
+
+	// Corrupt CA cert
+	bundle.CACertPEM = []byte("not-a-valid-ca-pem")
+
+	if _, err := bundle.ServerTLSConfig(); err == nil {
+		t.Fatal("expected error on corrupt CA for ServerTLSConfig")
+	}
+
+	if _, err := bundle.ClientTLSConfig("localhost"); err == nil {
+		t.Fatal("expected error on corrupt CA for ClientTLSConfig")
+	}
+
+	if _, err := bundle.UntrustedClientTLSConfig("localhost"); err == nil {
+		t.Fatal("expected error on corrupt CA for UntrustedClientTLSConfig")
 	}
 }
