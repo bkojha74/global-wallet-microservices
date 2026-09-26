@@ -21,7 +21,6 @@ import (
 	ledgerv1 "wallet-system/proto/ledger"
 )
 
-
 func TestRecordTransactionRejectsInvalidPayload(t *testing.T) {
 	tests := []struct {
 		name string
@@ -291,7 +290,7 @@ func TestCheckTrialBalanceEquilibrium(t *testing.T) {
 func TestLedgerHealthzHandler(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	w := httptest.NewRecorder()
-	
+
 	// Create healthz handler matching startLedgerMetricsServer
 	h := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		rw.Header().Set("Content-Type", "application/json")
@@ -525,7 +524,6 @@ func TestHandleInsertErrorDuplicateKeyRace(t *testing.T) {
 	}
 }
 
-
 func TestGetLedgerEntriesQueryFailure(t *testing.T) {
 	// Test the error path in GetLedgerEntries when Find fails
 	// We use a canceled context to force the find to fail
@@ -632,11 +630,6 @@ func TestGetLedgerEntriesInvalidWalletId(t *testing.T) {
 		t.Fatalf("expected InvalidArgument for empty wallet_id, got %v", err)
 	}
 }
-
-
-
-
-
 
 func TestLedgerMetricsServerHTTPEndpoints(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -777,4 +770,3 @@ func TestInitLedgerOutboxBranches(t *testing.T) {
 		t.Fatal("expected non-nil outbox and publisher when configured")
 	}
 }
-

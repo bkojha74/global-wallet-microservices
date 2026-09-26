@@ -165,4 +165,3 @@ func TestCACertAppendErrors(t *testing.T) {
 		t.Fatal("expected error on corrupt CA for UntrustedClientTLSConfig")
 	}
 }
-

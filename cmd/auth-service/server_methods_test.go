@@ -212,4 +212,3 @@ func TestAuthServer_FullTokenLifecycle(t *testing.T) {
 		t.Fatalf("RevokeToken failed: %v", err)
 	}
 }
-

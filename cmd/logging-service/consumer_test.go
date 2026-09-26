@@ -346,7 +346,3 @@ func TestReadyzEndpoint(t *testing.T) {
 		t.Fatalf("expected 503 Service Unavailable for /readyz when repo unhealthy, got %d", rec2.Code)
 	}
 }
-
-
-
-

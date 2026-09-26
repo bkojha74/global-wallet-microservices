@@ -360,5 +360,3 @@ func TestWalletServer_ValidationAndStatusChecks(t *testing.T) {
 		t.Fatalf("expected no error for ACTIVE status")
 	}
 }
-
-

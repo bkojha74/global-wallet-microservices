@@ -571,9 +571,3 @@ func TestAdminWalletStatusHandlersDetailed(t *testing.T) {
 		t.Fatalf("expected 404 Not Found, got %d", recUpdateNotFound.Code)
 	}
 }
-
-
-
-
-
-

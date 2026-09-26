@@ -202,16 +202,17 @@ type mockLogRepoImpl struct {
 	saveErr      error
 }
 
-func (m *mockLogRepoImpl) Save(ctx context.Context, event observability.Event) error { return m.saveErr }
+func (m *mockLogRepoImpl) Save(ctx context.Context, event observability.Event) error {
+	return m.saveErr
+}
 func (m *mockLogRepoImpl) Find(ctx context.Context, filter QueryFilter) ([]observability.Event, error) {
 	return nil, nil
 }
-func (m *mockLogRepoImpl) Health(ctx context.Context) error                           { return m.healthErr }
-func (m *mockLogRepoImpl) Close(ctx context.Context) error                            { return nil }
+func (m *mockLogRepoImpl) Health(ctx context.Context) error { return m.healthErr }
+func (m *mockLogRepoImpl) Close(ctx context.Context) error  { return nil }
 func (m *mockLogRepoImpl) Retention(ctx context.Context, maxAgeDays int) (int64, error) {
 	if m.retentionErr != nil {
 		return 0, m.retentionErr
 	}
 	return 5, nil
 }
-

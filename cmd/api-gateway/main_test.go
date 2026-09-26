@@ -972,8 +972,3 @@ func TestInitFailoverCoordinatorAndResolver(t *testing.T) {
 		t.Fatalf("expected 405 Method Not Allowed, got %d", rec.Code)
 	}
 }
-
-
-
-
-

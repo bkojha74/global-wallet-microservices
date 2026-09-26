@@ -771,5 +771,3 @@ func TestTLSConfigFromEnvAndPublisher(t *testing.T) {
 		t.Fatal("expected error publishing to invalid RabbitMQ URL")
 	}
 }
-
-

@@ -237,7 +237,7 @@ func (s *server) GetBalance(ctx context.Context, req *walletv1.GetBalanceRequest
 }
 
 type transferExecutionState struct {
-	finalTxnID   string
+	finalTxnID    string
 	outboxTaskID  primitive.ObjectID
 	outboxTask    LedgerTask
 	txnStatus     walletv1.TransferFundsResponse_Status
@@ -626,8 +626,8 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 
 	state := transferExecutionState{
 		finalTxnID:   primitive.NewObjectID().Hex(),
-		outboxTaskID:  primitive.NewObjectID(),
-		txnStatus:     walletv1.TransferFundsResponse_SUCCESS,
+		outboxTaskID: primitive.NewObjectID(),
+		txnStatus:    walletv1.TransferFundsResponse_SUCCESS,
 	}
 
 	_, err = session.WithTransaction(ctx, func(sessCtx mongo.SessionContext) (interface{}, error) {
@@ -646,7 +646,6 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 		HandledByRegion: s.region,
 	}, nil
 }
-
 
 func (s *server) UpdateWalletStatus(ctx context.Context, walletID, newStatus string) error {
 	db := s.db()

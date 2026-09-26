@@ -202,4 +202,3 @@ func TestRunLedgerServer_CancelledContext(t *testing.T) {
 		t.Errorf("expected clean shutdown, got: %v", err)
 	}
 }
-

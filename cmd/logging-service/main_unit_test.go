@@ -140,9 +140,9 @@ type mockAck struct {
 	nacked bool
 }
 
-func (m *mockAck) Ack(tag uint64, multiple bool) error                    { m.acked = true; return nil }
-func (m *mockAck) Nack(tag uint64, multiple bool, requeue bool) error     { m.nacked = true; return nil }
-func (m *mockAck) Reject(tag uint64, requeue bool) error                  { m.nacked = true; return nil }
+func (m *mockAck) Ack(tag uint64, multiple bool) error                { m.acked = true; return nil }
+func (m *mockAck) Nack(tag uint64, multiple bool, requeue bool) error { m.nacked = true; return nil }
+func (m *mockAck) Reject(tag uint64, requeue bool) error              { m.nacked = true; return nil }
 
 func TestConsumerProcessMessage(t *testing.T) {
 	oldBackoff := retryBackoff
@@ -259,5 +259,3 @@ func TestConsumerConsumeLoop(t *testing.T) {
 		t.Fatalf("expected nil error from Start on cancelled context")
 	}
 }
-
-

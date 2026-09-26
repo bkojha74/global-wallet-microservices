@@ -497,6 +497,3 @@ func TestDispatchImmediateLedgerSuccessLive(t *testing.T) {
 	}
 	srv.dispatchImmediateLedger(ctx, req, task, task.TransactionID)
 }
-
-
-

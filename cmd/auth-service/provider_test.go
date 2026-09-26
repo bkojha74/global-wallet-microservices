@@ -651,8 +651,3 @@ func TestLocalProvider_NameValidateAndRefreshToken(t *testing.T) {
 		t.Fatalf("expected error for Authenticate without store")
 	}
 }
-
-
-
-
-

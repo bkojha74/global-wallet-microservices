@@ -11,9 +11,9 @@ import (
 )
 
 type mockProvider struct {
-	authErr      error
-	valErr       error
-	refErr       error
+	authErr        error
+	valErr         error
+	refErr         error
 	claimsToReturn *UnifiedClaims
 	pairToReturn   *TokenPair
 }

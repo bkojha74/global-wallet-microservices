@@ -241,4 +241,3 @@ func TestRunGatewayServer_CancelledContext(t *testing.T) {
 	err := runGatewayServer(ctx)
 	t.Logf("runGatewayServer returned: %v", err)
 }
-

@@ -56,4 +56,3 @@ func TestConnectWithRetryAndEnsureIndexes(t *testing.T) {
 		t.Fatalf("EnsureWalletIndexes failed: %v", err)
 	}
 }
-
