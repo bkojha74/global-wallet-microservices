@@ -339,7 +339,7 @@ jobs:
 
   # Required status check for GitHub Branch Protection rules expecting 'Test'
   test:
-    name: Test
+    name: test
     needs: [env-setup-check, coding-standards, security-quality-sast, unit-tests, integration-tests, system-e2e-tests]
     runs-on: ubuntu-latest
     steps:
