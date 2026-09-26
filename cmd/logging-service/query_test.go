@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -133,7 +134,7 @@ func TestHandleLogs_FilterByTransactionID(t *testing.T) {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 	var resp logsResponse
-	json.NewDecoder(rec.Body).Decode(&resp)
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
 	if resp.Total != 1 {
 		t.Errorf("expected 1 event for tx-A, got %d", resp.Total)
 	}
@@ -161,7 +162,7 @@ func TestHandleLogs_FilterByLevelAndService(t *testing.T) {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 	var resp logsResponse
-	json.NewDecoder(rec.Body).Decode(&resp)
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
 	if resp.Total != 1 {
 		t.Errorf("expected 1 AUDIT wallet-service event, got %d", resp.Total)
 	}
@@ -188,7 +189,7 @@ func TestHandleLogs_FilterByTimeWindow(t *testing.T) {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 	var resp logsResponse
-	json.NewDecoder(rec.Body).Decode(&resp)
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
 	if resp.Total != 1 {
 		t.Errorf("expected 1 event in window, got %d", resp.Total)
 	}
@@ -270,7 +271,7 @@ func TestHandleTrace_Returns12EventsInOrder(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 	var resp traceResponse
-	json.NewDecoder(rec.Body).Decode(&resp)
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
 
 	if resp.AssociationID != assocID {
 		t.Errorf("expected assocID %q, got %q", assocID, resp.AssociationID)
@@ -333,7 +334,7 @@ func TestHandleTrace_EmptyResult_ReturnsDurationZero(t *testing.T) {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 	var resp traceResponse
-	json.NewDecoder(rec.Body).Decode(&resp)
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
 	if resp.TotalEvents != 0 {
 		t.Errorf("expected 0 events, got %d", resp.TotalEvents)
 	}
@@ -352,5 +353,41 @@ func TestHandleTrace_MethodNotAllowed(t *testing.T) {
 
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("expected 405, got %d", rec.Code)
+	}
+}
+
+func TestParseFilterValidationBranches(t *testing.T) {
+	// 1. Invalid 'to' parameter
+	reqBadTo := httptest.NewRequest(http.MethodGet, "/api/v1/logs?to=invalid-date", nil)
+	_, err := parseQueryFilter(reqBadTo.URL.Query())
+	if err == nil || !strings.Contains(err.Error(), "invalid 'to' parameter") {
+		t.Fatalf("expected invalid 'to' parameter error, got %v", err)
+	}
+
+	// 2. Valid 'to' parameter
+	reqGoodTo := httptest.NewRequest(http.MethodGet, "/api/v1/logs?to=2026-09-23T12:00:00Z", nil)
+	fTo, err := parseQueryFilter(reqGoodTo.URL.Query())
+	if err != nil || fTo.To.IsZero() {
+		t.Fatalf("expected parsed 'to' time, got %v, err=%v", fTo.To, err)
+	}
+
+	// 3. Invalid 'offset' parameter (negative or non-int)
+	reqBadOffset := httptest.NewRequest(http.MethodGet, "/api/v1/logs?offset=abc", nil)
+	_, err = parseQueryFilter(reqBadOffset.URL.Query())
+	if err == nil || !strings.Contains(err.Error(), "invalid 'offset' parameter") {
+		t.Fatalf("expected invalid 'offset' parameter error, got %v", err)
+	}
+
+	reqNegOffset := httptest.NewRequest(http.MethodGet, "/api/v1/logs?offset=-5", nil)
+	_, err = parseQueryFilter(reqNegOffset.URL.Query())
+	if err == nil || !strings.Contains(err.Error(), "invalid 'offset' parameter") {
+		t.Fatalf("expected invalid 'offset' parameter error, got %v", err)
+	}
+
+	// 4. Valid limit and offset
+	reqValid := httptest.NewRequest(http.MethodGet, "/api/v1/logs?limit=25&offset=50", nil)
+	fValid, err := parseQueryFilter(reqValid.URL.Query())
+	if err != nil || fValid.Limit != 25 || fValid.Offset != 50 {
+		t.Fatalf("expected limit=25, offset=50, got limit=%d, offset=%d, err=%v", fValid.Limit, fValid.Offset, err)
 	}
 }

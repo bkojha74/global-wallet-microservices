@@ -855,3 +855,40 @@ mongosh.exe --host 127.0.0.1:27017 --quiet --eval "rs.status().members.map(m => 
 ```
 
 Expected result is `PRIMARY` with `health: 1`. This verifies replica-set initialization, not automatic MongoDB failover.
+
+---
+
+## 10. Running Code Quality & Security Scanners Locally (SonarQube & GoSec)
+
+To maintain enterprise code quality and security without installing Java, SonarQube, or GoSec on your development host, both scanners are executed via containerized workflows with zero port collisions.
+
+### Port Allocation Architecture
+- **SonarQube Web UI**: `http://localhost:9000` (does not collide with any microservice: Gateway is on `8080`, Auth on `8085`, Logging on `8090`).
+- **SonarQube Database**: PostgreSQL runs on internal network port `5432` without host port mapping, preventing conflicts with local PostgreSQL instances.
+
+### Starting SonarQube Server
+Start the quality stack:
+```powershell
+docker compose -f docker-compose.quality.yml up -d
+```
+Allow ~45–60 seconds for SonarQube to complete its internal startup and initialize Elasticsearch. Verify health:
+```powershell
+curl.exe -s http://localhost:9000/api/system/status
+```
+
+### Running SonarQube Scanner
+1. Log in to SonarQube at [http://localhost:9000](http://localhost:9000) (default credentials: `admin` / `admin`).
+2. Generate an analysis token:
+   - Navigate to **User Profile** (top-right avatar) $\rightarrow$ **Security** $\rightarrow$ **Generate Token**.
+3. Run the scanner script with your token:
+   ```powershell
+   .\scripts\run-sonar-scan.bat <YOUR_TOKEN>
+   ```
+4. View real-time results, code smells, and quality gates on the SonarQube dashboard at `http://localhost:9000/dashboard?id=global-wallet`.
+
+### Running GoSec Static Application Security Testing (SAST)
+Execute the containerized GoSec scanner against all Go source packages:
+```powershell
+.\scripts\run-sast-scan.bat
+```
+This inspects for hardcoded secrets, unsafe pointer operations, SQL/NoSQL injection risks, and cryptographic vulnerabilities, returning a clean exit code `0` when zero issues are detected.

@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"wallet-system/pkg/auth"
+	"wallet-system/pkg/db"
+	authv1 "wallet-system/proto/auth"
 )
 
 func TestMapKeycloakClaims(t *testing.T) {
@@ -239,5 +241,413 @@ func TestHybridProvider_TokenRouting(t *testing.T) {
 	}
 	if !hasScope(claims2.Scopes, "wallet:transfer") {
 		t.Errorf("expected scope 'wallet:transfer' on kc token, got %v", claims2.Scopes)
+	}
+}
+
+func TestNormalizeAudience(t *testing.T) {
+	// String
+	if aud := normalizeAudience("my-app"); aud != "my-app" {
+		t.Fatalf("expected my-app, got %s", aud)
+	}
+
+	// Slice of interfaces
+	list := []interface{}{"aud1", "aud2"}
+	if aud := normalizeAudience(list); aud != "aud1,aud2" {
+		t.Fatalf("expected aud1,aud2, got %s", aud)
+	}
+
+	// Unsupported type
+	if aud := normalizeAudience(12345); aud != "" {
+		t.Fatalf("expected empty string, got %s", aud)
+	}
+}
+
+func TestStandardNoiseFilters(t *testing.T) {
+	if !isStandardKeycloakNoiseRole("offline_access") {
+		t.Fatal("expected offline_access to be noise role")
+	}
+	if !isStandardKeycloakNoiseRole("uma_authorization") {
+		t.Fatal("expected uma_authorization to be noise role")
+	}
+	if isStandardKeycloakNoiseRole("admin") {
+		t.Fatal("admin is not noise role")
+	}
+
+	if !isStandardOIDCNoiseScope("openid") || !isStandardOIDCNoiseScope("profile") || !isStandardOIDCNoiseScope("email") {
+		t.Fatal("expected standard scopes to be noise")
+	}
+	if isStandardOIDCNoiseScope("wallet:read") {
+		t.Fatal("wallet:read should not be noise")
+	}
+}
+
+func TestAddClientRolesEdgeCases(t *testing.T) {
+	roleMap := make(map[string]struct{})
+	// Empty clientID
+	addClientRoles(roleMap, nil, "")
+	if len(roleMap) != 0 {
+		t.Fatal("expected 0 roles")
+	}
+
+	// Missing clientID in resource access
+	resAccess := map[string]KeycloakResourceAccess{
+		"other-client": {Roles: []string{"admin"}},
+	}
+	addClientRoles(roleMap, resAccess, "my-client")
+	if len(roleMap) != 0 {
+		t.Fatal("expected 0 roles")
+	}
+
+	// Populated clientID with whitespace
+	resAccess["my-client"] = KeycloakResourceAccess{Roles: []string{"  manager  ", ""}}
+	addClientRoles(roleMap, resAccess, "my-client")
+	if _, ok := roleMap["manager"]; !ok {
+		t.Fatal("expected manager role in roleMap")
+	}
+}
+
+func TestAuthServerValidationAndAuthorize(t *testing.T) {
+	srv := &authServer{}
+
+	// ValidateToken: missing token
+	vResp, err := srv.ValidateToken(context.Background(), &authv1.ValidateTokenRequest{Token: ""})
+	if err != nil || vResp.Valid {
+		t.Fatalf("expected invalid token response, got valid=%v, err=%v", vResp.Valid, err)
+	}
+
+	// IssueToken: missing username/password
+	_, err = srv.IssueToken(context.Background(), &authv1.IssueTokenRequest{})
+	if err == nil {
+		t.Fatal("expected error for empty credentials")
+	}
+
+	// RefreshToken: missing refresh token
+	_, err = srv.RefreshToken(context.Background(), &authv1.RefreshTokenRequest{})
+	if err == nil {
+		t.Fatal("expected error for empty refresh token")
+	}
+
+	// Authorize: missing subject
+	authResp, err := srv.Authorize(context.Background(), &authv1.AuthorizeRequest{Subject: ""})
+	if err != nil || authResp.Allowed {
+		t.Fatalf("expected disallowed for empty subject, got %+v", authResp)
+	}
+
+	// Authorize: admin role bypasses
+	adminResp, err := srv.Authorize(context.Background(), &authv1.AuthorizeRequest{
+		Subject: "admin-user",
+		Roles:   []string{auth.RoleAdmin},
+	})
+	if err != nil || !adminResp.Allowed {
+		t.Fatalf("expected allowed for admin, got %+v", adminResp)
+	}
+
+	// Authorize: cluster admin with and without scope
+	clResp1, _ := srv.Authorize(context.Background(), &authv1.AuthorizeRequest{
+		Subject:  "cluster-user",
+		Resource: "cluster:failover",
+		Scopes:   []string{auth.ScopeClusterAdmin},
+	})
+	if !clResp1.Allowed {
+		t.Fatalf("expected cluster admin allowed, got %+v", clResp1)
+	}
+
+	clResp2, _ := srv.Authorize(context.Background(), &authv1.AuthorizeRequest{
+		Subject:  "cluster-user",
+		Resource: "cluster:failover",
+		Scopes:   []string{"wallet:read"},
+	})
+	if clResp2.Allowed {
+		t.Fatal("expected cluster admin disallowed without scope")
+	}
+
+	// Authorize: ledger audit with and without scope
+	ledResp1, _ := srv.Authorize(context.Background(), &authv1.AuthorizeRequest{
+		Subject:  "auditor",
+		Resource: "ledger:entries",
+		Scopes:   []string{auth.ScopeLedgerAudit},
+	})
+	if !ledResp1.Allowed {
+		t.Fatalf("expected ledger audit allowed, got %+v", ledResp1)
+	}
+
+	ledResp2, _ := srv.Authorize(context.Background(), &authv1.AuthorizeRequest{
+		Subject:  "auditor",
+		Resource: "ledger:entries",
+		Scopes:   []string{},
+	})
+	if ledResp2.Allowed {
+		t.Fatal("expected ledger audit disallowed without scope")
+	}
+
+	// Authorize: unknown resource
+	unkResp, _ := srv.Authorize(context.Background(), &authv1.AuthorizeRequest{
+		Subject:  "user-1",
+		Resource: "unknown:resource",
+	})
+	if unkResp.Allowed || unkResp.Reason != "no matching policy" {
+		t.Fatalf("expected no matching policy, got %+v", unkResp)
+	}
+
+	// Authorize: wallet unsupported action
+	wBadAction, _ := srv.Authorize(context.Background(), &authv1.AuthorizeRequest{
+		Subject:  "alice",
+		Resource: "wallet:w1",
+		Action:   "delete",
+	})
+	if wBadAction.Allowed || wBadAction.Reason != "unsupported wallet action" {
+		t.Fatalf("expected unsupported wallet action, got %+v", wBadAction)
+	}
+
+	// Authorize: wallet missing scope
+	wMissingScope, _ := srv.Authorize(context.Background(), &authv1.AuthorizeRequest{
+		Subject:  "alice",
+		Resource: "wallet:w1",
+		Action:   "read",
+		Scopes:   []string{"wallet:transfer"},
+	})
+	if wMissingScope.Allowed {
+		t.Fatal("expected wallet missing scope to be disallowed")
+	}
+
+	// Authorize: wallet with nil store (allowed)
+	wAllowed, _ := srv.Authorize(context.Background(), &authv1.AuthorizeRequest{
+		Subject:  "alice",
+		Resource: "wallet:w1",
+		Action:   "read",
+		Scopes:   []string{"wallet:read"},
+	})
+	if !wAllowed.Allowed {
+		t.Fatalf("expected wallet read to be allowed, got %+v", wAllowed)
+	}
+
+	// HealthCheck
+	hResp, err := srv.HealthCheck(context.Background(), nil)
+	if err != nil || hResp.Status != "SERVING" {
+		t.Fatalf("expected SERVING status, got %+v, err=%v", hResp, err)
+	}
+
+	// resolveScopes helper
+	scopesEmptyReq := resolveScopes([]string{auth.RoleUser}, []string{"wallet:read"}, nil)
+	if len(scopesEmptyReq) == 0 {
+		t.Fatal("expected non-empty default scopes")
+	}
+	scopesFiltered := resolveScopes([]string{auth.RoleUser}, []string{"wallet:read"}, []string{"wallet:read", "wallet:write"})
+	if len(scopesFiltered) != 1 || scopesFiltered[0] != "wallet:read" {
+		t.Fatalf("expected only wallet:read, got %v", scopesFiltered)
+	}
+}
+
+func TestParseAuthConfig(t *testing.T) {
+	// 1. Defaults
+	t.Setenv("AUTH_SERVICE_PORT", "")
+	t.Setenv("MONGO_URI", "")
+	t.Setenv("ENVIRONMENT", "")
+	t.Setenv("AUTH_PROVIDER", "")
+	t.Setenv("KEYCLOAK_URL", "")
+
+	cfg := parseAuthConfig()
+	if cfg.port != "50054" || cfg.environment != "local" || cfg.authProviderType != "local" {
+		t.Fatalf("unexpected defaults: %+v", cfg)
+	}
+
+	// 2. Hybrid detection via KEYCLOAK_URL
+	t.Setenv("KEYCLOAK_URL", "http://keycloak:8080")
+	cfgHybrid := parseAuthConfig()
+	if cfgHybrid.authProviderType != "hybrid" {
+		t.Fatalf("expected hybrid, got %s", cfgHybrid.authProviderType)
+	}
+
+	// 3. Explicit provider and port
+	t.Setenv("AUTH_PROVIDER", "KEYCLOAK")
+	t.Setenv("AUTH_SERVICE_PORT", "9999")
+	cfgExplicit := parseAuthConfig()
+	if cfgExplicit.authProviderType != "keycloak" || cfgExplicit.port != "9999" {
+		t.Fatalf("expected keycloak/9999, got %+v", cfgExplicit)
+	}
+}
+
+func TestAuthorizeWalletOwnershipLive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client, err := db.ConnectWithRetry(ctx, db.DefaultMongoURI(), 2)
+	if err != nil {
+		t.Skipf("MongoDB not reachable: %v", err)
+		return
+	}
+	defer func() { _ = client.Disconnect(ctx) }()
+
+	authDB := client.Database("auth_db")
+	userStore, storeErr := NewUserStore(authDB)
+	if storeErr != nil {
+		t.Fatalf("NewUserStore failed: %v", storeErr)
+	}
+
+	srv := &authServer{
+		store: userStore,
+	}
+
+	// 1. User does not own wallet (record doesn't exist)
+	respNotOwner, _ := srv.Authorize(ctx, &authv1.AuthorizeRequest{
+		Subject:  "bob_unowned",
+		Resource: "wallet:w999",
+		Action:   "read",
+		Scopes:   []string{"wallet:read"},
+	})
+	if respNotOwner.Allowed {
+		t.Fatal("expected unowned wallet to be rejected")
+	}
+
+	// 2. User owns wallet
+	_ = userStore.CreateUser(ctx, "charlie_owner", "pwd123", "charlie@test.com", []string{auth.RoleUser}, []string{"wallet:read"})
+	_ = userStore.AddWalletToUser(ctx, "charlie_owner", "w-charlie-1")
+
+	respOwner, _ := srv.Authorize(ctx, &authv1.AuthorizeRequest{
+		Subject:  "charlie_owner",
+		Resource: "wallet:w-charlie-1",
+		Action:   "read",
+		Scopes:   []string{"wallet:read"},
+	})
+	if !respOwner.Allowed {
+		t.Fatalf("expected owner to be allowed, got %+v", respOwner)
+	}
+
+	// 3. Ownership check error (canceled context)
+	cancCtx, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
+	respErr, _ := srv.Authorize(cancCtx, &authv1.AuthorizeRequest{
+		Subject:  "charlie_owner",
+		Resource: "wallet:w-charlie-1",
+		Action:   "read",
+		Scopes:   []string{"wallet:read"},
+	})
+	if respErr.Allowed || respErr.Reason != "ownership check failed" {
+		t.Fatalf("expected ownership check failed on error, got %+v", respErr)
+	}
+}
+
+func TestSetupIdentityProvider(t *testing.T) {
+	local := &LocalProvider{}
+	t.Setenv("KEYCLOAK_URL", "")
+	t.Setenv("KEYCLOAK_JWKS_URL", "")
+
+	// 1. Local fallback when KEYCLOAK_URL is empty
+	p1 := setupIdentityProvider("keycloak", local)
+	if p1 != local {
+		t.Fatal("expected fallback to local provider")
+	}
+
+	// 2. Hybrid provider when KEYCLOAK_URL is provided
+	t.Setenv("KEYCLOAK_URL", "http://keycloak:8080")
+	t.Setenv("KEYCLOAK_JWKS_URL", "http://keycloak:8080/jwks")
+	pHybrid := setupIdentityProvider("hybrid", local)
+	if pHybrid == nil {
+		t.Fatal("expected hybrid provider, got nil")
+	}
+
+	// 3. Default fallback
+	pDefault := setupIdentityProvider("unknown", local)
+	if pDefault == nil {
+		t.Fatal("expected default provider, got nil")
+	}
+}
+
+func TestBuildTokenEngine(t *testing.T) {
+	// 1. HS256 default
+	t.Setenv("AUTH_PRIVATE_KEY_PATH", "")
+	t.Setenv("AUTH_PUBLIC_KEY_PATH", "")
+	t.Setenv("JWT_SECRET", "test-secret-12345678901234567890")
+
+	e1, err := buildTokenEngine()
+	if err != nil || e1 == nil {
+		t.Fatalf("expected HS256 engine, got err=%v", err)
+	}
+
+	// 2. Invalid RSA path
+	t.Setenv("AUTH_PRIVATE_KEY_PATH", "/non/existent/path.pem")
+	t.Setenv("AUTH_PUBLIC_KEY_PATH", "/non/existent/path.pub")
+	_, err2 := buildTokenEngine()
+	if err2 == nil {
+		t.Fatal("expected error for non-existent key path")
+	}
+}
+
+func TestSeedDefaultAdmin(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client, err := db.ConnectWithRetry(ctx, db.DefaultMongoURI(), 2)
+	if err != nil {
+		t.Skipf("MongoDB not reachable: %v", err)
+		return
+	}
+	defer func() { _ = client.Disconnect(ctx) }()
+
+	authDB := client.Database("auth_db_test_seed")
+	_ = authDB.Drop(ctx)
+	userStore, err := NewUserStore(authDB)
+	if err != nil {
+		t.Fatalf("NewUserStore failed: %v", err)
+	}
+
+	t.Setenv("ADMIN_USERNAME", "testadmin")
+	t.Setenv("ADMIN_PASSWORD", "testpass123")
+
+	seedDefaultAdmin(ctx, userStore)
+
+	// Verify admin exists
+	u, err := userStore.FindByUsername(ctx, "testadmin")
+	if err != nil || u == nil {
+		t.Fatalf("expected admin user to be created, got err=%v", err)
+	}
+
+	// Idempotent: seed again when user already exists
+	seedDefaultAdmin(ctx, userStore)
+}
+
+func TestLocalProvider_NameValidateAndRefreshToken(t *testing.T) {
+	engine := NewHS256Engine("test-secret-32-bytes-long-key-1234567")
+	userStore, _ := NewUserStore(nil)
+	revStore, _ := NewRevocationStore(nil)
+	p := NewLocalProvider(userStore, engine, revStore)
+
+	if p.Name() != "local" {
+		t.Fatalf("expected name 'local', got %s", p.Name())
+	}
+
+	// Validate token issued by engine
+	claims := auth.Claims{
+		Subject:  "alice",
+		Roles:    []string{"user"},
+		Scopes:   []string{"wallet:read"},
+		IssuedAt: time.Now().Unix(),
+	}
+	tokenStr, err := engine.IssueAccessToken(claims)
+	if err != nil {
+		t.Fatalf("failed to issue token: %v", err)
+	}
+
+	uClaims, err := p.ValidateToken(context.Background(), tokenStr)
+	if err != nil || uClaims.Subject != "alice" {
+		t.Fatalf("ValidateToken failed, got %+v, err: %v", uClaims, err)
+	}
+
+	// Invalid token
+	_, errInvalid := p.ValidateToken(context.Background(), "invalid.jwt.token")
+	if errInvalid == nil {
+		t.Fatalf("expected error for invalid token")
+	}
+
+	// RefreshToken with nil store -> returns error
+	_, _, errRefresh := p.RefreshToken(context.Background(), "some-refresh-token")
+	if errRefresh == nil {
+		t.Fatalf("expected error for RefreshToken without store")
+	}
+
+	// Authenticate with nil store -> returns error
+	_, _, errAuth := p.Authenticate(context.Background(), "alice", "pass", nil)
+	if errAuth == nil {
+		t.Fatalf("expected error for Authenticate without store")
 	}
 }

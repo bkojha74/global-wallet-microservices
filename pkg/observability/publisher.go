@@ -28,7 +28,6 @@ const (
 // to the local FileSpool. Metrics are reported to the provided MetricsRegistry so
 // that each service can expose them at GET /metrics (GAP-07).
 type AsyncLogger struct {
-	mu          sync.Mutex
 	service     string
 	environment string
 	region      string
@@ -42,41 +41,64 @@ type AsyncLogger struct {
 	metrics     *MetricsRegistry
 }
 
-func NewAsyncLogger(service, environment, region string, publisher EventPublisher, spool *FileSpool, bufferSize int, writer io.Writer) *AsyncLogger {
-	return NewAsyncLoggerWithInstance(service, environment, region, ResolveInstanceID(), publisher, spool, bufferSize, writer)
+// AsyncLoggerConfig holds the configuration for an AsyncLogger.
+type AsyncLoggerConfig struct {
+	Service     string
+	Environment string
+	Region      string
+	InstanceID  string
+	Publisher   EventPublisher
+	Spool       *FileSpool
+	BufferSize  int
+	Writer      io.Writer
+	Metrics     *MetricsRegistry
 }
 
-func NewAsyncLoggerWithInstance(service, environment, region, instanceID string, publisher EventPublisher, spool *FileSpool, bufferSize int, writer io.Writer) *AsyncLogger {
-	return NewAsyncLoggerFull(service, environment, region, instanceID, publisher, spool, bufferSize, writer, DefaultMetrics)
-}
-
-// NewAsyncLoggerFull is the primary constructor; callers can supply a custom MetricsRegistry
-// for isolated testing. Production code should use NewAsyncLoggerWithInstance (uses DefaultMetrics).
-func NewAsyncLoggerFull(service, environment, region, instanceID string, publisher EventPublisher, spool *FileSpool, bufferSize int, writer io.Writer, metrics *MetricsRegistry) *AsyncLogger {
-	if instanceID == "" {
-		instanceID = ResolveInstanceID()
+// NewAsyncLoggerConfigured creates an AsyncLogger using an AsyncLoggerConfig struct.
+func NewAsyncLoggerConfigured(cfg AsyncLoggerConfig) *AsyncLogger {
+	if cfg.InstanceID == "" {
+		cfg.InstanceID = ResolveInstanceID()
 	}
-	if bufferSize <= 0 {
-		bufferSize = 256
+	if cfg.BufferSize <= 0 {
+		cfg.BufferSize = 256
 	}
-	if metrics == nil {
-		metrics = NewMetricsRegistry()
+	if cfg.Metrics == nil {
+		cfg.Metrics = DefaultMetrics
 	}
 	logger := &AsyncLogger{
-		service:     service,
-		environment: environment,
-		region:      region,
-		instanceID:  instanceID,
-		publisher:   publisher,
-		spool:       spool,
-		queue:       make(chan Event, bufferSize),
+		service:     cfg.Service,
+		environment: cfg.Environment,
+		region:      cfg.Region,
+		instanceID:  cfg.InstanceID,
+		publisher:   cfg.Publisher,
+		spool:       cfg.Spool,
+		queue:       make(chan Event, cfg.BufferSize),
 		stop:        make(chan struct{}),
 		stopped:     make(chan struct{}),
-		standard:    log.New(writer, "", 0),
-		metrics:     metrics,
+		standard:    log.New(cfg.Writer, "", 0),
+		metrics:     cfg.Metrics,
 	}
 	go logger.run()
 	return logger
+}
+
+// NewAsyncLogger creates an AsyncLogger with default configuration.
+func NewAsyncLogger(service, environment, region string, publisher EventPublisher, spool *FileSpool, bufferSize int, writer io.Writer) *AsyncLogger {
+	return NewAsyncLoggerConfigured(AsyncLoggerConfig{
+		Service:     service,
+		Environment: environment,
+		Region:      region,
+		Publisher:   publisher,
+		Spool:       spool,
+		BufferSize:  bufferSize,
+		Writer:      writer,
+		Metrics:     DefaultMetrics,
+	})
+}
+
+// NewAsyncLoggerFull creates an AsyncLogger from the provided AsyncLoggerConfig.
+func NewAsyncLoggerFull(cfg AsyncLoggerConfig) *AsyncLogger {
+	return NewAsyncLoggerConfigured(cfg)
 }
 
 // MetricsHandler returns the Prometheus-format HTTP handler for this logger's registry.
@@ -171,12 +193,15 @@ func (l *AsyncLogger) publish(event Event) {
 	}
 }
 
-func (l *AsyncLogger) Sync(ctx context.Context) error {
+func (s *AsyncLogger) Sync(ctx context.Context) error {
 	select {
-	case <-l.stopped:
-		return l.replayAndCount(ctx)
+	case <-s.stopped:
+		return s.replayAndCount(ctx)
 	case <-ctx.Done():
 		return ctx.Err()
+	default:
+		s.metrics.SetQueueDepth(s.service, len(s.queue))
+		return nil
 	}
 }
 
@@ -333,6 +358,7 @@ func (p *RabbitPublisher) reconnectLoop() {
 		} else {
 			consecutiveFailures++
 			// Jitter ±20%: factor in range [0.8, 1.2]
+			// #nosec G404 -- jitter backoff does not require cryptographic randomness
 			jitterFactor := 0.8 + (rand.Float64() * 0.4)
 			sleepDuration := time.Duration(float64(currentInterval) * jitterFactor)
 
@@ -476,7 +502,9 @@ func TLSConfigFromEnv() (*tls.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("TLS: failed to load client cert/key (%s/%s): %w", certFile, keyFile, err)
 	}
-	caPEM, err := os.ReadFile(caFile)
+	cleanCA := filepath.Clean(caFile)
+	// #nosec G304,G703 -- CA certificate path is loaded from trusted environment configuration
+	caPEM, err := os.ReadFile(cleanCA)
 	if err != nil {
 		return nil, fmt.Errorf("TLS: failed to read CA cert (%s): %w", caFile, err)
 	}
@@ -520,12 +548,15 @@ func LoggerFromEnvironment(service, environment, region string, writer io.Writer
 		log.Printf("[LOGGING-SDK] TLS enabled for RabbitMQ connection")
 	}
 
-	return NewAsyncLoggerFull(
-		service, environment, region, instanceID,
-		NewRabbitPublisherWithTLS(url, exchange, tlsCfg),
-		NewFileSpool(spoolPath),
-		256,
-		writer,
-		DefaultMetrics,
-	)
+	return NewAsyncLoggerFull(AsyncLoggerConfig{
+		Service:     service,
+		Environment: environment,
+		Region:      region,
+		InstanceID:  instanceID,
+		Publisher:   NewRabbitPublisherWithTLS(url, exchange, tlsCfg),
+		Spool:       NewFileSpool(spoolPath),
+		BufferSize:  256,
+		Writer:      writer,
+		Metrics:     DefaultMetrics,
+	})
 }

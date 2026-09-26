@@ -270,4 +270,31 @@ func TestValidateWalletOwnershipIDOR(t *testing.T) {
 	if err := ValidateWalletOwnership(adminClaims, "bob"); err != nil {
 		t.Fatalf("expected admin allowed on any wallet, got: %v", err)
 	}
+
+	// Nil claims -> Insufficient perms
+	if err := ValidateWalletOwnership(nil, "bob"); err != auth.ErrInsufficientPerms {
+		t.Fatalf("expected ErrInsufficientPerms for nil claims, got: %v", err)
+	}
+
+	// tokenErrorMessage helper
+	if msg := tokenErrorMessage(authv1.TokenErrorCode_TOKEN_EXPIRED); msg != "token has expired" {
+		t.Fatalf("unexpected msg for expired token: %s", msg)
+	}
+	if msg := tokenErrorMessage(authv1.TokenErrorCode_TOKEN_REVOKED); msg != "token has been revoked" {
+		t.Fatalf("unexpected msg for revoked token: %s", msg)
+	}
+	if msg := tokenErrorMessage(authv1.TokenErrorCode_TOKEN_INVALID_SIG); msg != "token signature is invalid" {
+		t.Fatalf("unexpected msg for invalid sig: %s", msg)
+	}
+
+	// claimsCache invalidate
+	c := newClaimsCache("secret")
+	c.set("t1", &auth.Claims{Subject: "sub1"})
+	if _, ok := c.get("t1"); !ok {
+		t.Fatalf("expected t1 in cache")
+	}
+	c.invalidate("t1")
+	if _, ok := c.get("t1"); ok {
+		t.Fatalf("expected t1 invalidated")
+	}
 }

@@ -1,4 +1,4 @@
-.PHONY: up up-mongodb up-queue up-auth up-logging up-monitoring up-app down down-mongodb down-queue down-auth down-logging down-monitoring down-app logs test clean k8s-build k8s-deploy
+.PHONY: up up-mongodb up-queue up-auth up-logging up-monitoring up-quality up-app down down-mongodb down-queue down-auth down-logging down-monitoring down-quality down-app logs test clean k8s-build k8s-deploy sonar-scan sast-scan
 
 up: up-mongodb up-queue up-auth up-logging
 	docker compose -f docker-compose.yml up --build -d
@@ -25,6 +25,11 @@ up-monitoring:
 	docker network inspect wallet_shared_net >/dev/null 2>&1 || docker network create wallet_shared_net
 	docker compose -f docker-compose.monitoring.yml up -d
 
+up-quality:
+	docker network inspect wallet_shared_net >/dev/null 2>&1 || docker network create wallet_shared_net
+	docker compose -f docker-compose.quality.yml up -d
+	@echo "SonarQube is starting up at http://localhost:9000 (Default login: admin/admin). Please allow ~45-60s for initialization."
+
 up-app:
 	docker compose -f docker-compose.yml up --build -d
 
@@ -41,6 +46,9 @@ down-app:
 
 down-monitoring:
 	docker compose -f docker-compose.monitoring.yml down
+
+down-quality:
+	docker compose -f docker-compose.quality.yml down
 
 down-logging:
 	docker compose -f docker-compose.logging.yml down
@@ -60,6 +68,14 @@ logs:
 test:
 	@chmod +x scripts/test-e2e.sh
 	./scripts/test-e2e.sh
+
+sonar-scan:
+	@chmod +x scripts/run-sonar-scan.sh
+	./scripts/run-sonar-scan.sh
+
+sast-scan:
+	@chmod +x scripts/run-sast-scan.sh
+	./scripts/run-sast-scan.sh
 
 clean:
 	docker compose -f docker-compose.yml down -v --rmi all

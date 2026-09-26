@@ -13,9 +13,15 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"path/filepath"
 	"time"
 
 	"google.golang.org/grpc/credentials"
+)
+
+const (
+	errFailedToAppendCACert = "failed to append CA cert"
+	pemTypeECPrivateKey     = "EC PRIVATE KEY"
 )
 
 // NewServerTransportCredentials loads TLS credentials for a gRPC server.
@@ -32,7 +38,9 @@ func NewServerTransportCredentials(certFile, keyFile, caFile string) (credential
 	}
 
 	if caFile != "" {
-		caBytes, err := os.ReadFile(caFile)
+		cleanCA := filepath.Clean(caFile)
+		// #nosec G304 -- CA certificate path is loaded from trusted system or test configuration
+		caBytes, err := os.ReadFile(cleanCA)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read CA certificate: %w", err)
 		}
@@ -64,7 +72,9 @@ func NewClientTransportCredentials(certFile, keyFile, caFile, serverName string)
 	}
 
 	if caFile != "" {
-		caBytes, err := os.ReadFile(caFile)
+		cleanCA := filepath.Clean(caFile)
+		// #nosec G304 -- CA certificate path is loaded from trusted system or test configuration
+		caBytes, err := os.ReadFile(cleanCA)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read CA certificate: %w", err)
 		}
@@ -97,7 +107,7 @@ func (b *TestCertBundle) ServerTLSConfig() (*tls.Config, error) {
 	}
 	caPool := x509.NewCertPool()
 	if !caPool.AppendCertsFromPEM(b.CACertPEM) {
-		return nil, errors.New("failed to append CA cert")
+		return nil, errors.New(errFailedToAppendCACert)
 	}
 
 	return &tls.Config{
@@ -116,7 +126,7 @@ func (b *TestCertBundle) ClientTLSConfig(serverName string) (*tls.Config, error)
 	}
 	caPool := x509.NewCertPool()
 	if !caPool.AppendCertsFromPEM(b.CACertPEM) {
-		return nil, errors.New("failed to append CA cert")
+		return nil, errors.New(errFailedToAppendCACert)
 	}
 
 	return &tls.Config{
@@ -135,7 +145,7 @@ func (b *TestCertBundle) UntrustedClientTLSConfig(serverName string) (*tls.Confi
 	}
 	caPool := x509.NewCertPool()
 	if !caPool.AppendCertsFromPEM(b.CACertPEM) {
-		return nil, errors.New("failed to append CA cert")
+		return nil, errors.New(errFailedToAppendCACert)
 	}
 
 	return &tls.Config{
@@ -195,7 +205,7 @@ func GenerateTestCertificates() (*TestCertBundle, error) {
 	}
 	serverCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverBytes})
 	serverKeyBytes, _ := x509.MarshalECPrivateKey(serverPrivKey)
-	serverKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: serverKeyBytes})
+	serverKeyPEM := pem.EncodeToMemory(&pem.Block{Type: pemTypeECPrivateKey, Bytes: serverKeyBytes})
 
 	// 3. Client Certificate
 	clientPrivKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -219,7 +229,7 @@ func GenerateTestCertificates() (*TestCertBundle, error) {
 	}
 	clientCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientBytes})
 	clientKeyBytes, _ := x509.MarshalECPrivateKey(clientPrivKey)
-	clientKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: clientKeyBytes})
+	clientKeyPEM := pem.EncodeToMemory(&pem.Block{Type: pemTypeECPrivateKey, Bytes: clientKeyBytes})
 
 	// 4. Untrusted Client Certificate (signed by a rogue CA)
 	roguePrivKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -247,7 +257,7 @@ func GenerateTestCertificates() (*TestCertBundle, error) {
 	untrustedBytes, _ := x509.CreateCertificate(rand.Reader, untrustedTemplate, rogueCACert, &untrustedPrivKey.PublicKey, roguePrivKey)
 	untrustedCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: untrustedBytes})
 	untrustedKeyBytes, _ := x509.MarshalECPrivateKey(untrustedPrivKey)
-	untrustedKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: untrustedKeyBytes})
+	untrustedKeyPEM := pem.EncodeToMemory(&pem.Block{Type: pemTypeECPrivateKey, Bytes: untrustedKeyBytes})
 
 	return &TestCertBundle{
 		CACertPEM:              caPEM,

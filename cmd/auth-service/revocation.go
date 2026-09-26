@@ -35,6 +35,9 @@ type RevocationStore struct {
 // NewRevocationStore creates a RevocationStore and ensures the TTL index exists.
 func NewRevocationStore(db *mongo.Database) (*RevocationStore, error) {
 	s := &RevocationStore{db: db}
+	if db == nil {
+		return s, nil
+	}
 	if err := s.ensureIndexes(context.Background()); err != nil {
 		return nil, fmt.Errorf("revocation_store: index setup failed: %w", err)
 	}
@@ -45,7 +48,7 @@ func NewRevocationStore(db *mongo.Database) (*RevocationStore, error) {
 func (s *RevocationStore) ensureIndexes(ctx context.Context) error {
 	// TTL index: MongoDB auto-removes documents after their expires_at
 	_, err := s.col().Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys:    bson.D{{Key: "expires_at", Value: 1}},
+		Keys:    bson.D{bson.E{Key: "expires_at", Value: 1}},
 		Options: options.Index().SetExpireAfterSeconds(0).SetName("idx_revoked_ttl"),
 	})
 	if err != nil && !strings.Contains(err.Error(), "11000") {
@@ -54,7 +57,7 @@ func (s *RevocationStore) ensureIndexes(ctx context.Context) error {
 
 	// Unique index on token_id to prevent duplicate revocation entries
 	_, err = s.col().Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys:    bson.D{{Key: "token_id", Value: 1}},
+		Keys:    bson.D{bson.E{Key: "token_id", Value: 1}},
 		Options: options.Index().SetUnique(true).SetSparse(true).SetName("idx_token_id_unique"),
 	})
 	if err != nil && !strings.Contains(err.Error(), "11000") {
@@ -69,6 +72,9 @@ func (s *RevocationStore) ensureIndexes(ctx context.Context) error {
 // tokenID is the JWT "jti" claim. expiresAt is when the original token would have expired
 // (used for TTL — the blocklist entry is automatically cleaned up after that time).
 func (s *RevocationStore) Revoke(ctx context.Context, tokenID, subject, reason string, expiresAt time.Time) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
 	rec := RevokedTokenRecord{
 		ID:        primitive.NewObjectID(),
 		TokenID:   tokenID,
@@ -91,6 +97,9 @@ func (s *RevocationStore) Revoke(ctx context.Context, tokenID, subject, reason s
 
 // IsRevoked returns true if the given token ID appears in the blocklist.
 func (s *RevocationStore) IsRevoked(ctx context.Context, tokenID string) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, nil
+	}
 	count, err := s.col().CountDocuments(ctx, bson.M{"token_id": tokenID})
 	if err != nil {
 		return false, fmt.Errorf("revocation_store: check failed: %w", err)
@@ -101,6 +110,9 @@ func (s *RevocationStore) IsRevoked(ctx context.Context, tokenID string) (bool, 
 // PurgeExpired explicitly removes expired revocation records.
 // Normally handled by MongoDB TTL, but this can be called for immediate cleanup.
 func (s *RevocationStore) PurgeExpired(ctx context.Context) (int64, error) {
+	if s == nil || s.db == nil {
+		return 0, nil
+	}
 	res, err := s.col().DeleteMany(ctx, bson.M{
 		"expires_at": bson.M{"$lt": time.Now().UTC()},
 	})
@@ -111,5 +123,8 @@ func (s *RevocationStore) PurgeExpired(ctx context.Context) (int64, error) {
 }
 
 func (s *RevocationStore) col() *mongo.Collection {
+	if s == nil || s.db == nil {
+		return nil
+	}
 	return s.db.Collection("revoked_tokens")
 }

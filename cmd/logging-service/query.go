@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -31,10 +33,7 @@ func registerQueryRoutes(mux *http.ServeMux, repo LogRepository) {
 	mux.HandleFunc("/api/v1/traces/", handleTrace(repo))
 }
 
-// handleLogs implements GET /api/v1/logs with optional query parameters:
-//
-//	transaction_id, association_id, service, level, from (RFC3339), to (RFC3339),
-//	limit (default 100, max 1000), offset (default 0).
+// handleLogs implements GET /api/v1/logs with optional query parameters.
 func handleLogs(repo LogRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -42,45 +41,10 @@ func handleLogs(repo LogRepository) http.HandlerFunc {
 			return
 		}
 
-		q := r.URL.Query()
-		filter := QueryFilter{
-			TransactionID: q.Get("transaction_id"),
-			AssociationID: q.Get("association_id"),
-			Service:       q.Get("service"),
-			Level:         q.Get("level"),
-		}
-
-		if fromStr := q.Get("from"); fromStr != "" {
-			t, err := time.Parse(time.RFC3339, fromStr)
-			if err != nil {
-				http.Error(w, "invalid 'from' parameter: must be RFC3339 (e.g. 2026-09-14T00:00:00Z)", http.StatusBadRequest)
-				return
-			}
-			filter.From = t
-		}
-		if toStr := q.Get("to"); toStr != "" {
-			t, err := time.Parse(time.RFC3339, toStr)
-			if err != nil {
-				http.Error(w, "invalid 'to' parameter: must be RFC3339 (e.g. 2026-09-14T23:59:59Z)", http.StatusBadRequest)
-				return
-			}
-			filter.To = t
-		}
-		if limitStr := q.Get("limit"); limitStr != "" {
-			n, err := strconv.ParseInt(limitStr, 10, 64)
-			if err != nil || n < 0 {
-				http.Error(w, "invalid 'limit' parameter: must be a non-negative integer", http.StatusBadRequest)
-				return
-			}
-			filter.Limit = n
-		}
-		if offsetStr := q.Get("offset"); offsetStr != "" {
-			n, err := strconv.ParseInt(offsetStr, 10, 64)
-			if err != nil || n < 0 {
-				http.Error(w, "invalid 'offset' parameter: must be a non-negative integer", http.StatusBadRequest)
-				return
-			}
-			filter.Offset = n
+		filter, err := parseQueryFilter(r.URL.Query())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 
 		events, err := repo.Find(r.Context(), filter)
@@ -98,6 +62,45 @@ func handleLogs(repo LogRepository) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, resp)
 	}
+}
+
+func parseQueryFilter(q url.Values) (QueryFilter, error) {
+	filter := QueryFilter{
+		TransactionID: q.Get("transaction_id"),
+		AssociationID: q.Get("association_id"),
+		Service:       q.Get("service"),
+		Level:         q.Get("level"),
+	}
+
+	if fromStr := q.Get("from"); fromStr != "" {
+		t, err := time.Parse(time.RFC3339, fromStr)
+		if err != nil {
+			return filter, errors.New("invalid 'from' parameter: must be RFC3339 (e.g. 2026-09-14T00:00:00Z)")
+		}
+		filter.From = t
+	}
+	if toStr := q.Get("to"); toStr != "" {
+		t, err := time.Parse(time.RFC3339, toStr)
+		if err != nil {
+			return filter, errors.New("invalid 'to' parameter: must be RFC3339 (e.g. 2026-09-14T23:59:59Z)")
+		}
+		filter.To = t
+	}
+	if limitStr := q.Get("limit"); limitStr != "" {
+		n, err := strconv.ParseInt(limitStr, 10, 64)
+		if err != nil || n < 0 {
+			return filter, errors.New("invalid 'limit' parameter: must be a non-negative integer")
+		}
+		filter.Limit = n
+	}
+	if offsetStr := q.Get("offset"); offsetStr != "" {
+		n, err := strconv.ParseInt(offsetStr, 10, 64)
+		if err != nil || n < 0 {
+			return filter, errors.New("invalid 'offset' parameter: must be a non-negative integer")
+		}
+		filter.Offset = n
+	}
+	return filter, nil
 }
 
 // handleTrace implements GET /api/v1/traces/{association_id}.

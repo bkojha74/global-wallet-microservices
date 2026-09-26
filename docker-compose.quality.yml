@@ -1,0 +1,52 @@
+name: global-quality-security
+
+services:
+  sonarqube-db:
+    image: postgres:15-alpine
+    container_name: wallet_sonar_db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=sonar
+      - POSTGRES_PASSWORD=sonar
+      - POSTGRES_DB=sonar
+    volumes:
+      - sonar_db_data:/var/lib/postgresql/data
+    networks:
+      - wallet_quality_net
+
+  sonarqube:
+    image: sonarqube:lts-community
+    container_name: wallet_sonarqube
+    restart: unless-stopped
+    depends_on:
+      - sonarqube-db
+    environment:
+      - SONAR_JDBC_USERNAME=sonar
+      - SONAR_JDBC_PASSWORD=sonar
+      - SONAR_JDBC_URL=jdbc:postgresql://sonarqube-db:5432/sonar
+    volumes:
+      - sonar_data:/opt/sonarqube/data
+      - sonar_extensions:/opt/sonarqube/extensions
+      - sonar_logs:/opt/sonarqube/logs
+    ports:
+      - "9000:9000"
+    networks:
+      - wallet_quality_net
+      - wallet_shared_net
+
+volumes:
+  sonar_db_data:
+    name: wallet_sonar_db_data
+  sonar_data:
+    name: wallet_sonar_data
+  sonar_extensions:
+    name: wallet_sonar_extensions
+  sonar_logs:
+    name: wallet_sonar_logs
+
+networks:
+  wallet_quality_net:
+    name: wallet_quality_net
+  wallet_shared_net:
+    name: wallet_shared_net
+    external: true

@@ -168,9 +168,9 @@ func (e *TokenEngine) verifyRS256(tokenStr string) (*auth.Claims, error) {
 	return &claims, nil
 }
 
-// tokenFingerprint returns an HMAC-SHA256 hex fingerprint of a token string.
+// TokenFingerprint returns an HMAC-SHA256 hex fingerprint of a token string.
 // Used as a cache key so raw tokens are never stored in memory as map keys.
-func tokenFingerprint(token, cacheSecret string) string {
+func TokenFingerprint(token, cacheSecret string) string {
 	mac := hmac.New(sha256.New, []byte(cacheSecret))
 	mac.Write([]byte(token))
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))

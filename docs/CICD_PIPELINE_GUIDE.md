@@ -22,7 +22,7 @@ The Global Wallet microservices platform features an enterprise-grade, automated
 
 ## 2. Pipeline Architecture & Workflow Diagram
 
-The pipeline consists of three sequential jobs executed across cloud and local runner environments:
+The pipeline consists of 9 sequential and parallelized enterprise stages executed across cloud and local runner environments:
 
 ```mermaid
 flowchart TD
@@ -33,49 +33,42 @@ flowchart TD
         Manual["workflow_dispatch<br/>(Manual Trigger)"]
     end
 
-    subgraph CI["Job 1: test (Go CI) [ubuntu-latest]"]
-        Checkout1["Checkout Repository"]
-        GoSetup["Setup Go (go.mod)"]
-        Protoc["Install protoc & Plugins"]
-        GenProto["Compile Protobuf Contracts<br/>(.pb.go)"]
-        Fmt["gofmt Format Verification"]
-        UnitTest["Unit Tests (go test ./...)"]
-        RaceTest["Race Detector (go test -race ./...)"]
-
-        Checkout1 --> GoSetup --> Protoc --> GenProto --> Fmt --> UnitTest --> RaceTest
+    subgraph Phase1["Stage 1: Environment Check"]
+        Env["1. env-setup-check<br/>• Toolchain verification<br/>• Dependency cache pre-warm"]
     end
 
-    subgraph CD_Build["Job 2: docker-publish (Docker Hub) [ubuntu-latest]"]
-        Gate1{"Branch == main<br/>OR Tag == v*<br/>OR Manual?"}
-        Buildx["Setup Docker Buildx"]
-        DHLogin["Authenticate Docker Hub"]
-        Matrix["Parallel Matrix Build<br/>(5 Microservices)"]
-        Cache["GHA Layer Caching (type=gha)"]
-        PushDH["Push Images to Docker Hub<br/>(latest, semver, sha)"]
-
-        Gate1 -->|Yes| Buildx --> DHLogin --> Matrix --> Cache --> PushDH
+    subgraph Phase2["Stage 2: Code Standards & SAST"]
+        Standards["2. code-standards<br/>• gofmt verification<br/>• golangci-lint analysis<br/>• GoSec SAST security scan<br/>• SonarQube Quality Scanner"]
     end
 
-    subgraph CD_Deploy["Job 3: deploy (Local Server) [self-hosted, Windows]"]
-        Runner["Self-Hosted Runner<br/>[self-hosted, Windows]"]
-        CheckDock["Pre-Flight Probe<br/>(docker info)"]
-        Decision{"Docker Ready?"}
-        SkipWarn["Skip Deployment<br/>(Emit Warning Annotation)"]
-        PullImg["Pull Latest Images<br/>(cmd shell)"]
-        NetVol["Validate Network & Volumes<br/>(wallet_shared_net)"]
-        StackUp["Deploy Modular Stacks<br/>(MongoDB -> RabbitMQ -> Auth -> Logging -> Core)"]
-        HealthCheck["Verify Containers<br/>(docker ps)"]
-
-        PushDH --> Runner --> CheckDock --> Decision
-        Decision -->|No / Closed| SkipWarn
-        Decision -->|Yes| PullImg --> NetVol --> StackUp --> HealthCheck
+    subgraph Phase3["Stage 3: Testing & Coverage"]
+        Unit["3. unit-tests<br/>• go test -count=1<br/>• Race detector (-race)<br/>• Coverage profiling"]
+        Integ["4. integration-tests<br/>• MongoDB Replica container<br/>• RabbitMQ broker container<br/>• Cross-service verification"]
+        Sys["5. system-tests<br/>• E2E API Gateway testing<br/>• Health & readiness probes<br/>• JWT auth verification"]
     end
 
-    PR --> CI
-    Push --> CI
-    Tag --> CI
-    Manual --> CI
-    RaceTest --> Gate1
+    subgraph Phase4["Stage 4: Security & Build"]
+        Vuln["6. security-audit<br/>• govulncheck audit<br/>• CVE vulnerability database"]
+        Build["7. build-artifacts<br/>• Multi-binary compilation<br/>• Protobuf contract verification"]
+    end
+
+    subgraph Phase5["Stage 5: Packaging & Release"]
+        Pub["8. docker-publish<br/>• Matrix build (5 microservices)<br/>• Docker Hub publication<br/>• GHA cache (type=gha)"]
+    end
+
+    subgraph Phase6["Stage 6: Deployment"]
+        Deploy["9. deploy<br/>• Self-hosted Windows runner<br/>• Docker daemon pre-flight check<br/>• Rolling compose stack updates"]
+    end
+
+    Triggers --> Env
+    Env --> Standards
+    Standards --> Unit
+    Unit --> Integ
+    Integ --> Sys
+    Sys --> Vuln
+    Vuln --> Build
+    Build --> Pub
+    Pub --> Deploy
 ```
 
 ---
@@ -110,13 +103,13 @@ on:
 
 ### Trigger Matrix
 
-| Event | Branches / Tags | Jobs Executed | Purpose |
+| Event | Branches / Tags | Stages Executed | Purpose |
 |---|---|---|---|
-| `pull_request` | `main`, `develop` | `test` | Quality gate for incoming code changes before merge |
-| `push` | `develop` | `test` | Integration verification on active development branch |
-| `push` | `main` | `test` $\rightarrow$ `docker-publish` $\rightarrow$ `deploy` | End-to-end production testing, container publishing, and deployment |
-| `push` (tag) | `refs/tags/v*` | `test` $\rightarrow$ `docker-publish` $\rightarrow$ `deploy` | Release creation with semantic version container tagging |
-| `workflow_dispatch` | Any branch | `test` $\rightarrow$ `docker-publish` $\rightarrow$ `deploy` | On-demand manual triggering from GitHub Actions Web UI |
+| `pull_request` | `main`, `develop` | Stages 1 through 7 (`env-setup-check` $\rightarrow$ `build-artifacts`) | Full quality, SAST security, and test verification gate before code merge |
+| `push` | `develop` | Stages 1 through 7 (`env-setup-check` $\rightarrow$ `build-artifacts`) | Continuous verification on active integration branch |
+| `push` | `main` | Stages 1 through 9 (`env-setup-check` $\rightarrow$ `deploy`) | Full verification, production container packaging, and local rolling deployment |
+| `push` (tag) | `refs/tags/v*` | Stages 1 through 9 (`env-setup-check` $\rightarrow$ `deploy`) | Release creation with semantic version container tagging |
+| `workflow_dispatch` | Any branch | Stages 1 through 9 (`env-setup-check` $\rightarrow$ `deploy`) | On-demand manual triggering from GitHub Actions Web UI |
 
 > [!NOTE]
 > **Path Filtering (`paths-ignore`)**: Any commits that strictly update documentation, markdown files, licenses, `.gitignore`, or Postman test files bypass the pipeline entirely, preventing unnecessary test runs and registry build charges.
@@ -125,27 +118,84 @@ on:
 
 ## 4. Pipeline Jobs & Execution Stages
 
-### Stage 1: Continuous Integration (`test`)
+### Stage 1: Environment Setup Check (`env-setup-check`)
 * **Runner**: `ubuntu-latest`
+* **Purpose**: Verifies that the build environment satisfies minimum compiler and toolchain prerequisites, downloads and hashes `go.mod` / `go.sum`, and caches Go module dependencies for downstream parallel jobs.
 * **Execution Steps**:
-  1. **Source Checkout**: `actions/checkout@v4` pulls the commit tree.
-  2. **Go Toolchain**: `actions/setup-go@v5` configures Go using the version specified in `go.mod` and enables Go module caching.
-  3. **Protobuf Compiler**: Installs system `protobuf-compiler` alongside Go plugins:
-     - `google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11`
-     - `google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.0`
-  4. **Contract Compilation**: Compiles the gRPC Protobuf v3 definitions:
-     - `proto/wallet/wallet.proto`
-     - `proto/ledger/ledger.proto`
-     - `proto/auth/auth.proto`
-  5. **Formatting Gate**: Runs `test -z "$(gofmt -l .)"` to ensure zero formatting deviations.
-  6. **Automated Unit Testing**: Runs all tests with fresh state (`go test ./... -count=1`).
-  7. **Race Condition Detector**: Executes tests under the Go race detector (`go test -race ./... -count=1`) to identify data races, goroutine leaks, or locking deadlocks.
+  1. Source checkout (`actions/checkout@v4`).
+  2. Setup Go compiler (`actions/setup-go@v5`) with caching enabled.
+  3. Verify Go version (`go version`) and module download (`go mod download`).
+  4. Module tidy check (`go mod tidy && git diff --exit-code go.mod go.sum`).
 
 ---
 
-### Stage 2: Multi-Target Container Packaging (`docker-publish`)
+### Stage 2: Code Standards & Static Security Check (`code-standards`)
 * **Runner**: `ubuntu-latest`
-* **Condition**: Triggered only when `test` succeeds and the ref is `main`, a version tag (`v*`), or a manual dispatch.
+* **Purpose**: Enforces code style, static analysis linters, SAST security analysis, and SonarQube quality gate compliance.
+* **Execution Steps**:
+  1. **Source Checkout**: `actions/checkout@v4` with full git history (`fetch-depth: 0`).
+  2. **Go Toolchain**: `actions/setup-go@v5`.
+  3. **Protobuf Compiler**: Installs system `protobuf-compiler` alongside `protoc-gen-go` and `protoc-gen-go-grpc`.
+  4. **Protobuf Contract Compilation**: Compiles `.proto` definitions to guarantee contract validity.
+  5. **Formatting Gate**: Runs `gofmt -l .` to ensure 100% adherence to standard Go format.
+  6. **GoSec SAST Scan**: Runs `securego/gosec` to scan for security vulnerabilities (e.g. hardcoded secrets, unsafe memory access, SQL/NoSQL injection vectors).
+  7. **SonarQube Quality Scanner**: Runs `sonarsource/sonar-scanner-cli` targeting SonarQube Server or SonarCloud using `sonar-project.properties`.
+
+---
+
+### Stage 3: Unit Testing & Concurrency Safety (`unit-tests`)
+* **Runner**: `ubuntu-latest`
+* **Purpose**: Runs all isolated package unit tests with race detection and generates coverage reports.
+* **Execution Steps**:
+  1. **Go Toolchain & Contracts**: Configures environment and compiles protobuf contracts.
+  2. **Unit Tests**: Runs `go test ./... -count=1` to guarantee tests pass without caching.
+  3. **Race Condition Detector**: Executes `go test -race ./... -count=1` to detect data races or thread contention.
+  4. **Coverage Profile**: Generates `coverage.out` and publishes coverage artifacts.
+
+---
+
+### Stage 4: Integration Testing (`integration-tests`)
+* **Runner**: `ubuntu-latest`
+* **Purpose**: Tests cross-service interactions, transactional guarantees, and message queues against real containerized services.
+* **Container Services**:
+  - **MongoDB**: `mongo:7.0` single-node replica set.
+  - **RabbitMQ**: `rabbitmq:3.13-management` message broker.
+* **Execution Steps**:
+  1. Service container health checks.
+  2. Runs integration test suites (`go test -tags=integration ./...`).
+
+---
+
+### Stage 5: System End-to-End Testing (`system-tests`)
+* **Runner**: `ubuntu-latest`
+* **Purpose**: Validates complete customer transaction workflows across API Gateway, Auth Service, and Core Wallets.
+* **Execution Steps**:
+  1. Boots application microservice test instances.
+  2. Tests `/healthz`, `/readyz`, and `/metrics` management endpoints.
+  3. Executes end-to-end token generation, wallet creation, and multi-service fund transfer flows.
+
+---
+
+### Stage 6: Security Vulnerability Audit (`security-audit`)
+* **Runner**: `ubuntu-latest`
+* **Purpose**: Checks Go dependencies against the official Go Vulnerability Database.
+* **Execution Steps**:
+  1. Installs `golang.org/x/vuln/cmd/govulncheck@latest`.
+  2. Runs `govulncheck ./...` to detect known CVEs in third-party packages.
+
+---
+
+### Stage 7: Binary Build Verification (`build-artifacts`)
+* **Runner**: `ubuntu-latest`
+* **Purpose**: Verifies that all 5 microservice binaries compile natively without linker errors before triggering Docker image packaging.
+* **Execution Steps**:
+  - Compiles `cmd/api-gateway`, `cmd/wallet-service`, `cmd/ledger-service`, `cmd/auth-service`, and `cmd/logging-service`.
+
+---
+
+### Stage 8: Multi-Target Container Packaging & Publishing (`docker-publish`)
+* **Runner**: `ubuntu-latest`
+* **Condition**: Triggered only when previous stages pass and ref is `main`, a release tag (`v*`), or manual dispatch.
 * **Matrix Strategy**: 5 microservices build simultaneously in parallel:
 
 | Service Matrix Identifier | Dockerfile Target | Container Repository |
@@ -161,19 +211,17 @@ on:
   cache-from: type=gha
   cache-to: type=gha,mode=max
   ```
-  GitHub Actions cache stores intermediate Docker build layers, ensuring incremental builds finish in under 30 seconds.
 * **Automated Tagging Engine**:
   - `latest` (applied when pushing to `main`)
   - `vX.Y.Z` & `vX.Y` (applied on version tags)
-  - `sha-<short>` (e.g. `sha-3685067`, applied on every build for complete provenance tracking)
+  - `sha-<short>` (e.g. `sha-3685067`, applied on every build for complete audit provenance)
 
 ---
 
-### Stage 3: Continuous Deployment (`deploy`)
+### Stage 9: Continuous Deployment to Self-Hosted Environment (`deploy`)
 * **Runner**: Self-hosted Windows runner (`[self-hosted, Windows]`)
-* **Shell**: Native Windows `cmd` (`shell: cmd`) to avoid PowerShell script execution policy restrictions (`Restricted`).
+* **Shell**: Native Windows `cmd` (`shell: cmd`) to avoid PowerShell script execution policy restrictions.
 * **Pre-Flight Docker Daemon Readiness Check**:
-  Before running any deployment commands, the runner executes a pre-flight probe:
   ```cmd
   docker info >nul 2>&1
   if errorlevel 1 (
@@ -185,10 +233,6 @@ on:
   )
   exit /b 0
   ```
-  - **If Docker is offline or stopped**: Sets `DOCKER_READY=false`, emits a warning annotation, and cleanly exits with code `0`. Subsequent steps (`pull`, `up`, `ps`) are skipped automatically. The GitHub Actions run stays **GREEN**.
-  - **If Docker is running and healthy**: Sets `DOCKER_READY=true` and executes the rolling deployment.
-* **Step-Level Fault Tolerance (`continue-on-error: true`)**:
-  All deployment steps include `continue-on-error: true` to ensure local hardware or network glitches never mark a GitHub pull request or release as failed.
 * **Rolling Deployment Order**:
   1. `docker compose -f docker-compose.mongodb.yml pull && up -d` (MongoDB Replica Set)
   2. `docker compose -f docker-compose.rabbitmq.yml pull && up -d` (AMQP Broker)
@@ -199,7 +243,53 @@ on:
 
 ---
 
-## 5. Configuring GitHub Secrets & Permissions
+## 5. Dockerized Quality & Security Scanners (Local & CI)
+
+To ensure zero dependencies are required on developer machines, SonarQube and GoSec SAST are fully dockerized with zero port collisions:
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                        QUALITY STACK PORT ALLOCATION ARCHITECTURE                      │
+├──────────────────────┬──────────────┬──────────────┬───────────────────────────────────┤
+│ Container Name       │ Host Port    │ Internal Port│ Purpose                           │
+├──────────────────────┼──────────────┼──────────────┼───────────────────────────────────┤
+│ wallet_sonarqube     │ 9000         │ 9000         │ SonarQube Web UI & Scanner Target │
+│ wallet_sonarqube_db  │ None         │ 5432         │ PostgreSQL for SonarQube Internal │
+└──────────────────────┴──────────────┴──────────────┴───────────────────────────────────┘
+```
+
+### Running SonarQube Locally
+1. Start the SonarQube Community server stack:
+   ```bash
+   docker compose -f docker-compose.quality.yml up -d
+   ```
+2. Open [http://localhost:9000](http://localhost:9000) (default credentials: `admin` / `admin`).
+3. Generate a User Token:
+   - Navigate to **User Profile** $\rightarrow$ **Security** $\rightarrow$ **Generate Token**.
+4. Run the scanner script:
+   - **Windows**:
+     ```powershell
+     .\scripts\run-sonar-scan.bat <YOUR_TOKEN>
+     ```
+   - **Linux / macOS**:
+     ```bash
+     ./scripts/run-sonar-scan.sh <YOUR_TOKEN>
+     ```
+
+### Running GoSec SAST Security Scan Locally
+Run the containerized GoSec scanner directly:
+- **Windows**:
+  ```powershell
+  .\scripts\run-sast-scan.bat
+  ```
+- **Linux / macOS**:
+  ```bash
+  ./scripts/run-sast-scan.sh
+  ```
+
+---
+
+## 6. Configuring GitHub Secrets & Permissions
 
 To allow GitHub Actions to build, publish, and pull container images from Docker Hub, you must configure two encrypted secrets in your GitHub repository.
 

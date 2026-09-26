@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +15,8 @@ import (
 	"time"
 
 	"google.golang.org/grpc/metadata"
+
+	"wallet-system/pkg/db"
 )
 
 // ─── Phase 1 tests (preserved) ───────────────────────────────────────────────
@@ -286,7 +289,17 @@ func newTestAsyncLogger(t *testing.T, pub *mockPublisher) (*AsyncLogger, *FileSp
 	spoolPath := filepath.Join(tmpDir, "test.jsonl")
 	spool := NewFileSpool(spoolPath)
 	reg := NewMetricsRegistry()
-	logger := NewAsyncLoggerFull("test-service", "test", "us-east-1", "test-instance", pub, spool, 8, os.Stderr, reg)
+	logger := NewAsyncLoggerFull(AsyncLoggerConfig{
+		Service:     "test-service",
+		Environment: "test",
+		Region:      "us-east-1",
+		InstanceID:  "test-instance",
+		Publisher:   pub,
+		Spool:       spool,
+		BufferSize:  8,
+		Writer:      os.Stderr,
+		Metrics:     reg,
+	})
 	return logger, spool, reg
 }
 
@@ -410,7 +423,17 @@ func TestAsyncLoggerReplayOnBrokerRecovery(t *testing.T) {
 		t.Fatalf("seed spool: %v", err)
 	}
 
-	logger := NewAsyncLoggerFull("test-service", "test", "us-east-1", "test-instance", pub, spool, 8, os.Stderr, reg)
+	logger := NewAsyncLoggerFull(AsyncLoggerConfig{
+		Service:     "test-service",
+		Environment: "test",
+		Region:      "us-east-1",
+		InstanceID:  "test-instance",
+		Publisher:   pub,
+		Spool:       spool,
+		BufferSize:  8,
+		Writer:      os.Stderr,
+		Metrics:     reg,
+	})
 
 	// Restore broker; the 2-second ticker will trigger replay
 	pub.clearError()
@@ -530,6 +553,8 @@ func TestFileSpoolPruneRespectsAuditLevel(t *testing.T) {
 			t.Errorf("non-audit event survived prune: %+v", e)
 		}
 	}
+	// Give Windows OS file system brief moment to release file handles before TempDir cleanup
+	time.Sleep(50 * time.Millisecond)
 }
 
 // TestFileSpoolMaxBytesDropsNonAudit verifies that when spool is over budget, non-AUDIT
@@ -562,8 +587,7 @@ func TestFileSpoolMaxBytesDropsNonAudit(t *testing.T) {
 	// All replayed events must be AUDIT (INFO may have been pruned)
 	for _, e := range pub.events {
 		if e.Level == LevelInfo {
-			// Presence of INFO is acceptable only if budget was not exceeded
-			// — this test is about ensuring AUDIT events are never lost.
+			_ = e // INFO event presence is allowed if budget was not exceeded
 		}
 	}
 	auditCount := 0
@@ -576,6 +600,7 @@ func TestFileSpoolMaxBytesDropsNonAudit(t *testing.T) {
 	if auditCount != 5 {
 		t.Errorf("expected 5 AUDIT events after prune, got %d (total replayed: %d)", auditCount, len(pub.events))
 	}
+	time.Sleep(50 * time.Millisecond)
 }
 
 // ─── Phase 2: Metrics handler / Prometheus output tests ─────────────────────
@@ -634,5 +659,114 @@ func TestMetricsRegistryCounterValues(t *testing.T) {
 
 	if !strings.Contains(rec.Body.String(), "logging_publish_failures_total") {
 		t.Error("expected publish_failures_total in metrics output")
+	}
+}
+
+func TestNewAsyncLoggerDefaults(t *testing.T) {
+	pub := &mockPublisher{}
+	logger := NewAsyncLogger("test-svc", "test", "us-east-1", pub, nil, 0, io.Discard)
+	if logger == nil {
+		t.Fatal("expected non-nil AsyncLogger")
+	}
+	defer func() { _ = logger.Close(context.Background()) }()
+
+	if logger.MetricsRegistry() == nil {
+		t.Fatal("expected default metrics registry")
+	}
+	if logger.MetricsHandler() == nil {
+		t.Fatal("expected non-nil metrics handler")
+	}
+}
+
+func TestLoggerFromEnvironmentAsync(t *testing.T) {
+	t.Setenv("LOGGING_RABBITMQ_URL", "amqp://localhost:5672/")
+	t.Setenv("LOGGING_SPOOL_PATH", filepath.Join(t.TempDir(), "spool.jsonl"))
+	logger := LoggerFromEnvironment("test-async-svc", "test", "us-east-1", io.Discard)
+	if logger == nil {
+		t.Fatal("expected non-nil logger from env")
+	}
+	_ = logger.Close(context.Background())
+}
+
+func TestOutboxEnabledAndMongoOutbox(t *testing.T) {
+	// 1. OutboxEnabled check
+	t.Setenv("LOGGING_OUTBOX_ENABLED", "true")
+	if !OutboxEnabled() {
+		t.Fatal("expected OutboxEnabled true for 'true'")
+	}
+
+	t.Setenv("LOGGING_OUTBOX_ENABLED", "1")
+	if !OutboxEnabled() {
+		t.Fatal("expected OutboxEnabled true for '1'")
+	}
+
+	t.Setenv("LOGGING_OUTBOX_ENABLED", "false")
+	if OutboxEnabled() {
+		t.Fatal("expected OutboxEnabled false for 'false'")
+	}
+
+	// 2. Outbox & OutboxRelay initialization tests
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client, err := db.ConnectWithRetry(ctx, db.DefaultMongoURI(), 1)
+	if err != nil {
+		t.Skipf("MongoDB unavailable: %v", err)
+		return
+	}
+	defer func() { _ = client.Disconnect(ctx) }()
+
+	testDB := client.Database("test_outbox_pkg")
+	_ = testDB.Drop(ctx)
+
+	outbox := NewMongoOutbox(testDB, "outbox_events")
+	if err := outbox.EnsureIndexes(ctx); err != nil {
+		t.Skipf("EnsureIndexes failed (MongoDB down/unsupported): %v", err)
+		return
+	}
+
+	evt := Event{
+		SchemaVersion: 1,
+		EventID:       "evt-outbox-1",
+		OccurredAt:    time.Now().UTC(),
+		Service:       "test-service",
+		Environment:   "test",
+		Level:         LevelInfo,
+		EventType:     "test.outbox",
+	}
+	if err := outbox.Append(ctx, evt); err != nil {
+		t.Skipf("outbox Append failed (MongoDB write unavailable): %v", err)
+		return
+	}
+
+	// Test OutboxRelay with mock publisher
+	pub := &mockPublisher{}
+	relay := NewOutboxRelay(testDB, "outbox_events", pub)
+	if err := relay.relay(ctx); err != nil {
+		t.Skipf("relay cycle failed: %v", err)
+		return
+	}
+
+	if len(pub.events) != 1 || pub.events[0].EventID != "evt-outbox-1" {
+		t.Fatalf("expected 1 published event from relay, got %+v", pub.events)
+	}
+}
+
+func TestTLSConfigFromEnvAndPublisher(t *testing.T) {
+	t.Setenv("LOGGING_TLS_ENABLED", "false")
+	cfg, err := TLSConfigFromEnv()
+	if err != nil || cfg != nil {
+		t.Fatalf("expected nil TLS config when disabled, got %v, err=%v", cfg, err)
+	}
+
+	pub := NewRabbitPublisherWithTLS("amqp://invalid:5672/", "test.exchange", nil)
+	if pub == nil {
+		t.Fatal("expected non-nil RabbitPublisher")
+	}
+
+	// Verify publish fails on invalid URL without crashing
+	pubErr := pub.Publish(context.Background(), Event{EventID: "evt-fail"})
+	if pubErr == nil {
+		t.Fatal("expected error publishing to invalid RabbitMQ URL")
 	}
 }

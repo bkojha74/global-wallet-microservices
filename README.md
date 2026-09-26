@@ -503,94 +503,62 @@ flowchart TD
         PR["Pull Request<br/>(main, develop)"]
         Push["Git Push<br/>(main, develop)"]
         Tag["Release Tag<br/>(v*)"]
+        Manual["workflow_dispatch<br/>(Manual Trigger)"]
     end
 
-    subgraph CI["Job 1: test (Go CI)"]
-        Checkout1["Checkout Code"]
-        GoSetup["Setup Go (go.mod)"]
-        Protoc["Install protoc & Plugins"]
-        GenProto["Generate Protobuf (.pb.go)"]
-        Fmt["gofmt Format Verification"]
-        UnitTest["Unit Tests (go test ./...)"]
-        RaceTest["Race Detector (go test -race ./...)"]
-
-        Checkout1 --> GoSetup --> Protoc --> GenProto --> Fmt --> UnitTest --> RaceTest
+    subgraph CI_Pipeline["Automated Quality & Verification Gates"]
+        Env["1. env-setup-check<br/>• Toolchain & Go cache verification"]
+        Standards["2. code-standards<br/>• gofmt + golangci-lint<br/>• GoSec SAST + SonarQube Scanner"]
+        Unit["3. unit-tests<br/>• go test -count=1 + -race<br/>• Coverage profiling"]
+        Integ["4. integration-tests<br/>• MongoDB Replica + RabbitMQ services<br/>• Cross-service integration flows"]
+        Sys["5. system-tests<br/>• Full E2E API Gateway testing<br/>• Health & readiness checks"]
+        Vuln["6. security-audit<br/>• govulncheck vulnerability database"]
+        Build["7. build-artifacts<br/>• Microservice binary builds<br/>• Protobuf contract verification"]
     end
 
-    subgraph CD_Build["Job 2: docker-publish (Docker Hub)"]
-        Gate1{"Branch == main<br/>OR Tag == v*?"}
-        Buildx["Docker Buildx Setup"]
-        DHLogin["Docker Hub Auth"]
-        Matrix["Parallel Matrix Build<br/>(5 Microservices)"]
-        Cache["GHA Layer Caching (type=gha)"]
-        PushDH["Push Images to Docker Hub"]
-
-        Gate1 -->|Yes| Buildx --> DHLogin --> Matrix --> Cache --> PushDH
+    subgraph CD_Build["Packaging & Release"]
+        Pub["8. docker-publish<br/>• Parallel Matrix (5 Microservices)<br/>• Docker Hub + GHA layer caching"]
     end
 
-    subgraph CD_Deploy["Job 3: deploy (Self-Hosted Runner)"]
-        Runner["Self-Hosted Runner<br/>[self-hosted, Windows]"]
-        PullImg["Pull Latest Microservices<br/>(cmd shell)"]
-        NetVol["Validate Network & Volumes<br/>(wallet_shared_net)"]
-        StackUp["Deploy Modular Stacks<br/>(MongoDB -> RabbitMQ -> Auth -> Logging -> Core)"]
-        HealthCheck["Verify Containers<br/>(docker ps)"]
-
-        PushDH --> Runner --> PullImg --> NetVol --> StackUp --> HealthCheck
+    subgraph CD_Deploy["Continuous Deployment"]
+        Deploy["9. deploy<br/>• Self-Hosted Windows runner<br/>• Pre-flight Docker daemon probe<br/>• Zero-downtime rolling compose updates"]
     end
 
-    PR --> CI
-    Push --> CI
-    Tag --> CI
-    RaceTest --> Gate1
+    Triggers --> Env
+    Env --> Standards
+    Standards --> Unit
+    Unit --> Integ
+    Integ --> Sys
+    Sys --> Vuln
+    Vuln --> Build
+    Build --> Pub
+    Pub --> Deploy
 ```
 
 ### Pipeline Stages
 
-#### 1. Continuous Integration & Quality Gates (`test`)
-- **Execution Target**: `ubuntu-latest`
-- **Trigger**: Every pull request and push to `main` and `develop`, release tags (`v*`), or manual dispatch (`workflow_dispatch`).
-- **Path Filtering (`paths-ignore`)**: Automatically skips workflow runs when only documentation, markdown files (`*.md`), or configuration guides are modified, preventing redundant CI/CD executions.
-- **Protobuf Compilation**: Installs `protobuf-compiler`, `protoc-gen-go@v1.36.11`, and `protoc-gen-go-grpc@v1.6.0`, compiling `.proto` definitions (`proto/wallet/wallet.proto`, `proto/ledger/ledger.proto`, `proto/auth/auth.proto`) to guarantee strict API contract adherence.
-- **Formatting Enforcement**: Runs `test -z "$(gofmt -l .)"` to ensure standard Go formatting and clean diffs.
-- **Unit & Concurrency Race Detection**: Executes all tests with `-count=1` and `-race` (`go test -race ./...`) to catch race conditions, goroutine leaks, or transactional concurrency regressions.
+The platform utilizes a comprehensive 9-stage CI/CD pipeline configured in [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
 
-#### 2. Multi-Target Container Packaging & Publishing (`docker-publish`)
-- **Execution Target**: `ubuntu-latest`
-- **Trigger**: Pushes to `main`, release tags (`refs/tags/v*`), or manual workflow dispatches upon successful completion of the `test` job.
-- **Docker Buildx & Layer Caching**: Configures `docker/setup-buildx-action@v3` with GitHub Actions cache backend (`cache-from: type=gha`, `cache-to: type=gha,mode=max`) for blazing fast incremental image builds.
-- **Matrix Parallelization**: Concurrently builds and pushes 5 production microservice targets using the hardened multi-stage `Dockerfile`:
-  1. `wallet-api-gateway` (target: `api-gateway`)
-  2. `wallet-service` (target: `wallet-service`) — powers both Primary and Standby instances
-  3. `wallet-ledger-service` (target: `ledger-service`)
-  4. `wallet-auth-service` (target: `auth-service`)
-  5. `wallet-logging-service` (target: `logging-service`)
-- **Automated Version Tagging**: Automatically tags images using `docker/metadata-action@v5`:
-  - `latest` on branch `main`
-  - Semantic versions `vX.Y.Z` and `vX.Y` on Git tags
-  - Short commit SHA (`sha-xxxxxxx`) for granular audit traceability
-
-#### 3. Continuous Deployment to Self-Hosted Environment (`deploy`)
-- **Execution Target**: Self-hosted Windows runner (`[self-hosted, Windows]`).
-- **Execution Shell**: Leverages native `cmd` shell to guarantee predictable execution regardless of local PowerShell execution policies.
-- **Docker Pre-Flight Health Check**: Automatically verifies if the Docker daemon is accessible (`docker info`). If Docker Desktop is closed or not running on the runner machine, it issues a helpful GitHub Actions warning and gracefully skips deployment without failing the pipeline.
-- **Non-Blocking Fault Tolerance (`continue-on-error`)**: Guarantees that local environment issues (such as an offline runner or stopped Docker daemon) do not block or fail code merge workflows.
-- **Network & Volume Primitives**: Verifies and creates the shared Docker bridge network (`wallet_shared_net`) and MongoDB data volume (`global-wallet-microservices_mongo_data`).
-- **Rolling Compose Updates**: Pulls the newly pushed images and restarts the modular stacks in strict dependency order:
-  1. `docker-compose.mongodb.yml` (Primary transactional datastore replica set)
-  2. `docker-compose.rabbitmq.yml` (AMQP async broker & exchanges)
-  3. `docker-compose.auth.yml` (Keycloak IdP & Auth Service)
-  4. `docker-compose.logging.yml` (Centralized Logging Service & AMQP consumer)
-  5. `docker-compose.yml` (API Gateway, Primary Wallet, Standby Wallet, Ledger Service)
-- **Post-Deploy Health Validation**: Executes `docker ps` to display live container statuses and bound ports.
+1. **`env-setup-check` (Environment Setup Check)**: Validates Go toolchain versions, downloads Go modules, and verifies module tidy cleanliness (`go mod tidy && git diff --exit-code go.mod go.sum`).
+2. **`code-standards` (Coding Standards & SAST Scanning)**: Enforces code format (`gofmt`), static analysis (`golangci-lint`), containerized static application security testing (`securego/gosec`), and automated SonarQube LTS quality gate analysis (`sonarsource/sonar-scanner-cli`).
+3. **`unit-tests` (Unit Testing & Concurrency Safety)**: Compiles Protobuf contracts and executes all unit tests under the Go race detector (`go test -race ./... -count=1`) while generating `coverage.out`.
+4. **`integration-tests` (Integration Testing)**: Spawns real containerized service dependencies (`mongo:7.0` replica set and `rabbitmq:3.13` broker) to test transactional outbox relays and message delivery.
+5. **`system-tests` (System End-to-End Testing)**: Boots microservice test instances to validate edge-to-core flows through the API Gateway, including token generation, balance inquiries, and failover status.
+6. **`security-audit` (Vulnerability Auditing)**: Runs `govulncheck ./...` against the official Go Vulnerability Database to prevent known CVEs from entering production.
+7. **`build-artifacts` (Binary Build Verification)**: Natively compiles all 5 microservice binaries (`api-gateway`, `wallet-service`, `ledger-service`, `auth-service`, `logging-service`) to catch link-time or architectural compile errors.
+8. **`docker-publish` (Multi-Target Container Packaging)**: Compiles and publishes 5 hardened production container images to Docker Hub in parallel using Buildx and GitHub Actions layer caching (`type=gha`).
+9. **`deploy` (Continuous Deployment to Self-Hosted Environment)**: Executes on a self-hosted Windows runner with pre-flight Docker daemon health verification and rolling stack restarts.
 
 ### Secrets & Configuration
 
-To enable automated image publishing and self-hosted deployment, configure the following secrets in **GitHub Repository Settings -> Secrets and variables -> Actions**:
+To enable automated image publishing and quality scans, configure the following secrets in **GitHub Repository Settings -> Secrets and variables -> Actions**:
 
 | Secret Name | Description | Required For |
 |---|---|---|
 | `DOCKERHUB_USERNAME` | Docker Hub username or organization handle (e.g. `bkojha74`) | Registry authentication and image namespace |
 | `DOCKERHUB_TOKEN` | Docker Hub Personal Access Token (PAT) with `Read & Write` scope | Automated image pushing and pulling |
+| `SONAR_TOKEN` | SonarQube / SonarCloud User Authentication Token | Code quality scan submission and quality gate checks |
+| `SONAR_HOST_URL` | Optional SonarQube Host URL (defaults to `http://sonarqube:9000` or SonarCloud) | Remote SonarQube server endpoint |
 
 ### Container Registry & Images
 
@@ -642,7 +610,10 @@ docker compose -f docker-compose.logging.yml up --build -d
 # 6. Start Observability & Telemetry Monitoring (Project: global-monitoring)
 docker compose -f docker-compose.monitoring.yml up -d
 
-# 7. Start Core Application Microservices (Project: global-wallet-microservices)
+# 7. Start Code Quality & SonarQube Server (Project: global-quality)
+docker compose -f docker-compose.quality.yml up -d
+
+# 8. Start Core Application Microservices (Project: global-wallet-microservices)
 docker compose -f docker-compose.yml up --build -d
 ```
 

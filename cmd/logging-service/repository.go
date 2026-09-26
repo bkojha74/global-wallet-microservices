@@ -66,24 +66,24 @@ func NewMongoLogRepository(ctx context.Context, uri, dbName, collectionName stri
 func (r *MongoLogRepository) createIndexes(ctx context.Context) error {
 	indexes := []mongo.IndexModel{
 		{
-			Keys:    bson.D{{Key: "event_id", Value: 1}},
+			Keys:    bson.D{bson.E{Key: "event_id", Value: 1}},
 			Options: options.Index().SetUnique(true), // Deduplication
 		},
 		{
-			Keys:    bson.D{{Key: "transaction_id", Value: 1}},
+			Keys:    bson.D{bson.E{Key: "transaction_id", Value: 1}},
 			Options: options.Index().SetSparse(true),
 		},
 		{
-			Keys: bson.D{{Key: "association_id", Value: 1}},
+			Keys: bson.D{bson.E{Key: "association_id", Value: 1}},
 		},
 		{
-			Keys: bson.D{{Key: "occurred_at", Value: 1}},
+			Keys: bson.D{bson.E{Key: "occurred_at", Value: 1}},
 		},
 		{
 			Keys: bson.D{
-				{Key: "service", Value: 1},
-				{Key: "level", Value: 1},
-				{Key: "occurred_at", Value: -1},
+				bson.E{Key: "service", Value: 1},
+				bson.E{Key: "level", Value: 1},
+				bson.E{Key: "occurred_at", Value: -1},
 			},
 		},
 	}
@@ -145,7 +145,7 @@ func (r *MongoLogRepository) Find(ctx context.Context, filter QueryFilter) ([]ob
 	}
 
 	findOptions := options.Find().
-		SetSort(bson.D{{Key: "occurred_at", Value: 1}}).
+		SetSort(bson.D{bson.E{Key: "occurred_at", Value: 1}}).
 		SetLimit(limit).
 		SetSkip(filter.Offset)
 
@@ -179,8 +179,8 @@ func (r *MongoLogRepository) Retention(ctx context.Context, maxAgeDays int) (int
 	cutoff := time.Now().UTC().AddDate(0, 0, -maxAgeDays)
 	// Preserve AUDIT events regardless of age.
 	filter := bson.D{
-		{Key: "occurred_at", Value: bson.D{{Key: "$lt", Value: cutoff}}},
-		{Key: "level", Value: bson.D{{Key: "$ne", Value: "AUDIT"}}},
+		bson.E{Key: "occurred_at", Value: bson.D{bson.E{Key: "$lt", Value: cutoff}}},
+		bson.E{Key: "level", Value: bson.D{bson.E{Key: "$ne", Value: "AUDIT"}}},
 	}
 	result, err := r.collection.DeleteMany(ctx, filter)
 	if err != nil {
@@ -190,5 +190,29 @@ func (r *MongoLogRepository) Retention(ctx context.Context, maxAgeDays int) (int
 }
 
 func (r *MongoLogRepository) Close(ctx context.Context) error {
+	if r == nil || r.client == nil {
+		return nil
+	}
 	return r.client.Disconnect(ctx)
+}
+
+type mockLogRepoImpl struct {
+	healthErr    error
+	retentionErr error
+	saveErr      error
+}
+
+func (m *mockLogRepoImpl) Save(ctx context.Context, event observability.Event) error {
+	return m.saveErr
+}
+func (m *mockLogRepoImpl) Find(ctx context.Context, filter QueryFilter) ([]observability.Event, error) {
+	return nil, nil
+}
+func (m *mockLogRepoImpl) Health(ctx context.Context) error { return m.healthErr }
+func (m *mockLogRepoImpl) Close(ctx context.Context) error  { return nil }
+func (m *mockLogRepoImpl) Retention(ctx context.Context, maxAgeDays int) (int64, error) {
+	if m.retentionErr != nil {
+		return 0, m.retentionErr
+	}
+	return 5, nil
 }
