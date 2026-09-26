@@ -134,7 +134,7 @@ func TestHandleLogs_FilterByTransactionID(t *testing.T) {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 	var resp logsResponse
-	json.NewDecoder(rec.Body).Decode(&resp)
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
 	if resp.Total != 1 {
 		t.Errorf("expected 1 event for tx-A, got %d", resp.Total)
 	}
@@ -162,7 +162,7 @@ func TestHandleLogs_FilterByLevelAndService(t *testing.T) {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 	var resp logsResponse
-	json.NewDecoder(rec.Body).Decode(&resp)
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
 	if resp.Total != 1 {
 		t.Errorf("expected 1 AUDIT wallet-service event, got %d", resp.Total)
 	}
@@ -189,7 +189,7 @@ func TestHandleLogs_FilterByTimeWindow(t *testing.T) {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 	var resp logsResponse
-	json.NewDecoder(rec.Body).Decode(&resp)
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
 	if resp.Total != 1 {
 		t.Errorf("expected 1 event in window, got %d", resp.Total)
 	}

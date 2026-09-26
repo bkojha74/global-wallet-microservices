@@ -156,11 +156,11 @@ func TestConcurrentOverdraftRaceLive(t *testing.T) {
 		t.Skipf("MongoDB not reachable for live concurrency test: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	database := client.Database("test_concurrency_wallet_db")
 	_ = database.Drop(ctx)
-	defer database.Drop(ctx)
+	defer func() { _ = database.Drop(ctx) }()
 
 	if err := db.EnsureWalletIndexes(ctx, database); err != nil {
 		t.Fatalf("failed to ensure indexes: %v", err)
@@ -268,11 +268,11 @@ func TestConcurrentIdempotentReplayLive(t *testing.T) {
 		t.Skipf("MongoDB not reachable for live idempotency test: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	database := client.Database("test_idemp_wallet_db")
 	_ = database.Drop(ctx)
-	defer database.Drop(ctx)
+	defer func() { _ = database.Drop(ctx) }()
 
 	if err := db.EnsureWalletIndexes(ctx, database); err != nil {
 		t.Fatalf("failed to ensure indexes: %v", err)

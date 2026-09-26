@@ -85,7 +85,7 @@ func runAuthServer(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		defer mongoClient.Disconnect(context.Background())
+		defer func() { _ = mongoClient.Disconnect(context.Background()) }()
 		log.Println("[AUTH-SERVICE] MongoDB connected (auth_db)")
 	}
 

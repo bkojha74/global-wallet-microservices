@@ -365,13 +365,13 @@ func (c *Consumer) processMessage(ctx context.Context, msg amqp.Delivery) {
 	var event observability.Event
 	if err := json.Unmarshal(msg.Body, &event); err != nil {
 		log.Printf("[ERROR] Failed to unmarshal event, dead-lettering: %v", err)
-		msg.Nack(false, false) // Requeue=false -> goes to DLQ
+		_ = msg.Nack(false, false) // Requeue=false -> goes to DLQ
 		return
 	}
 
 	if err := observability.ValidateEvent(event); err != nil {
 		log.Printf("[ERROR] Invalid event schema %s, dead-lettering: %v", event.EventID, err)
-		msg.Nack(false, false) // Requeue=false -> goes to DLQ
+		_ = msg.Nack(false, false) // Requeue=false -> goes to DLQ
 		return
 	}
 
@@ -388,12 +388,12 @@ func (c *Consumer) processMessage(ctx context.Context, msg amqp.Delivery) {
 
 	if saveErr != nil {
 		log.Printf("[ERROR] Max retries reached for event %s, dead-lettering: %v", event.EventID, saveErr)
-		msg.Nack(false, false) // Give up and send to DLQ
+		_ = msg.Nack(false, false) // Give up and send to DLQ
 		return
 	}
 
 	// Success, acknowledge the message
-	msg.Ack(false)
+	_ = msg.Ack(false)
 }
 
 func (c *Consumer) Close() error {

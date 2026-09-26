@@ -87,7 +87,7 @@ func (s *FileSpool) Append(event Event) error {
 	if err != nil {
 		return fmt.Errorf("acquire spool lock: %w", err)
 	}
-	defer lock.Release()
+	defer func() { _ = lock.Release() }()
 
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o750); err != nil {
 		return err
@@ -127,7 +127,7 @@ func (s *FileSpool) Replay(ctx context.Context, publisher EventPublisher) error 
 	if err != nil {
 		return fmt.Errorf("acquire spool lock: %w", err)
 	}
-	defer lock.Release()
+	defer func() { _ = lock.Release() }()
 
 	file, err := os.Open(s.path)
 	if os.IsNotExist(err) {

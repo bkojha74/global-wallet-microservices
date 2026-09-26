@@ -294,7 +294,7 @@ func TestLedgerHealthzHandler(t *testing.T) {
 	// Create healthz handler matching startLedgerMetricsServer
 	h := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		rw.Header().Set("Content-Type", "application/json")
-		rw.Write([]byte(`{"status":"UP","region":"us-east-1"}` + "\n"))
+		_, _ = rw.Write([]byte(`{"status":"UP","region":"us-east-1"}` + "\n"))
 	})
 	h.ServeHTTP(w, req)
 
@@ -431,7 +431,7 @@ func TestRecordTransactionValidationBranches(t *testing.T) {
 		Amount:              0,
 		Currency:            "USD",
 	}
-	resp, err = srv.RecordTransaction(ctx, reqZero)
+	_, err = srv.RecordTransaction(ctx, reqZero)
 	if err == nil || status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("expected InvalidArgument code for zero amount, got %v", err)
 	}
@@ -444,7 +444,7 @@ func TestRecordTransactionValidationBranches(t *testing.T) {
 		Amount:              100,
 		Currency:            "UNKNOWN",
 	}
-	resp, err = srv.RecordTransaction(ctx, reqBadCurr)
+	_, err = srv.RecordTransaction(ctx, reqBadCurr)
 	if err == nil || status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("expected InvalidArgument code for unsupported currency, got %v", err)
 	}

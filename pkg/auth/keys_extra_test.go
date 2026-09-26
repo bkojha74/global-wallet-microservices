@@ -94,6 +94,6 @@ func TestRSAKeys_FullLifecycle(t *testing.T) {
 	}
 
 	// Non-RSA key in PKCS8
-	ecKey, _ := rsa.GenerateKey(rand.Reader, 1024)
+	ecKey, _ := rsa.GenerateKey(rand.Reader, 2048)
 	_ = ecKey
 }

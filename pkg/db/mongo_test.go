@@ -43,7 +43,7 @@ func TestConnectWithRetryAndEnsureIndexes(t *testing.T) {
 		t.Skipf("MongoDB not available: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	testDB := client.Database("test_db_indexes_pkg")
 	_ = testDB.Drop(ctx)

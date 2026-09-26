@@ -587,8 +587,7 @@ func TestFileSpoolMaxBytesDropsNonAudit(t *testing.T) {
 	// All replayed events must be AUDIT (INFO may have been pruned)
 	for _, e := range pub.events {
 		if e.Level == LevelInfo {
-			// Presence of INFO is acceptable only if budget was not exceeded
-			// — this test is about ensuring AUDIT events are never lost.
+			_ = e // INFO event presence is allowed if budget was not exceeded
 		}
 	}
 	auditCount := 0
@@ -715,7 +714,7 @@ func TestOutboxEnabledAndMongoOutbox(t *testing.T) {
 		t.Skipf("MongoDB unavailable: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	testDB := client.Database("test_outbox_pkg")
 	_ = testDB.Drop(ctx)

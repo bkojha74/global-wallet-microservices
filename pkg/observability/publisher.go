@@ -28,7 +28,6 @@ const (
 // to the local FileSpool. Metrics are reported to the provided MetricsRegistry so
 // that each service can expose them at GET /metrics (GAP-07).
 type AsyncLogger struct {
-	mu          sync.Mutex
 	service     string
 	environment string
 	region      string

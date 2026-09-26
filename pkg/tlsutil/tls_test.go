@@ -41,7 +41,7 @@ func TestMutualTLSHandshakeSuccess(t *testing.T) {
 
 	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
 	walletv1.RegisterWalletServiceServer(grpcServer, &dummyWalletServer{})
-	go grpcServer.Serve(lis)
+	go func() { _ = grpcServer.Serve(lis) }()
 	defer grpcServer.Stop()
 
 	// Connect with trusted client cert
@@ -88,7 +88,7 @@ func TestMutualTLSRejectsUntrustedClient(t *testing.T) {
 
 	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
 	walletv1.RegisterWalletServiceServer(grpcServer, &dummyWalletServer{})
-	go grpcServer.Serve(lis)
+	go func() { _ = grpcServer.Serve(lis) }()
 	defer grpcServer.Stop()
 
 	// Connect with untrusted rogue client cert
@@ -125,10 +125,10 @@ func TestFileBasedTransportCredentials(t *testing.T) {
 	cliCertPath := filepath.Join(tmpDir, "client.pem")
 	cliKeyPath := filepath.Join(tmpDir, "client.key")
 
-	_ = os.WriteFile(caPath, bundle.CACertPEM, 0o644)
-	_ = os.WriteFile(srvCertPath, bundle.ServerCertPEM, 0o644)
+	_ = os.WriteFile(caPath, bundle.CACertPEM, 0o600)
+	_ = os.WriteFile(srvCertPath, bundle.ServerCertPEM, 0o600)
 	_ = os.WriteFile(srvKeyPath, bundle.ServerKeyPEM, 0o600)
-	_ = os.WriteFile(cliCertPath, bundle.ClientCertPEM, 0o644)
+	_ = os.WriteFile(cliCertPath, bundle.ClientCertPEM, 0o600)
 	_ = os.WriteFile(cliKeyPath, bundle.ClientKeyPEM, 0o600)
 
 	// Server credentials with CA
