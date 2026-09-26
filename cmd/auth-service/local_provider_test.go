@@ -18,7 +18,7 @@ func TestLocalProviderComplete(t *testing.T) {
 		t.Skipf("MongoDB unavailable: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	authDB := client.Database("auth_db_test_local_prov")
 	_ = authDB.Drop(ctx)

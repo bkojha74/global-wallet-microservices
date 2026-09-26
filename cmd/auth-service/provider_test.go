@@ -476,7 +476,7 @@ func TestAuthorizeWalletOwnershipLive(t *testing.T) {
 		t.Skipf("MongoDB not reachable: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	authDB := client.Database("auth_db")
 	userStore, storeErr := NewUserStore(authDB)
@@ -582,7 +582,7 @@ func TestSeedDefaultAdmin(t *testing.T) {
 		t.Skipf("MongoDB not reachable: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	authDB := client.Database("auth_db_test_seed")
 	_ = authDB.Drop(ctx)
