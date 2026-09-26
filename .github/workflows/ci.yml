@@ -290,6 +290,9 @@ jobs:
         run: |
           docker network inspect wallet_shared_net >/dev/null 2>&1 || docker network create wallet_shared_net
           docker volume inspect global-wallet-microservices_mongo_data >/dev/null 2>&1 || docker volume create global-wallet-microservices_mongo_data
+          docker volume inspect wallet_rabbitmq_data >/dev/null 2>&1 || docker volume create wallet_rabbitmq_data
+          docker volume inspect wallet_rabbitmq_data_2 >/dev/null 2>&1 || docker volume create wallet_rabbitmq_data_2
+          docker volume inspect wallet_rabbitmq_data_3 >/dev/null 2>&1 || docker volume create wallet_rabbitmq_data_3
 
       - name: Build and Spin Up Full System Stack
         run: |
@@ -467,6 +470,9 @@ jobs:
         run: |
           docker network inspect wallet_shared_net >nul 2>&1 || docker network create wallet_shared_net
           docker volume inspect global-wallet-microservices_mongo_data >nul 2>&1 || docker volume create global-wallet-microservices_mongo_data
+          docker volume inspect wallet_rabbitmq_data >nul 2>&1 || docker volume create wallet_rabbitmq_data
+          docker volume inspect wallet_rabbitmq_data_2 >nul 2>&1 || docker volume create wallet_rabbitmq_data_2
+          docker volume inspect wallet_rabbitmq_data_3 >nul 2>&1 || docker volume create wallet_rabbitmq_data_3
           docker compose -f docker-compose.mongodb.yml up -d
           docker compose -f docker-compose.rabbitmq.yml up -d
           docker compose -f docker-compose.auth.yml up -d
