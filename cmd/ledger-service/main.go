@@ -115,7 +115,7 @@ func (s *server) getPreviousSequenceAndHash(ctx context.Context, col *mongo.Coll
 	var seqNumber int64 = 1
 	prevHash := GenesisHash
 	var lastDoc LedgerDocument
-	findLastOpts := options.FindOne().SetSort(bson.D{{Key: "sequence_number", Value: -1}})
+	findLastOpts := options.FindOne().SetSort(bson.D{bson.E{Key: "sequence_number", Value: -1}})
 	if findErr := col.FindOne(ctx, bson.M{"sequence_number": bson.M{"$gt": 0}}, findLastOpts).Decode(&lastDoc); findErr == nil {
 		seqNumber = lastDoc.SequenceNumber + 1
 		if lastDoc.EntryHash != "" {
@@ -316,7 +316,7 @@ func (s *server) GetLedgerEntries(ctx context.Context, req *ledgerv1.GetLedgerRe
 	totalCount, _ := col.CountDocuments(ctx, filter)
 
 	findOpts := options.Find().
-		SetSort(bson.D{{Key: "timestamp", Value: -1}}).
+		SetSort(bson.D{bson.E{Key: "timestamp", Value: -1}}).
 		SetSkip(offset).
 		SetLimit(limit)
 

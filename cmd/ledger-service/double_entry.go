@@ -212,7 +212,7 @@ func checkTrialBalanceEquilibrium(result *AuditVerificationResult) {
 // VerifyAuditChain traverses the entire immutable ledger in ascending sequence order,
 // recomputing cryptographic SHA-256 hashes and verifying trial balance equilibrium.
 func VerifyAuditChain(ctx context.Context, col *mongo.Collection) (*AuditVerificationResult, error) {
-	findOpts := options.Find().SetSort(bson.D{{Key: "sequence_number", Value: 1}})
+	findOpts := options.Find().SetSort(bson.D{bson.E{Key: "sequence_number", Value: 1}})
 	cursor, err := col.Find(ctx, bson.M{"sequence_number": bson.M{"$gt": 0}}, findOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query ledger entries for verification: %w", err)

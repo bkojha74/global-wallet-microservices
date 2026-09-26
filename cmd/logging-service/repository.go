@@ -66,24 +66,24 @@ func NewMongoLogRepository(ctx context.Context, uri, dbName, collectionName stri
 func (r *MongoLogRepository) createIndexes(ctx context.Context) error {
 	indexes := []mongo.IndexModel{
 		{
-			Keys:    bson.D{{Key: "event_id", Value: 1}},
+			Keys:    bson.D{bson.E{Key: "event_id", Value: 1}},
 			Options: options.Index().SetUnique(true), // Deduplication
 		},
 		{
-			Keys:    bson.D{{Key: "transaction_id", Value: 1}},
+			Keys:    bson.D{bson.E{Key: "transaction_id", Value: 1}},
 			Options: options.Index().SetSparse(true),
 		},
 		{
-			Keys: bson.D{{Key: "association_id", Value: 1}},
+			Keys: bson.D{bson.E{Key: "association_id", Value: 1}},
 		},
 		{
-			Keys: bson.D{{Key: "occurred_at", Value: 1}},
+			Keys: bson.D{bson.E{Key: "occurred_at", Value: 1}},
 		},
 		{
 			Keys: bson.D{
-				{Key: "service", Value: 1},
-				{Key: "level", Value: 1},
-				{Key: "occurred_at", Value: -1},
+				bson.E{Key: "service", Value: 1},
+				bson.E{Key: "level", Value: 1},
+				bson.E{Key: "occurred_at", Value: -1},
 			},
 		},
 	}
@@ -145,7 +145,7 @@ func (r *MongoLogRepository) Find(ctx context.Context, filter QueryFilter) ([]ob
 	}
 
 	findOptions := options.Find().
-		SetSort(bson.D{{Key: "occurred_at", Value: 1}}).
+		SetSort(bson.D{bson.E{Key: "occurred_at", Value: 1}}).
 		SetLimit(limit).
 		SetSkip(filter.Offset)
 
@@ -179,8 +179,8 @@ func (r *MongoLogRepository) Retention(ctx context.Context, maxAgeDays int) (int
 	cutoff := time.Now().UTC().AddDate(0, 0, -maxAgeDays)
 	// Preserve AUDIT events regardless of age.
 	filter := bson.D{
-		{Key: "occurred_at", Value: bson.D{{Key: "$lt", Value: cutoff}}},
-		{Key: "level", Value: bson.D{{Key: "$ne", Value: "AUDIT"}}},
+		bson.E{Key: "occurred_at", Value: bson.D{bson.E{Key: "$lt", Value: cutoff}}},
+		bson.E{Key: "level", Value: bson.D{bson.E{Key: "$ne", Value: "AUDIT"}}},
 	}
 	result, err := r.collection.DeleteMany(ctx, filter)
 	if err != nil {

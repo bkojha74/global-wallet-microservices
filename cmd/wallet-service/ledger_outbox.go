@@ -60,7 +60,7 @@ func (m *mongoLedgerTaskStore) FindPending(ctx context.Context, limit int64) ([]
 		return nil, nil
 	}
 	opts := options.Find().
-		SetSort(bson.D{{Key: "created_at", Value: 1}}).
+		SetSort(bson.D{bson.E{Key: "created_at", Value: 1}}).
 		SetLimit(limit)
 	cursor, err := m.col.Find(ctx, bson.M{"status": LedgerTaskStatusPending}, opts)
 	if err != nil {

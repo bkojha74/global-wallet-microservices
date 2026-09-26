@@ -48,7 +48,7 @@ func NewRevocationStore(db *mongo.Database) (*RevocationStore, error) {
 func (s *RevocationStore) ensureIndexes(ctx context.Context) error {
 	// TTL index: MongoDB auto-removes documents after their expires_at
 	_, err := s.col().Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys:    bson.D{{Key: "expires_at", Value: 1}},
+		Keys:    bson.D{bson.E{Key: "expires_at", Value: 1}},
 		Options: options.Index().SetExpireAfterSeconds(0).SetName("idx_revoked_ttl"),
 	})
 	if err != nil && !strings.Contains(err.Error(), "11000") {
@@ -57,7 +57,7 @@ func (s *RevocationStore) ensureIndexes(ctx context.Context) error {
 
 	// Unique index on token_id to prevent duplicate revocation entries
 	_, err = s.col().Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys:    bson.D{{Key: "token_id", Value: 1}},
+		Keys:    bson.D{bson.E{Key: "token_id", Value: 1}},
 		Options: options.Index().SetUnique(true).SetSparse(true).SetName("idx_token_id_unique"),
 	})
 	if err != nil && !strings.Contains(err.Error(), "11000") {

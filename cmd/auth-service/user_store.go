@@ -75,7 +75,7 @@ func NewUserStore(db *mongo.Database) (*UserStore, error) {
 func (s *UserStore) ensureIndexes(ctx context.Context) error {
 	// Unique index on username
 	_, err := s.users().Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys:    bson.D{{Key: "username", Value: 1}},
+		Keys:    bson.D{bson.E{Key: "username", Value: 1}},
 		Options: options.Index().SetUnique(true).SetName("idx_username_unique"),
 	})
 	if err != nil && !isDuplicateKeyError(err) {
@@ -84,7 +84,7 @@ func (s *UserStore) ensureIndexes(ctx context.Context) error {
 
 	// TTL index on refresh_tokens.expires_at (auto-delete expired tokens)
 	_, err = s.refreshTokens().Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys:    bson.D{{Key: "expires_at", Value: 1}},
+		Keys:    bson.D{bson.E{Key: "expires_at", Value: 1}},
 		Options: options.Index().SetExpireAfterSeconds(0).SetName("idx_refresh_ttl"),
 	})
 	if err != nil && !isDuplicateKeyError(err) {
@@ -93,7 +93,7 @@ func (s *UserStore) ensureIndexes(ctx context.Context) error {
 
 	// Index on refresh token string for fast lookup
 	_, err = s.refreshTokens().Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys:    bson.D{{Key: "token", Value: 1}},
+		Keys:    bson.D{bson.E{Key: "token", Value: 1}},
 		Options: options.Index().SetUnique(true).SetName("idx_refresh_token_unique"),
 	})
 	if err != nil && !isDuplicateKeyError(err) {
