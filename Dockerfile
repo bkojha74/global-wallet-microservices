@@ -1,5 +1,5 @@
 # Stage 1: Protobuf Generator & Go Multi-Binary Builder
-FROM golang:1.23-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 RUN apk add --no-cache git protobuf protobuf-dev build-base
 
