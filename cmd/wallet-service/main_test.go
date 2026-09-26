@@ -512,7 +512,7 @@ func TestAdminWalletStatusHandlersDetailed(t *testing.T) {
 		t.Skipf("MongoDB unavailable: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	walletDB := client.Database("test_admin_status_pkg")
 	_ = walletDB.Drop(ctx)

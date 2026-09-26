@@ -83,7 +83,7 @@ func TestRevocationStoreLive(t *testing.T) {
 		t.Skipf("MongoDB unavailable: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	authDB := client.Database("auth_db_test_revocation")
 	_ = authDB.Drop(ctx)
@@ -163,7 +163,7 @@ func TestUserStoreLifecycle(t *testing.T) {
 		t.Skipf("MongoDB unavailable: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	authDB := client.Database("auth_db_test_userstore")
 	_ = authDB.Drop(ctx)

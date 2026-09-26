@@ -461,7 +461,7 @@ func TestDispatchImmediateLedgerSuccessLive(t *testing.T) {
 		t.Skipf("MongoDB not reachable: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	taskCol := client.Database("banking_db").Collection("ledger_tasks")
 	task := LedgerTask{

@@ -33,7 +33,7 @@ func TestLedgerRelayLive(t *testing.T) {
 		t.Skipf("MongoDB unavailable: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	walletDB := client.Database("test_wallet_relay_pkg")
 	_ = walletDB.Drop(ctx)

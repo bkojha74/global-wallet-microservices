@@ -459,7 +459,7 @@ func TestHandleInsertErrorDuplicateKeyRace(t *testing.T) {
 		t.Skipf("MongoDB not reachable: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	srv := &server{
 		mongoClient: client,
@@ -535,7 +535,7 @@ func TestGetLedgerEntriesQueryFailure(t *testing.T) {
 		t.Skipf("MongoDB not reachable: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	srv := &server{
 		mongoClient: client,
@@ -568,7 +568,7 @@ func TestGetLedgerEntriesWithPageToken(t *testing.T) {
 		t.Skipf("MongoDB not reachable: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	srv := &server{
 		mongoClient: client,
@@ -640,7 +640,7 @@ func TestLedgerMetricsServerHTTPEndpoints(t *testing.T) {
 		t.Skipf("MongoDB not reachable: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	// Start metrics server on a random port
 	srv := startLedgerMetricsServer(client, "0", "us-east-1")
@@ -688,7 +688,7 @@ func TestLedgerMetricsServerHandlersDirect(t *testing.T) {
 		t.Skipf("MongoDB not reachable: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	// Test /healthz handler directly via httptest
 	healthHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -745,7 +745,7 @@ func TestInitLedgerOutboxBranches(t *testing.T) {
 		t.Skipf("MongoDB not reachable: %v", err)
 		return
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	// 1. Disabled
 	t.Setenv("LOGGING_OUTBOX_ENABLED", "false")
