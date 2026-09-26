@@ -455,6 +455,7 @@ jobs:
         continue-on-error: true
         run: |
           echo Checking Docker daemon status...
+          docker context use desktop-linux >nul 2>&1 || ver >nul
           docker info
           if errorlevel 1 (
             echo.
