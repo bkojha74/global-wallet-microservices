@@ -154,51 +154,61 @@ func (s *authServer) Authorize(ctx context.Context, req *authv1.AuthorizeRequest
 		}
 	}
 
-	// Resource-based ABAC: wallet ownership check
 	if strings.HasPrefix(req.Resource, "wallet:") {
-		walletID := strings.TrimPrefix(req.Resource, "wallet:")
-		if req.Action == "read" || req.Action == "transfer" {
-			required := fmt.Sprintf("wallet:%s", req.Action)
-			if !hasScope(req.Scopes, required) {
-				return &authv1.AuthorizeResponse{
-					Allowed: false,
-					Reason:  fmt.Sprintf("missing scope: %s", required),
-				}, nil
-			}
-
-			// Verify ownership against user store if record exists
-			owns, err := s.store.OwnsWallet(ctx, req.Subject, walletID)
-			if err != nil {
-				log.Printf("[AUTH-SERVER] Authorize wallet ownership check error: %v", err)
-				return &authv1.AuthorizeResponse{Allowed: false, Reason: "ownership check failed"}, nil
-			}
-			if !owns {
-				return &authv1.AuthorizeResponse{
-					Allowed: false,
-					Reason:  fmt.Sprintf("subject %s does not own wallet %s", req.Subject, walletID),
-				}, nil
-			}
-			return &authv1.AuthorizeResponse{Allowed: true, Reason: "wallet owner"}, nil
-		}
+		return s.authorizeWallet(ctx, req)
 	}
-
-	// Cluster-admin routes
 	if strings.HasPrefix(req.Resource, "cluster:") {
-		if !hasScope(req.Scopes, auth.ScopeClusterAdmin) {
-			return &authv1.AuthorizeResponse{Allowed: false, Reason: "requires cluster:admin scope"}, nil
-		}
-		return &authv1.AuthorizeResponse{Allowed: true, Reason: "cluster admin scope"}, nil
+		return s.authorizeCluster(req)
 	}
-
-	// Ledger audit
 	if strings.HasPrefix(req.Resource, "ledger:") {
-		if !hasScope(req.Scopes, auth.ScopeLedgerAudit) {
-			return &authv1.AuthorizeResponse{Allowed: false, Reason: "requires ledger:audit scope"}, nil
-		}
-		return &authv1.AuthorizeResponse{Allowed: true, Reason: "ledger audit scope"}, nil
+		return s.authorizeLedger(req)
 	}
 
 	return &authv1.AuthorizeResponse{Allowed: false, Reason: "no matching policy"}, nil
+}
+
+func (s *authServer) authorizeWallet(ctx context.Context, req *authv1.AuthorizeRequest) (*authv1.AuthorizeResponse, error) {
+	walletID := strings.TrimPrefix(req.Resource, "wallet:")
+	if req.Action != "read" && req.Action != "transfer" {
+		return &authv1.AuthorizeResponse{Allowed: false, Reason: "unsupported wallet action"}, nil
+	}
+	required := fmt.Sprintf("wallet:%s", req.Action)
+	if !hasScope(req.Scopes, required) {
+		return &authv1.AuthorizeResponse{
+			Allowed: false,
+			Reason:  fmt.Sprintf("missing scope: %s", required),
+		}, nil
+	}
+
+	// Verify ownership against user store if record exists
+	if s.store != nil {
+		owns, err := s.store.OwnsWallet(ctx, req.Subject, walletID)
+		if err != nil {
+			log.Printf("[AUTH-SERVER] Authorize wallet ownership check error: %v", err)
+			return &authv1.AuthorizeResponse{Allowed: false, Reason: "ownership check failed"}, nil
+		}
+		if !owns {
+			return &authv1.AuthorizeResponse{
+				Allowed: false,
+				Reason:  fmt.Sprintf("subject %s does not own wallet %s", req.Subject, walletID),
+			}, nil
+		}
+	}
+	return &authv1.AuthorizeResponse{Allowed: true, Reason: "wallet owner"}, nil
+}
+
+func (s *authServer) authorizeCluster(req *authv1.AuthorizeRequest) (*authv1.AuthorizeResponse, error) {
+	if !hasScope(req.Scopes, auth.ScopeClusterAdmin) {
+		return &authv1.AuthorizeResponse{Allowed: false, Reason: "requires cluster:admin scope"}, nil
+	}
+	return &authv1.AuthorizeResponse{Allowed: true, Reason: "cluster admin scope"}, nil
+}
+
+func (s *authServer) authorizeLedger(req *authv1.AuthorizeRequest) (*authv1.AuthorizeResponse, error) {
+	if !hasScope(req.Scopes, auth.ScopeLedgerAudit) {
+		return &authv1.AuthorizeResponse{Allowed: false, Reason: "requires ledger:audit scope"}, nil
+	}
+	return &authv1.AuthorizeResponse{Allowed: true, Reason: "ledger audit scope"}, nil
 }
 
 // HealthCheck returns the service health status.

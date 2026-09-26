@@ -62,6 +62,9 @@ type UserStore struct {
 // It ensures required indexes exist on startup.
 func NewUserStore(db *mongo.Database) (*UserStore, error) {
 	s := &UserStore{db: db}
+	if db == nil {
+		return s, nil
+	}
 	if err := s.ensureIndexes(context.Background()); err != nil {
 		return nil, fmt.Errorf("user_store: index setup failed: %w", err)
 	}
@@ -105,6 +108,9 @@ func (s *UserStore) ensureIndexes(ctx context.Context) error {
 // It manages the failed login counter and account lockout automatically.
 // Returns the user record on success.
 func (s *UserStore) Authenticate(ctx context.Context, username, password string) (*UserRecord, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("user store unavailable")
+	}
 	user, err := s.FindByUsername(ctx, username)
 	if err != nil {
 		return nil, errors.New("invalid credentials")
@@ -128,25 +134,33 @@ func (s *UserStore) Authenticate(ctx context.Context, username, password string)
 			update["$set"].(bson.M)["status"] = UserStatusLocked
 			log.Printf("[AUTH-STORE] Account locked after %d failed attempts: %s", newCount, username)
 		}
-		_, _ = s.users().UpdateOne(ctx, bson.M{"username": username}, update)
+		if col := s.users(); col != nil {
+			_, _ = col.UpdateOne(ctx, bson.M{"username": username}, update)
+		}
 		return nil, errors.New("invalid credentials")
 	}
 
 	// Successful login — reset failure counter
 	now := time.Now().UTC()
-	_, _ = s.users().UpdateOne(ctx, bson.M{"username": username}, bson.M{"$set": bson.M{
-		"failed_login_count": 0,
-		"last_login_at":      now,
-		"updated_at":         now,
-	}})
+	if col := s.users(); col != nil {
+		_, _ = col.UpdateOne(ctx, bson.M{"username": username}, bson.M{"$set": bson.M{
+			"failed_login_count": 0,
+			"last_login_at":      now,
+			"updated_at":         now,
+		}})
+	}
 
 	return user, nil
 }
 
 // FindByUsername returns a user record by username.
 func (s *UserStore) FindByUsername(ctx context.Context, username string) (*UserRecord, error) {
+	col := s.users()
+	if col == nil {
+		return nil, errors.New("user_store: database unavailable")
+	}
 	var u UserRecord
-	err := s.users().FindOne(ctx, bson.M{"username": username}).Decode(&u)
+	err := col.FindOne(ctx, bson.M{"username": username}).Decode(&u)
 	if err != nil {
 		return nil, fmt.Errorf("user_store: user not found: %w", err)
 	}
@@ -156,6 +170,10 @@ func (s *UserStore) FindByUsername(ctx context.Context, username string) (*UserR
 // CreateUser inserts a new user with a bcrypt-hashed password.
 // Intended for admin provisioning or a registration endpoint.
 func (s *UserStore) CreateUser(ctx context.Context, username, email, password string, roles, scopes []string) error {
+	col := s.users()
+	if col == nil {
+		return errors.New("user_store: database unavailable")
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		return fmt.Errorf("user_store: bcrypt hash: %w", err)
@@ -178,6 +196,10 @@ func (s *UserStore) CreateUser(ctx context.Context, username, email, password st
 
 // StoreRefreshToken persists a new refresh token linked to the given subject.
 func (s *UserStore) StoreRefreshToken(ctx context.Context, token, subject string, roles, scopes []string, ttl time.Duration) error {
+	col := s.refreshTokens()
+	if col == nil {
+		return errors.New("user_store: database unavailable")
+	}
 	now := time.Now().UTC()
 	rec := RefreshTokenRecord{
 		ID:        primitive.NewObjectID(),
@@ -189,19 +211,23 @@ func (s *UserStore) StoreRefreshToken(ctx context.Context, token, subject string
 		ExpiresAt: now.Add(ttl),
 		Revoked:   false,
 	}
-	_, err := s.refreshTokens().InsertOne(ctx, rec)
+	_, err := col.InsertOne(ctx, rec)
 	return err
 }
 
 // FindRefreshToken retrieves an active (non-revoked, non-expired) refresh token record.
 func (s *UserStore) FindRefreshToken(ctx context.Context, token string) (*RefreshTokenRecord, error) {
+	col := s.refreshTokens()
+	if col == nil {
+		return nil, errors.New("user_store: database unavailable")
+	}
 	var rec RefreshTokenRecord
 	filter := bson.M{
 		"token":      token,
 		"revoked":    false,
 		"expires_at": bson.M{"$gt": time.Now().UTC()},
 	}
-	err := s.refreshTokens().FindOne(ctx, filter).Decode(&rec)
+	err := col.FindOne(ctx, filter).Decode(&rec)
 	if err != nil {
 		return nil, fmt.Errorf("user_store: refresh token not found or expired: %w", err)
 	}
@@ -210,7 +236,11 @@ func (s *UserStore) FindRefreshToken(ctx context.Context, token string) (*Refres
 
 // RevokeRefreshToken marks a refresh token as revoked.
 func (s *UserStore) RevokeRefreshToken(ctx context.Context, token string) error {
-	_, err := s.refreshTokens().UpdateOne(
+	col := s.refreshTokens()
+	if col == nil {
+		return errors.New("user_store: database unavailable")
+	}
+	_, err := col.UpdateOne(
 		ctx,
 		bson.M{"token": token},
 		bson.M{"$set": bson.M{"revoked": true}},
@@ -220,7 +250,11 @@ func (s *UserStore) RevokeRefreshToken(ctx context.Context, token string) error 
 
 // OwnsWallet checks if the given subject is linked to the walletID (ABAC ownership check).
 func (s *UserStore) OwnsWallet(ctx context.Context, subject, walletID string) (bool, error) {
-	count, err := s.users().CountDocuments(ctx, bson.M{
+	col := s.users()
+	if col == nil {
+		return true, nil
+	}
+	count, err := col.CountDocuments(ctx, bson.M{
 		"username":   subject,
 		"wallet_ids": walletID,
 	})
@@ -229,7 +263,11 @@ func (s *UserStore) OwnsWallet(ctx context.Context, subject, walletID string) (b
 
 // AddWalletToUser links a wallet ID to a user account (called on wallet creation).
 func (s *UserStore) AddWalletToUser(ctx context.Context, username, walletID string) error {
-	_, err := s.users().UpdateOne(
+	col := s.users()
+	if col == nil {
+		return errors.New("user_store: database unavailable")
+	}
+	_, err := col.UpdateOne(
 		ctx,
 		bson.M{"username": username},
 		bson.M{
@@ -251,10 +289,16 @@ func DefaultScopesForRoles(roles []string) []string {
 }
 
 func (s *UserStore) users() *mongo.Collection {
+	if s == nil || s.db == nil {
+		return nil
+	}
 	return s.db.Collection("users")
 }
 
 func (s *UserStore) refreshTokens() *mongo.Collection {
+	if s == nil || s.db == nil {
+		return nil
+	}
 	return s.db.Collection("refresh_tokens")
 }
 

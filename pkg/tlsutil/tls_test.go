@@ -3,6 +3,8 @@ package tlsutil
 import (
 	"context"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -109,3 +111,58 @@ func TestMutualTLSRejectsUntrustedClient(t *testing.T) {
 		}
 	}
 }
+
+func TestFileBasedTransportCredentials(t *testing.T) {
+	bundle, err := GenerateTestCertificates()
+	if err != nil {
+		t.Fatalf("generate test certs: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	caPath := filepath.Join(tmpDir, "ca.pem")
+	srvCertPath := filepath.Join(tmpDir, "server.pem")
+	srvKeyPath := filepath.Join(tmpDir, "server.key")
+	cliCertPath := filepath.Join(tmpDir, "client.pem")
+	cliKeyPath := filepath.Join(tmpDir, "client.key")
+
+	_ = os.WriteFile(caPath, bundle.CACertPEM, 0o644)
+	_ = os.WriteFile(srvCertPath, bundle.ServerCertPEM, 0o644)
+	_ = os.WriteFile(srvKeyPath, bundle.ServerKeyPEM, 0o600)
+	_ = os.WriteFile(cliCertPath, bundle.ClientCertPEM, 0o644)
+	_ = os.WriteFile(cliKeyPath, bundle.ClientKeyPEM, 0o600)
+
+	// Server credentials with CA
+	srvCreds, err := NewServerTransportCredentials(srvCertPath, srvKeyPath, caPath)
+	if err != nil || srvCreds == nil {
+		t.Fatalf("expected server transport credentials, got %v", err)
+	}
+
+	// Client credentials with CA and client cert
+	cliCreds, err := NewClientTransportCredentials(cliCertPath, cliKeyPath, caPath, "localhost")
+	if err != nil || cliCreds == nil {
+		t.Fatalf("expected client transport credentials, got %v", err)
+	}
+}
+
+func TestCACertAppendErrors(t *testing.T) {
+	bundle, err := GenerateTestCertificates()
+	if err != nil {
+		t.Fatalf("generate certs: %v", err)
+	}
+
+	// Corrupt CA cert
+	bundle.CACertPEM = []byte("not-a-valid-ca-pem")
+
+	if _, err := bundle.ServerTLSConfig(); err == nil {
+		t.Fatal("expected error on corrupt CA for ServerTLSConfig")
+	}
+
+	if _, err := bundle.ClientTLSConfig("localhost"); err == nil {
+		t.Fatal("expected error on corrupt CA for ClientTLSConfig")
+	}
+
+	if _, err := bundle.UntrustedClientTLSConfig("localhost"); err == nil {
+		t.Fatal("expected error on corrupt CA for UntrustedClientTLSConfig")
+	}
+}
+

@@ -116,6 +116,9 @@ func (s *FileSpool) Append(event Event) error {
 }
 
 func (s *FileSpool) Replay(ctx context.Context, publisher EventPublisher) error {
+	if s == nil {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -134,41 +137,44 @@ func (s *FileSpool) Replay(ctx context.Context, publisher EventPublisher) error 
 		return err
 	}
 
+	remaining, err := scanSpoolEvents(file, ctx, publisher)
+	_ = file.Close()
+	if err != nil {
+		return err
+	}
+
+	if len(remaining) == 0 {
+		return os.Remove(s.path)
+	}
+	return s.rewriteRemaining(remaining)
+}
+
+func scanSpoolEvents(file *os.File, ctx context.Context, publisher EventPublisher) ([]Event, error) {
 	var remaining []Event
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		var event Event
 		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
-			file.Close()
-			return fmt.Errorf("decode spool event: %w", err)
+			return nil, fmt.Errorf("decode spool event: %w", err)
 		}
 		if err := publisher.Publish(ctx, event); err != nil {
 			remaining = append(remaining, event)
 			for scanner.Scan() {
 				var pending Event
 				if err := json.Unmarshal(scanner.Bytes(), &pending); err != nil {
-					file.Close()
-					return fmt.Errorf("decode pending spool event: %w", err)
+					return nil, fmt.Errorf("decode pending spool event: %w", err)
 				}
 				remaining = append(remaining, pending)
 			}
 			break
 		}
 	}
-	scanErr := scanner.Err()
-	closeErr := file.Close()
-	if scanErr != nil {
-		return scanErr
-	}
-	if closeErr != nil {
-		return closeErr
-	}
+	return remaining, scanner.Err()
+}
 
-	if len(remaining) == 0 {
-		return os.Remove(s.path)
-	}
-
-	temporaryPath := s.path + ".tmp"
+func (s *FileSpool) rewriteRemaining(remaining []Event) error {
+	temporaryPath := filepath.Clean(s.path + ".tmp")
+	// #nosec G304 -- temporary spool file path is internal to the application
 	temporary, err := os.OpenFile(temporaryPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
@@ -227,7 +233,8 @@ func (s *FileSpool) pruneUnderLock() error {
 		keptBytes += eBytes
 	}
 
-	temporaryPath := s.path + ".prune.tmp"
+	temporaryPath := filepath.Clean(s.path + ".prune.tmp")
+	// #nosec G304 -- temporary spool file path is internal to the application
 	tempFile, err := os.OpenFile(temporaryPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
@@ -242,6 +249,9 @@ func (s *FileSpool) pruneUnderLock() error {
 
 // Size returns current file size of spool file in bytes
 func (s *FileSpool) Size() int64 {
+	if s == nil {
+		return 0
+	}
 	fi, err := os.Stat(s.path)
 	if err != nil {
 		return 0
@@ -251,6 +261,9 @@ func (s *FileSpool) Size() int64 {
 
 // OldestAge returns age of oldest event in spool file
 func (s *FileSpool) OldestAge() time.Duration {
+	if s == nil {
+		return 0
+	}
 	file, err := os.Open(s.path)
 	if err != nil {
 		return 0

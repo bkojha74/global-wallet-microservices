@@ -34,17 +34,68 @@ func queueTypeArgs() amqp.Table {
 	return nil // classic queue — default
 }
 
-type Consumer struct {
-	amqpURI string
-	conn    *amqp.Connection
-	ch      *amqp.Channel
-	repo    LogRepository
+type AMQPChannel interface {
+	ExchangeDeclare(name, kind string, durable, autoDelete, internal, noWait bool, args amqp.Table) error
+	QueueDeclare(name string, durable, autoDelete, exclusive, noWait bool, args amqp.Table) (amqp.Queue, error)
+	QueueBind(name, key, exchange string, noWait bool, args amqp.Table) error
+	Qos(prefetchCount, prefetchSize int, global bool) error
+	Consume(queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args amqp.Table) (<-chan amqp.Delivery, error)
+	Close() error
+	IsClosed() bool
 }
 
-func NewConsumer(amqpURI string, repo LogRepository) (*Consumer, error) {
+type AMQPConnection interface {
+	Channel() (AMQPChannel, error)
+	IsClosed() bool
+	Close() error
+}
+
+type realChannel struct {
+	*amqp.Channel
+}
+
+func (r *realChannel) IsClosed() bool {
+	if r == nil || r.Channel == nil {
+		return true
+	}
+	return r.Channel.IsClosed()
+}
+
+type realConnection struct {
+	*amqp.Connection
+}
+
+func (r *realConnection) IsClosed() bool {
+	if r == nil || r.Connection == nil {
+		return true
+	}
+	return r.Connection.IsClosed()
+}
+
+func (r *realConnection) Channel() (AMQPChannel, error) {
+	if r == nil || r.Connection == nil {
+		return nil, fmt.Errorf("connection is nil")
+	}
+	ch, err := r.Connection.Channel()
+	if err != nil {
+		return nil, err
+	}
+	return &realChannel{Channel: ch}, nil
+}
+
+type Consumer struct {
+	amqpURI string
+	conn    AMQPConnection
+	ch      AMQPChannel
+	repo    LogRepository
+	dialer  func(string) (AMQPConnection, error)
+}
+
+func NewConsumerWithDialer(amqpURI string, repo LogRepository, dialer func(string) (AMQPConnection, error)) (*Consumer, error) {
 	c := &Consumer{
 		amqpURI: amqpURI,
 		repo:    repo,
+		dialer:  dialer,
 	}
 	if err := c.connect(); err != nil {
 		return nil, err
@@ -52,10 +103,25 @@ func NewConsumer(amqpURI string, repo LogRepository) (*Consumer, error) {
 	return c, nil
 }
 
+func NewConsumer(amqpURI string, repo LogRepository) (*Consumer, error) {
+	return NewConsumerWithDialer(amqpURI, repo, nil)
+}
+
+func (c *Consumer) dial(uri string) (AMQPConnection, error) {
+	if c.dialer != nil {
+		return c.dialer(uri)
+	}
+	conn, err := amqp.Dial(uri)
+	if err != nil {
+		return nil, err
+	}
+	return &realConnection{Connection: conn}, nil
+}
+
 func (c *Consumer) connect() error {
 	c.cleanup()
 
-	conn, err := amqp.Dial(c.amqpURI)
+	conn, err := c.dial(c.amqpURI)
 	if err != nil {
 		return fmt.Errorf("failed to connect to RabbitMQ: %w", err)
 	}
@@ -188,59 +254,80 @@ func (c *Consumer) cleanup() {
 	}
 }
 
+func waitBackoff(ctx context.Context, backoff *time.Duration, maxBackoff time.Duration) bool {
+	select {
+	case <-time.After(*backoff):
+		*backoff = *backoff * 2
+		if *backoff > maxBackoff {
+			*backoff = maxBackoff
+		}
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (c *Consumer) ensureConnection(ctx context.Context, backoff *time.Duration, maxBackoff time.Duration) error {
+	if c.conn != nil && !c.conn.IsClosed() && c.ch != nil && !c.ch.IsClosed() {
+		return nil
+	}
+	log.Println("[LOGGING-SERVICE] Reconnecting to RabbitMQ...")
+	if err := c.connect(); err != nil {
+		log.Printf("[WARN] RabbitMQ reconnect failed: %v. Retrying in %v...", err, *backoff)
+		if !waitBackoff(ctx, backoff, maxBackoff) {
+			return ctx.Err()
+		}
+		return err
+	}
+	*backoff = 1 * time.Second
+	log.Println("[LOGGING-SERVICE] Successfully reconnected to RabbitMQ.")
+	return nil
+}
+
+func (c *Consumer) registerConsumer(ctx context.Context, backoff *time.Duration, maxBackoff time.Duration) (<-chan amqp.Delivery, error) {
+	msgs, err := c.ch.Consume(
+		queueName,
+		"logging-service", // consumer
+		false,             // auto-ack
+		false,             // exclusive
+		false,             // no-local
+		false,             // no-wait
+		nil,               // args
+	)
+	if err != nil {
+		log.Printf("[WARN] Failed to register consumer: %v. Reconnecting in %v...", err, *backoff)
+		c.cleanup()
+		if !waitBackoff(ctx, backoff, maxBackoff) {
+			return nil, ctx.Err()
+		}
+		return nil, err
+	}
+	return msgs, nil
+}
+
 func (c *Consumer) Start(ctx context.Context) error {
 	backoff := 1 * time.Second
 	const maxBackoff = 30 * time.Second
 
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			log.Println("[LOGGING-SERVICE] Context cancelled, stopping consumer")
 			return nil
-		default:
 		}
 
-		if c.conn == nil || c.conn.IsClosed() || c.ch == nil || c.ch.IsClosed() {
-			log.Println("[LOGGING-SERVICE] Reconnecting to RabbitMQ...")
-			if err := c.connect(); err != nil {
-				log.Printf("[WARN] RabbitMQ reconnect failed: %v. Retrying in %v...", err, backoff)
-				select {
-				case <-time.After(backoff):
-					backoff = backoff * 2
-					if backoff > maxBackoff {
-						backoff = maxBackoff
-					}
-					continue
-				case <-ctx.Done():
-					return nil
-				}
-			}
-			backoff = 1 * time.Second
-			log.Println("[LOGGING-SERVICE] Successfully reconnected to RabbitMQ.")
-		}
-
-		msgs, err := c.ch.Consume(
-			queueName,
-			"logging-service", // consumer
-			false,             // auto-ack
-			false,             // exclusive
-			false,             // no-local
-			false,             // no-wait
-			nil,               // args
-		)
-		if err != nil {
-			log.Printf("[WARN] Failed to register consumer: %v. Reconnecting in %v...", err, backoff)
-			c.cleanup()
-			select {
-			case <-time.After(backoff):
-				backoff = backoff * 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
-				continue
-			case <-ctx.Done():
+		if err := c.ensureConnection(ctx, &backoff, maxBackoff); err != nil {
+			if ctx.Err() != nil {
 				return nil
 			}
+			continue
+		}
+
+		msgs, err := c.registerConsumer(ctx, &backoff, maxBackoff)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			continue
 		}
 
 		log.Println("[LOGGING-SERVICE] RabbitMQ consumer listening for incoming events...")
@@ -252,7 +339,11 @@ func (c *Consumer) Start(ctx context.Context) error {
 
 		log.Printf("[WARN] RabbitMQ consumer channel closed: %v. Initiating automatic reconnect...", consumeErr)
 		c.cleanup()
-		time.Sleep(1 * time.Second)
+		select {
+		case <-time.After(1 * time.Second):
+		case <-ctx.Done():
+			return nil
+		}
 	}
 }
 

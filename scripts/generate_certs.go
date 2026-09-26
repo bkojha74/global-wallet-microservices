@@ -18,10 +18,10 @@ import (
 func main() {
 	outDir := "certs"
 	if len(os.Args) > 1 {
-		outDir = os.Args[1]
+		outDir = filepath.Clean(os.Args[1])
 	}
-
-	if err := os.MkdirAll(outDir, 0755); err != nil {
+	// #nosec G301 -- certificate output directory with restricted 0750 permissions
+	if err := os.MkdirAll(outDir, 0750); err != nil {
 		fmt.Printf("Failed to create output dir: %v\n", err)
 		os.Exit(1)
 	}
@@ -107,7 +107,9 @@ func main() {
 }
 
 func writePEM(filename, blockType string, data []byte) {
-	f, err := os.Create(filename)
+	cleanName := filepath.Clean(filename)
+	// #nosec G304,G703 -- local certificate generation script writing to certs directory
+	f, err := os.OpenFile(cleanName, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		panic(err)
 	}

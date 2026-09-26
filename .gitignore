@@ -1,11 +1,19 @@
-# Local environment and secrets
+# Environment variables and secrets
 .env
 .env.*
 !.env.example
 *.secret
 *.secrets
+
+# Certificates and SSL/TLS keys
+/certs/
 *.key
 *.pem
+*.crt
+*.csr
+*.srl
+*.p12
+*.pfx
 
 # Local databases and generated runtime data
 /data/
@@ -17,30 +25,74 @@
 # Local logs and diagnostics
 *.log
 InstallationLog.txt
+*.syslog
+
+# Test coverage artifacts, reports, and parts
 coverage.out
 coverage.html
+coverage.txt
+coverage
+coverage_*
+/coverage_parts/
+*_cov
+cov
+cov.out
+cov_temp.out
+part_*
+*.cov
+*.out
 
-# Go build output
+# Go build outputs and compiled binaries
 /bin/
 /build/
 *.exe
+*.exe.manifest
+*.dll
+*.so
+*.dylib
 *.test
+*.prof
+/api-gateway
+/auth-service
+/ledger-service
+/logging-service
+/wallet-service
+
+# Security and code scanner artifacts (Sonar, SAST, Trivy)
+.scannerwork/
+.sonar/
+.trivy/
+sast-results/
 
 # Generated protobuf and gRPC Go files
 /proto/**/*.pb.go
 
-# IDE and OS files
+# Scratch and temporary directories/files
+scratch/
+tmp/
+temp/
+*.tmp
+*.temp
+*~
+
+# IDE and Editor files
 .vscode/
 .idea/
 *.swp
+*.swo
+.project
+.classpath
+.settings/
+
+# OS metadata files
 .DS_Store
+.DS_Store?
+._*
 Thumbs.db
+ehthumbs.db
+Desktop.ini
 
-# Temporary files
-*.tmp
-*.temp
-
-# Postman files
+# Postman and BloomRPC test preset files
 *.postman_environment.json
 *.postman_collection.json
-BloomRPC_Test_Presets.json
+BloomRPC_Test_Presets.json

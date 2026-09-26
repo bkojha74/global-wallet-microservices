@@ -1,4 +1,4 @@
-name: Go CI
+name: Enterprise CI/CD Pipeline
 
 on:
   push:
@@ -24,9 +24,14 @@ on:
 
 permissions:
   contents: read
+  security-events: write
 
 jobs:
-  test:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 1: Environment Setup, Protobuf Contract & Build Verification
+  # ═══════════════════════════════════════════════════════════════════════════
+  env-setup-check:
+    name: Environment & Proto Setup Check
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -37,6 +42,11 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Verify Go Module Integrity
+        run: |
+          go mod verify
+          git diff --exit-code go.mod go.sum
 
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -56,19 +66,240 @@ jobs:
             proto/ledger/ledger.proto \
             proto/auth/auth.proto
 
-      - name: Check formatting
+      - name: Verify Protobuf Contract Drift
+        run: |
+          if ! git diff --exit-code proto/; then
+            echo "::error::Protobuf generated code drift detected! Commit updated generated files before pushing."
+            exit 1
+          fi
+
+      - name: Verify Binaries Buildability
+        run: go build ./cmd/...
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 2: Coding Standards & Linting (Parallel)
+  # ═══════════════════════════════════════════════════════════════════════════
+  coding-standards:
+    name: Coding Standards (gofmt & golangci-lint)
+    needs: env-setup-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check Go Formatting
         shell: bash
-        run: test -z "$(gofmt -l .)"
+        run: |
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "::error::Files not formatted according to gofmt:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
 
-      - name: Run tests
-        run: go test ./... -count=1
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
 
-      - name: Run race detector
-        run: go test -race ./... -count=1
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 3: Security & Code Quality Gate / SAST (Parallel)
+  # ═══════════════════════════════════════════════════════════════════════════
+  security-quality-sast:
+    name: SAST & Security Analysis (SonarQube / Fortify / govulncheck)
+    needs: env-setup-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Dependency Vulnerability Scan (govulncheck)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: Run GoSec Security Linter (OWASP/CWE Analysis)
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          gosec -exclude-generated -severity medium ./...
+
+      - name: SonarQube / SonarCloud Scanner
+        if: env.SONAR_TOKEN != ''
+        uses: sonarsource/sonarqube-scan-action@v3
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: SonarQube Status Notice
+        if: env.SONAR_TOKEN == ''
+        run: |
+          echo "Notice: SONAR_TOKEN secret not present in repository secrets. Skipping remote SonarQube Quality Gate analysis."
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 4: Unit Testing & Race Detection (Parallel)
+  # ═══════════════════════════════════════════════════════════════════════════
+  unit-tests:
+    name: Unit Tests & Race Detection
+    needs: env-setup-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run Unit Tests with Race Detector & Coverage
+        run: |
+          go test -race -v -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Upload Test Coverage Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.out
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 5: Integration Testing (Live Backing Services)
+  # ═══════════════════════════════════════════════════════════════════════════
+  integration-tests:
+    name: Integration Testing (Keycloak & Backing Services)
+    needs: [coding-standards, security-quality-sast, unit-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install protobuf compiler & plugins
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          protoc --go_out=. --go_opt=paths=source_relative \
+            --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+            proto/wallet/wallet.proto proto/ledger/ledger.proto proto/auth/auth.proto
+
+      - name: Start Ephemeral Keycloak Container
+        run: |
+          docker network create wallet_shared_net || true
+          docker run -d --name keycloak-ci --network wallet_shared_net \
+            -p 8085:8080 \
+            -e KEYCLOAK_ADMIN=admin \
+            -e KEYCLOAK_ADMIN_PASSWORD=admin \
+            -v ${{ github.workspace }}/deploy/keycloak/wallet-realm-realm.json:/opt/keycloak/data/import/wallet-realm-realm.json \
+            quay.io/keycloak/keycloak:24.0.1 start-dev --import-realm
+
+      - name: Wait for Keycloak Readiness
+        run: |
+          for i in {1..30}; do
+            if curl -s http://localhost:8085/realms/wallet-realm/.well-known/openid-configuration | grep -q "issuer"; then
+              echo "Keycloak is ready!"
+              exit 0
+            fi
+            echo "Waiting for Keycloak... ($i/30)"
+            sleep 2
+          done
+          echo "Keycloak readiness timed out"
+          docker logs keycloak-ci --tail=50
+          exit 1
+
+      - name: Run Keycloak OIDC & RBAC Integration Tests
+        env:
+          KEYCLOAK_TEST_HOST: http://localhost:8085
+        run: go test -v -run TestKeycloakIntegration ./cmd/auth-service
+
+      - name: Teardown Keycloak
+        if: always()
+        run: docker rm -f keycloak-ci || true
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 6: System & E2E Testing
+  # ═══════════════════════════════════════════════════════════════════════════
+  system-e2e-tests:
+    name: System & E2E Testing
+    needs: integration-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Networks & Volumes
+        run: |
+          docker network inspect wallet_shared_net >/dev/null 2>&1 || docker network create wallet_shared_net
+          docker volume inspect global-wallet-microservices_mongo_data >/dev/null 2>&1 || docker volume create global-wallet-microservices_mongo_data
+
+      - name: Build and Spin Up Full System Stack
+        run: |
+          docker compose -f docker-compose.mongodb.yml up -d
+          docker compose -f docker-compose.rabbitmq.yml up -d
+          docker compose -f docker-compose.auth.yml up --build -d
+          docker compose -f docker-compose.logging.yml up --build -d
+          docker compose -f docker-compose.yml up --build -d
+
+      - name: Wait for API Gateway Readiness
+        run: |
+          for i in {1..35}; do
+            if curl -s http://localhost:8080/api/v1/cluster/status | grep -q "current_routed_target"; then
+              echo "API Gateway and cluster are operational!"
+              exit 0
+            fi
+            echo "Waiting for API Gateway cluster... ($i/35)"
+            sleep 3
+          done
+          echo "Cluster readiness timeout"
+          docker compose -f docker-compose.yml logs --tail=50
+          exit 1
+
+      - name: Run E2E Test Suite (9 ACID Transfer & Failover Scenarios)
+        run: |
+          chmod +x scripts/test-e2e.sh
+          ./scripts/test-e2e.sh
+
+      - name: Dump Logs on Failure
+        if: failure()
+        run: |
+          docker compose -f docker-compose.yml logs --tail=100
+          docker compose -f docker-compose.auth.yml logs --tail=50
+          docker compose -f docker-compose.logging.yml logs --tail=50
+
+      - name: Teardown System Stack
+        if: always()
+        run: |
+          docker compose -f docker-compose.yml down -v || true
+          docker compose -f docker-compose.logging.yml down -v || true
+          docker compose -f docker-compose.auth.yml down -v || true
+          docker compose -f docker-compose.rabbitmq.yml down -v || true
+          docker compose -f docker-compose.mongodb.yml down -v || true
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 7: Container Build, Security Scan (Trivy) & Push to Registry
+  # ═══════════════════════════════════════════════════════════════════════════
   docker-publish:
-    name: Build & Push to Docker Hub
-    needs: test
+    name: Build, Scan & Push to Docker Hub
+    needs: system-e2e-tests
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     strategy:
@@ -109,7 +340,26 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-,format=short
 
-      - name: Build and push image
+      - name: Build Docker Image locally for Scanning
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.service.target }}
+          load: true
+          tags: ${{ matrix.service.name }}:scan
+          cache-from: type=gha
+
+      - name: Run Trivy Container Vulnerability Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ matrix.service.name }}:scan'
+          format: 'table'
+          exit-code: '0'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Push Image to Docker Hub
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -120,6 +370,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 8: Deploy to Target / Local Server
+  # ═══════════════════════════════════════════════════════════════════════════
   deploy:
     name: Deploy to Local Server
     needs: docker-publish
@@ -186,3 +439,25 @@ jobs:
         continue-on-error: true
         run: |
           docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 9: Post-Deployment Smoke Verification
+  # ═══════════════════════════════════════════════════════════════════════════
+  post-deploy-smoke:
+    name: Post-Deploy Smoke Verification
+    needs: deploy
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, Windows]
+    steps:
+      - name: Verify API Gateway & Cluster Status
+        shell: cmd
+        continue-on-error: true
+        run: |
+          echo Verifying cluster status after deployment...
+          curl -s -f http://localhost:8080/api/v1/cluster/status
+          if errorlevel 1 (
+            echo ::warning::Local cluster status check returned error or runner cannot reach localhost:8080.
+          ) else (
+            echo.
+            echo Cluster is healthy and responding after deployment!
+          )

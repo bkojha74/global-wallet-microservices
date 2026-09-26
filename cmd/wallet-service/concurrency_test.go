@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
@@ -16,6 +18,8 @@ import (
 
 	"wallet-system/pkg/coordinator"
 	"wallet-system/pkg/db"
+	"wallet-system/pkg/observability"
+	ledgerv1 "wallet-system/proto/ledger"
 	walletv1 "wallet-system/proto/wallet"
 )
 
@@ -338,3 +342,161 @@ func TestConcurrentIdempotentReplayLive(t *testing.T) {
 		t.Fatalf("expected balance 75, got %+v", bal.Balances)
 	}
 }
+
+func TestTransferFundsEdgeCasesLive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	client, err := db.ConnectWithRetry(ctx, db.DefaultMongoURI(), 2)
+	if err != nil {
+		t.Skipf("MongoDB not reachable: %v", err)
+		return
+	}
+	defer client.Disconnect(ctx)
+
+	database := client.Database("test_wallet_edge_cases_db")
+	_ = database.Drop(ctx)
+	defer database.Drop(ctx)
+
+	_ = db.EnsureWalletIndexes(ctx, database)
+
+	srv := &server{
+		mongoClient: client,
+		dbName:      "test_wallet_edge_cases_db",
+		region:      "test-edge-region",
+		isActive:    true,
+	}
+
+	now := time.Now().UnixNano()
+	wSrc := fmt.Sprintf("src-%d", now)
+	wDst := fmt.Sprintf("dst-%d", now)
+	wEUR := fmt.Sprintf("eur-%d", now)
+	wFrozen := fmt.Sprintf("frz-%d", now)
+
+	_, _ = srv.CreateWallet(ctx, &walletv1.CreateWalletRequest{WalletId: wSrc, Currency: "USD", InitialBalance: 500})
+	_, _ = srv.CreateWallet(ctx, &walletv1.CreateWalletRequest{WalletId: wDst, Currency: "USD", InitialBalance: 500})
+	_, _ = srv.CreateWallet(ctx, &walletv1.CreateWalletRequest{WalletId: wEUR, Currency: "EUR", InitialBalance: 500})
+	_, _ = srv.CreateWallet(ctx, &walletv1.CreateWalletRequest{WalletId: wFrozen, Currency: "USD", InitialBalance: 500})
+	_ = srv.UpdateWalletStatus(ctx, wFrozen, WalletStatusFrozen)
+
+	// 1. Missing source wallet
+	resp1, _ := srv.TransferFunds(ctx, &walletv1.TransferFundsRequest{
+		IdempotencyKey:      fmt.Sprintf("k-missing-src-%d", now),
+		SourceWalletId:      "nonexistent-src",
+		DestinationWalletId: wDst,
+		Amount:              &walletv1.Money{Units: 50, Currency: "USD"},
+	})
+	if resp1 == nil || resp1.Status != walletv1.TransferFundsResponse_FAILED_INSUFFICIENT_FUNDS {
+		t.Fatalf("expected FAILED_INSUFFICIENT_FUNDS for missing source, got %+v", resp1)
+	}
+
+	// 2. Missing destination wallet
+	resp2, _ := srv.TransferFunds(ctx, &walletv1.TransferFundsRequest{
+		IdempotencyKey:      fmt.Sprintf("k-missing-dst-%d", now),
+		SourceWalletId:      wSrc,
+		DestinationWalletId: "nonexistent-dst",
+		Amount:              &walletv1.Money{Units: 50, Currency: "USD"},
+	})
+	if resp2 == nil || resp2.Status != walletv1.TransferFundsResponse_INTERNAL_ERROR {
+		t.Fatalf("expected INTERNAL_ERROR for missing destination, got %+v", resp2)
+	}
+
+	// 3. Frozen source wallet
+	resp3, _ := srv.TransferFunds(ctx, &walletv1.TransferFundsRequest{
+		IdempotencyKey:      fmt.Sprintf("k-frozen-src-%d", now),
+		SourceWalletId:      wFrozen,
+		DestinationWalletId: wDst,
+		Amount:              &walletv1.Money{Units: 50, Currency: "USD"},
+	})
+	if resp3 == nil || resp3.Status != walletv1.TransferFundsResponse_INTERNAL_ERROR {
+		t.Fatalf("expected INTERNAL_ERROR for frozen source, got %+v", resp3)
+	}
+
+	// 4. Frozen destination wallet
+	resp4, _ := srv.TransferFunds(ctx, &walletv1.TransferFundsRequest{
+		IdempotencyKey:      fmt.Sprintf("k-frozen-dst-%d", now),
+		SourceWalletId:      wSrc,
+		DestinationWalletId: wFrozen,
+		Amount:              &walletv1.Money{Units: 50, Currency: "USD"},
+	})
+	if resp4 == nil || resp4.Status != walletv1.TransferFundsResponse_INTERNAL_ERROR {
+		t.Fatalf("expected INTERNAL_ERROR for frozen destination, got %+v", resp4)
+	}
+
+	// 5. Currency mismatch on destination
+	resp5, _ := srv.TransferFunds(ctx, &walletv1.TransferFundsRequest{
+		IdempotencyKey:      fmt.Sprintf("k-curr-mismatch-%d", now),
+		SourceWalletId:      wSrc,
+		DestinationWalletId: wEUR,
+		Amount:              &walletv1.Money{Units: 50, Currency: "USD"},
+	})
+	if resp5 == nil || resp5.Status != walletv1.TransferFundsResponse_INTERNAL_ERROR {
+		t.Fatalf("expected INTERNAL_ERROR for currency mismatch, got %+v", resp5)
+	}
+}
+
+func TestHandleWalletShutdownLive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client, err := db.ConnectWithRetry(ctx, db.DefaultMongoURI(), 2)
+	if err != nil {
+		t.Skipf("MongoDB not reachable: %v", err)
+		return
+	}
+
+	grpcServer := grpc.NewServer()
+	healthServer := health.NewServer()
+	metricsServer := &http.Server{}
+
+	handleWalletShutdown(grpcServer, healthServer, metricsServer, nil, nil, client)
+}
+
+func TestDispatchImmediateLedgerSuccessLive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client, err := db.ConnectWithRetry(ctx, db.DefaultMongoURI(), 2)
+	if err != nil {
+		t.Skipf("MongoDB not reachable: %v", err)
+		return
+	}
+	defer client.Disconnect(ctx)
+
+	taskCol := client.Database("banking_db").Collection("ledger_tasks")
+	task := LedgerTask{
+		TransactionID:       fmt.Sprintf("tx-live-success-%d", time.Now().UnixNano()),
+		IdempotencyKey:      fmt.Sprintf("idemp-live-success-%d", time.Now().UnixNano()),
+		SourceWalletID:      "alice",
+		DestinationWalletID: "bob",
+		Amount:              100,
+		Currency:            "USD",
+		Region:              "us-east-1",
+		Status:              LedgerTaskStatusPending,
+		CreatedAt:           time.Now().UTC(),
+	}
+	_, _ = taskCol.InsertOne(ctx, task)
+
+	fakeSuccess := &fakeLedgerSyncClient{
+		recordResp: &ledgerv1.RecordTransactionResponse{Success: true},
+	}
+	relay := &LedgerRelay{
+		col:          taskCol,
+		ledgerClient: fakeSuccess,
+		logger:       observability.NewMemoryLogger(),
+	}
+	srv := &server{
+		ledgerRelay: relay,
+		logger:      observability.NewMemoryLogger(),
+	}
+	req := &walletv1.TransferFundsRequest{
+		IdempotencyKey:      task.IdempotencyKey,
+		SourceWalletId:      "alice",
+		DestinationWalletId: "bob",
+		Amount:              &walletv1.Money{Currency: "USD", Units: 100},
+	}
+	srv.dispatchImmediateLedger(ctx, req, task, task.TransactionID)
+}
+
+
+

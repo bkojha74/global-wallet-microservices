@@ -64,6 +64,8 @@ func (m *MetricsRegistry) IncEventsEmitted(service, level, eventType string) {
 	m.mu.Unlock()
 }
 
+const labelServiceFmt = "service=%q"
+
 func (m *MetricsRegistry) IncPublishFailures(service, reason string) {
 	key := fmt.Sprintf("service=%q,reason=%q", service, reason)
 	m.mu.Lock()
@@ -72,14 +74,14 @@ func (m *MetricsRegistry) IncPublishFailures(service, reason string) {
 }
 
 func (m *MetricsRegistry) IncEventsDropped(service string) {
-	key := fmt.Sprintf("service=%q", service)
+	key := fmt.Sprintf(labelServiceFmt, service)
 	m.mu.Lock()
 	m.eventsDropped[key]++
 	m.mu.Unlock()
 }
 
 func (m *MetricsRegistry) AddSpoolReplayed(service string, count int64) {
-	key := fmt.Sprintf("service=%q", service)
+	key := fmt.Sprintf(labelServiceFmt, service)
 	m.mu.Lock()
 	m.spoolReplayed[key] += count
 	m.mu.Unlock()
@@ -88,21 +90,21 @@ func (m *MetricsRegistry) AddSpoolReplayed(service string, count int64) {
 // --- Gauge setters ---
 
 func (m *MetricsRegistry) SetQueueDepth(service string, depth int) {
-	key := fmt.Sprintf("service=%q", service)
+	key := fmt.Sprintf(labelServiceFmt, service)
 	m.mu.Lock()
 	m.queueDepth[key] = int64(depth)
 	m.mu.Unlock()
 }
 
 func (m *MetricsRegistry) SetSpoolBytes(service string, bytes int64) {
-	key := fmt.Sprintf("service=%q", service)
+	key := fmt.Sprintf(labelServiceFmt, service)
 	m.mu.Lock()
 	m.spoolBytes[key] = bytes
 	m.mu.Unlock()
 }
 
 func (m *MetricsRegistry) SetSpoolOldestAge(service string, seconds float64) {
-	key := fmt.Sprintf("service=%q", service)
+	key := fmt.Sprintf(labelServiceFmt, service)
 	m.mu.Lock()
 	m.spoolOldestAge[key] = seconds
 	m.mu.Unlock()
@@ -158,84 +160,35 @@ func (m *MetricsRegistry) Handler() http.Handler {
 		defer m.mu.RUnlock()
 
 		var b strings.Builder
-
-		// 1. logging_events_emitted_total (Counter)
-		b.WriteString("# HELP logging_events_emitted_total Total events successfully emitted.\n")
-		b.WriteString("# TYPE logging_events_emitted_total counter\n")
-		for _, k := range sortedKeys(m.eventsEmitted) {
-			fmt.Fprintf(&b, "logging_events_emitted_total{%s} %d\n", k, m.eventsEmitted[k])
-		}
-
-		// 2. logging_queue_depth — current in-memory channel depth (Gauge)
-		b.WriteString("# HELP logging_queue_depth Current number of events waiting in the in-memory channel.\n")
-		b.WriteString("# TYPE logging_queue_depth gauge\n")
-		for _, k := range sortedKeys(m.queueDepth) {
-			fmt.Fprintf(&b, "logging_queue_depth{%s} %d\n", k, m.queueDepth[k])
-		}
-
-		// 3. logging_spool_bytes — current spool file size (Gauge)
-		b.WriteString("# HELP logging_spool_bytes Current size of the local spool file in bytes.\n")
-		b.WriteString("# TYPE logging_spool_bytes gauge\n")
-		for _, k := range sortedKeys(m.spoolBytes) {
-			fmt.Fprintf(&b, "logging_spool_bytes{%s} %d\n", k, m.spoolBytes[k])
-		}
-
-		// 3. logging_publish_failures_total (Counter)
-		b.WriteString("# HELP logging_publish_failures_total Total RabbitMQ publish failures since startup.\n")
-		b.WriteString("# TYPE logging_publish_failures_total counter\n")
-		for _, k := range sortedKeys(m.publishFailures) {
-			fmt.Fprintf(&b, "logging_publish_failures_total{%s} %d\n", k, m.publishFailures[k])
-		}
-
-		// 4. logging_events_dropped_total (Counter)
-		b.WriteString("# HELP logging_events_dropped_total Total events dropped due to full channel and spool error.\n")
-		b.WriteString("# TYPE logging_events_dropped_total counter\n")
-		for _, k := range sortedKeys(m.eventsDropped) {
-			fmt.Fprintf(&b, "logging_events_dropped_total{%s} %d\n", k, m.eventsDropped[k])
-		}
-
-		// 5. logging_spool_replay_events_total (Counter)
-		b.WriteString("# HELP logging_spool_replay_events_total Total events successfully replayed from spool.\n")
-		b.WriteString("# TYPE logging_spool_replay_events_total counter\n")
-		for _, k := range sortedKeys(m.spoolReplayed) {
-			fmt.Fprintf(&b, "logging_spool_replay_events_total{%s} %d\n", k, m.spoolReplayed[k])
-		}
-
-		// 6. logging_spool_oldest_event_age_seconds (Gauge)
-		b.WriteString("# HELP logging_spool_oldest_event_age_seconds Age in seconds of the oldest event in the spool.\n")
-		b.WriteString("# TYPE logging_spool_oldest_event_age_seconds gauge\n")
-		for _, k := range sortedFloatKeys(m.spoolOldestAge) {
-			fmt.Fprintf(&b, "logging_spool_oldest_event_age_seconds{%s} %.2f\n", k, m.spoolOldestAge[k])
-		}
-
-		// 7. grpc_requests_total (Counter)
-		b.WriteString("# HELP grpc_requests_total Total gRPC requests by service, method, and response status code.\n")
-		b.WriteString("# TYPE grpc_requests_total counter\n")
-		for _, k := range sortedKeys(m.grpcRequests) {
-			fmt.Fprintf(&b, "grpc_requests_total{%s} %d\n", k, m.grpcRequests[k])
-		}
-
-		// 8. grpc_request_duration_seconds (Summary/Counters)
-		b.WriteString("# HELP grpc_request_duration_seconds_sum Total duration of gRPC requests in seconds.\n")
-		b.WriteString("# TYPE grpc_request_duration_seconds_sum counter\n")
-		for _, k := range sortedFloatKeys(m.grpcLatencySum) {
-			fmt.Fprintf(&b, "grpc_request_duration_seconds_sum{%s} %.4f\n", k, m.grpcLatencySum[k])
-		}
-		b.WriteString("# HELP grpc_request_duration_seconds_count Total count of recorded gRPC requests.\n")
-		b.WriteString("# TYPE grpc_request_duration_seconds_count counter\n")
-		for _, k := range sortedKeys(m.grpcLatencyCount) {
-			fmt.Fprintf(&b, "grpc_request_duration_seconds_count{%s} %d\n", k, m.grpcLatencyCount[k])
-		}
-
-		// 9. cluster_active_target (Gauge)
-		b.WriteString("# HELP cluster_active_target Cluster active routing target (1 for active, 0 for standby).\n")
-		b.WriteString("# TYPE cluster_active_target gauge\n")
-		for _, k := range sortedKeys(m.clusterActiveTarget) {
-			fmt.Fprintf(&b, "cluster_active_target{%s} %d\n", k, m.clusterActiveTarget[k])
-		}
+		writeMetricInts(&b, "logging_events_emitted_total", "Total events successfully emitted.", "counter", m.eventsEmitted)
+		writeMetricInts(&b, "logging_queue_depth", "Current number of events waiting in the in-memory channel.", "gauge", m.queueDepth)
+		writeMetricInts(&b, "logging_spool_bytes", "Current size of the local spool file in bytes.", "gauge", m.spoolBytes)
+		writeMetricInts(&b, "logging_publish_failures_total", "Total RabbitMQ publish failures since startup.", "counter", m.publishFailures)
+		writeMetricInts(&b, "logging_events_dropped_total", "Total events dropped due to full channel and spool error.", "counter", m.eventsDropped)
+		writeMetricInts(&b, "logging_spool_replay_events_total", "Total events successfully replayed from spool.", "counter", m.spoolReplayed)
+		writeMetricFloats(&b, "logging_spool_oldest_event_age_seconds", "Age in seconds of the oldest event in the spool.", "gauge", "%.2f", m.spoolOldestAge)
+		writeMetricInts(&b, "grpc_requests_total", "Total gRPC requests by service, method, and response status code.", "counter", m.grpcRequests)
+		writeMetricFloats(&b, "grpc_request_duration_seconds_sum", "Total duration of gRPC requests in seconds.", "counter", "%.4f", m.grpcLatencySum)
+		writeMetricInts(&b, "grpc_request_duration_seconds_count", "Total count of recorded gRPC requests.", "counter", m.grpcLatencyCount)
+		writeMetricInts(&b, "cluster_active_target", "Cluster active routing target (1 for active, 0 for standby).", "gauge", m.clusterActiveTarget)
 
 		_, _ = w.Write([]byte(b.String()))
 	})
+}
+
+func writeMetricInts(b *strings.Builder, name, help, typeName string, data map[string]int64) {
+	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, typeName)
+	for _, k := range sortedKeys(data) {
+		fmt.Fprintf(b, "%s{%s} %d\n", name, k, data[k])
+	}
+}
+
+func writeMetricFloats(b *strings.Builder, name, help, typeName, format string, data map[string]float64) {
+	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, typeName)
+	for _, k := range sortedFloatKeys(data) {
+		b.WriteString(name + "{" + k + "} ")
+		fmt.Fprintf(b, format+"\n", data[k])
+	}
 }
 
 func sortedKeys[V any](m map[string]V) []string {
