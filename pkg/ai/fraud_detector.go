@@ -16,7 +16,7 @@ import (
 type FraudSignals struct {
 	SourceWalletID      string    `json:"source_wallet_id"`
 	DestinationWalletID string    `json:"destination_wallet_id"`
-	AmountUnits         int64     `json:"amount_units"`       // smallest currency unit, e.g. cents
+	AmountUnits         int64     `json:"amount_units"` // smallest currency unit, e.g. cents
 	Currency            string    `json:"currency"`
 	Region              string    `json:"region"`
 	Timestamp           time.Time `json:"timestamp"`
@@ -28,10 +28,10 @@ type FraudSignals struct {
 
 // FraudDecision is the structured verdict returned by Gemini.
 type FraudDecision struct {
-	RiskScore  float64 `json:"risk_score"`  // 0.0 = safe, 1.0 = definite fraud
-	Decision   string  `json:"decision"`    // "ALLOW", "FLAG", or "BLOCK"
-	Reason     string  `json:"reason"`      // one-sentence explanation
-	Confidence float64 `json:"confidence"`  // model confidence 0.0–1.0
+	RiskScore  float64 `json:"risk_score"` // 0.0 = safe, 1.0 = definite fraud
+	Decision   string  `json:"decision"`   // "ALLOW", "FLAG", or "BLOCK"
+	Reason     string  `json:"reason"`     // one-sentence explanation
+	Confidence float64 `json:"confidence"` // model confidence 0.0–1.0
 }
 
 // FraudDetector scores wallet transfer requests using the Gemini AI model.

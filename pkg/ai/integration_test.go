@@ -25,7 +25,7 @@ func TestFraudDetector_LiveGemini(t *testing.T) {
 	defer client.Close()
 
 	detector := NewFraudDetector(client)
-	
+
 	// Test Case: Safe, small transfer between known wallets
 	t.Run("SafeTransfer", func(t *testing.T) {
 		signals := FraudSignals{
