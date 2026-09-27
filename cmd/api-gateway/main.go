@@ -348,7 +348,7 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	})
 
 	log.Printf(traceWalletGRPCReqFmt, traceID, target)
-	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	callCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
 	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
@@ -360,6 +360,10 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 			"operation": "transfer",
 			"error":     err.Error(),
 		})
+		if st, ok := status.FromError(err); ok && st.Code() == codes.PermissionDenied {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": st.Message()})
+			return
+		}
 		http.Error(w, fmt.Sprintf("Transfer gRPC failure: %v", err), http.StatusInternalServerError)
 		return
 	}
