@@ -54,6 +54,7 @@ The **Global Multi-Currency Digital Wallet & Ledger Service** is engineered to d
 * **Idempotency Guarantees**: Cryptographic deduplication using client-supplied idempotency keys with automated 30-day TTL lifecycle management.
 * **Active-Standby Multi-Region Disaster Recovery**: Simulated multi-region architecture (`us-east-1` Primary Active, `eu-west-1` Standby Hot DR) featuring dynamic routing switchover at the API Gateway.
 * **Resilient Centralized Logging Ecosystem**: Non-blocking asynchronous event emission to RabbitMQ with automatic local JSONL disk spooling and backpressure-aware background replay workers.
+* **Intelligent AI Fraud Detection**: Real-time contextual transaction analysis leveraging Google's `gemini-3.1-flash-lite` to intercept and block anomalous financial activity, utilizing a resilient Fail-Open architecture to ensure high availability.
 * **Operational Tracing & Observability**: Correlation IDs (`association_id`, `idempotency_key`, `transaction_id`) propagated across gRPC metadata and HTTP headers, with a dedicated Log Query API, Prometheus metrics, and preconfigured Grafana dashboards.
 
 ---
@@ -481,6 +482,11 @@ graph TD
 - [x] **Multi-Stage Matrix Docker Builds**: Automated parallel builds across 5 microservices using Docker Buildx and GitHub Actions cache (`type=gha`), creating optimized production container images.
 - [x] **Docker Hub Distribution & Semantic Tagging**: Automatic container image publishing to Docker Hub with `latest` (from `main`), semantic release versions (`v*`), and Git SHA tags.
 - [x] **Continuous Deployment via Self-Hosted Runner**: Automated deployment pipeline targeting self-hosted environments (`[self-hosted, Windows]`) using native `cmd` scripts to pull updated images and perform zero-downtime rolling updates of all modular Docker Compose stacks.
+
+#### 7. AI Fraud Prevention & Intelligence
+- [x] **Google Gemini Integration**: Integrated `gemini-3.1-flash-lite` for real-time contextual fraud analysis on every transfer via the official `github.com/google/genai-alpha-go` SDK.
+- [x] **Enforcement & Fail-Open Resiliency**: Transactions evaluated with an AI Risk Score. If `score > 0.6`, the transfer is rejected with HTTP `403 Forbidden`. If the AI API times out or rate limits, the system safely "Fails-Open" ensuring legitimate transactions are never dropped.
+- [x] **CI/CD Quality Gate Testing**: The CI/CD End-to-End Test suite explicitly tests and asserts the AI Fraud Detection block during the GitHub Actions pipeline, preventing regression.
 
 ---
 
