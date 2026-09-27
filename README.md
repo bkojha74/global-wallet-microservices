@@ -122,6 +122,17 @@ Operating under the foundational principle of **"Never Trust, Always Verify"**, 
 
 ---
 
+### 🧠 Intelligent AI Fraud Detection (Powered by Gemini)
+
+To protect against sophisticated financial exploits and anomalous transfer patterns, the platform integrates a **Real-Time AI Fraud Detection Layer** directly into the core transaction lifecycle.
+
+* **Contextual Transfer Analysis**: Leverages Google's `gemini-3.1-flash-lite` model via the `github.com/google/genai-alpha-go` SDK to evaluate the context, intent, and risk of every transfer *before* database execution.
+* **Proactive Interception**: Transactions assigned a high AI Risk Score (e.g., `> 0.60`) are instantly blocked and rejected with an HTTP `403 Forbidden` response, preventing funds from ever leaving the account.
+* **Fail-Open Resiliency**: Designed for mission-critical availability, the system utilizes a strict timeout mechanism. If the AI provider experiences an outage, rate-limiting, or elevated latency, the system safely "Fails-Open" to ensure legitimate transactions are never dropped.
+* **CI/CD Quality Gates**: Automated End-to-End integration tests explicitly trigger fraudulent attack scenarios during the GitHub Actions pipeline, ensuring the AI model is actively enforcing security policies before any code is merged to production.
+
+---
+
 ## Pictorial Architecture & Flow Representations
 
 ### 1. High-Level System Architecture
