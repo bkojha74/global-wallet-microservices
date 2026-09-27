@@ -54,6 +54,7 @@ The **Global Multi-Currency Digital Wallet & Ledger Service** is engineered to d
 * **Idempotency Guarantees**: Cryptographic deduplication using client-supplied idempotency keys with automated 30-day TTL lifecycle management.
 * **Active-Standby Multi-Region Disaster Recovery**: Simulated multi-region architecture (`us-east-1` Primary Active, `eu-west-1` Standby Hot DR) featuring dynamic routing switchover at the API Gateway.
 * **Resilient Centralized Logging Ecosystem**: Non-blocking asynchronous event emission to RabbitMQ with automatic local JSONL disk spooling and backpressure-aware background replay workers.
+* **Intelligent AI Fraud Detection**: Real-time contextual transaction analysis leveraging Google's `gemini-3.1-flash-lite` to intercept and block anomalous financial activity, utilizing a resilient Fail-Open architecture to ensure high availability.
 * **Operational Tracing & Observability**: Correlation IDs (`association_id`, `idempotency_key`, `transaction_id`) propagated across gRPC metadata and HTTP headers, with a dedicated Log Query API, Prometheus metrics, and preconfigured Grafana dashboards.
 
 ---
@@ -121,6 +122,17 @@ Operating under the foundational principle of **"Never Trust, Always Verify"**, 
 
 ---
 
+### 🧠 Intelligent AI Fraud Detection (Powered by Gemini)
+
+To protect against sophisticated financial exploits and anomalous transfer patterns, the platform integrates a **Real-Time AI Fraud Detection Layer** directly into the core transaction lifecycle.
+
+* **Contextual Transfer Analysis**: Leverages Google's `gemini-3.1-flash-lite` model via the `github.com/google/genai-alpha-go` SDK to evaluate the context, intent, and risk of every transfer *before* database execution.
+* **Proactive Interception**: Transactions assigned a high AI Risk Score (e.g., `> 0.60`) are instantly blocked and rejected with an HTTP `403 Forbidden` response, preventing funds from ever leaving the account.
+* **Fail-Open Resiliency**: Designed for mission-critical availability, the system utilizes a strict timeout mechanism. If the AI provider experiences an outage, rate-limiting, or elevated latency, the system safely "Fails-Open" to ensure legitimate transactions are never dropped.
+* **CI/CD Quality Gates**: Automated End-to-End integration tests explicitly trigger fraudulent attack scenarios during the GitHub Actions pipeline, ensuring the AI model is actively enforcing security policies before any code is merged to production.
+
+---
+
 ## Pictorial Architecture & Flow Representations
 
 ### 1. High-Level System Architecture
@@ -149,6 +161,7 @@ flowchart TB
         subgraph CoreLedger["Core Ledger Domain"]
             LS["ledger-service (:50052)<br/>- Immutable Audit Ledger<br/>- Cursor-Based Pagination<br/>- Management HTTP (:9092)"]
         end
+        AI["Gemini 3.1 Flash<br/>AI Fraud Detection"]
     end
 
     subgraph Persistence["Persistence Layer (MongoDB 7.0 rs0)"]
@@ -184,6 +197,8 @@ flowchart TB
     GW -->|"gRPC"| LS
     GW <-->|"Failover Consensus"| MDB_C
 
+    WP -->|"Fraud Context (RPC)"| AI
+    WS -.->|"Fraud Context (RPC)"| AI
     WP -->|"ACID Multi-Doc TX"| MDB
     WS -.->|"ACID Multi-Doc TX"| MDB
     WP -->|"Fast-Path gRPC / Relay"| LS
@@ -229,6 +244,10 @@ sequenceDiagram
     GW->>WS: gRPC TransferFunds(IdempotencyKey, Source, Dest, Amount)
     
     Note over WS: Generate association_id, transaction_id & outbox_task_id
+
+    participant AI as Gemini 3.1 Flash AI
+    WS->>AI: Evaluate Fraud Risk(Alice, Bob, $250)
+    AI-->>WS: Risk Score: 0.1 (SAFE)
 
     rect rgb(238, 246, 255)
         Note over WS,MDB: MongoDB Multi-Document ACID Transaction
@@ -382,6 +401,10 @@ graph TD
         Allow -->|"gRPC over mTLS (Verified Client Cert)"| WP["wallet-primary (:50051)<br/>tls.RequireAndVerifyClientCert"]
         Allow -->|"gRPC over mTLS (Verified Client Cert)"| WS["wallet-standby (:50053)<br/>tls.RequireAndVerifyClientCert"]
         Allow -->|"gRPC over mTLS (Verified Client Cert)"| LS["ledger-service (:50052)<br/>tls.RequireAndVerifyClientCert"]
+        
+        WP -->|"Evaluate Risk"| AI["Gemini AI Fraud Detection"]
+        WS -->|"Evaluate Risk"| AI
+        
         WP -->|"gRPC over mTLS"| LS
         WS -->|"gRPC over mTLS"| LS
     end
@@ -409,87 +432,6 @@ The platform is structured into **6 modular Docker Compose projects** that can b
 
 ---
 
-## Implementation Status & Production Readiness Roadmap
-
-An exhaustive production readiness audit was performed in [docs/PRODUCTION_READINESS_AUDIT.md](docs/PRODUCTION_READINESS_AUDIT.md). The platform transition is structured into 4 remediation phases:
-
-```mermaid
-graph TD
-    classDef completed fill:#d4edda,stroke:#28a745,stroke-width:2px,color:#155724;
-
-    P1["Phase 1: Financial & Persistence Hardening<br/>(COMPLETED)"]:::completed
-    L15["Centralized Asynchronous Logging (Phases 1-5)<br/>(COMPLETED)"]:::completed
-    P2["Phase 2: Zero-Trust Security & Identity<br/>(COMPLETED)"]:::completed
-    P3["Phase 3: High Availability & Tracing<br/>(COMPLETED)"]:::completed
-    P4["Phase 4: Cloud-Native & Double-Entry<br/>(COMPLETED)"]:::completed
-    P5["Phase 5: Automated CI/CD & Deployment<br/>(COMPLETED)"]:::completed
-
-    P1 --> P2
-    L15 --> P2
-    P2 --> P3
-    P3 --> P4
-    P4 --> P5
-```
-
-### Completed Implementations
-
-#### 1. Core Financial & Persistence Hardening (Phase 1)
-- [x] **Decoupled Database Transactions from Network I/O (GAP-FIN-01)**: Completely removed synchronous cross-service gRPC calls from inside MongoDB `session.WithTransaction()`. Implemented the **Transactional Outbox Pattern** (`ledger_tasks` collection) and a background `LedgerRelay` worker for resilient fallback delivery.
-- [x] **Eliminated Database Collection Scans (GAP-DB-01)**: Created unique index on `idempotency_key` and compound query indexes on `{source_wallet_id: 1, timestamp: -1}` and `{destination_wallet_id: 1, timestamp: -1}` on `ledger_entries` collection, terminating COLLSCAN latencies.
-- [x] **Automated Data Lifecycle (GAP-DB-03)**: Enforced a 30-day MongoDB TTL expiration index on `idempotency_records` (`created_at`).
-- [x] **Bounded Ledger Queries & Pagination (GAP-DB-02)**: Implemented cursor-based pagination with configurable limit bounds (default 50, max 200) and reverse-chronological sorting.
-- [x] **Strict Currency Scale & Validation (GAP-FIN-04)**: Standardized currency parsing against strict ISO-4217 currency dictionaries.
-
-#### 2. Centralized Asynchronous Logging Subsystem (Phases 1–5)
-- [x] **Correlation Context Propagation (Phase 1)**: Context propagation across gRPC metadata (`x-association-id`, `x-idempotency-key`, `x-transaction-id`).
-- [x] **Resilient AMQP Publisher with Disk Spooling (Phase 2)**: Non-blocking buffered channel publisher with automatic fallback to local JSONL spool files and backpressure-aware background replay.
-- [x] **Standalone Logging Microservice (Phase 3)**: Dedicated consumer microservice with schema validation, deduplication via MongoDB unique index, and dead-letter queuing (`wallet.logging.dead.v1`).
-- [x] **Operational Log & Trace Query REST API (Phase 4)**: Added `/api/v1/logs` with rich multi-field filtering and `/api/v1/traces/{association_id}` to reconstruct the full distributed 12-step transaction timeline with latency metrics.
-- [x] **Production Hardening & Monitoring (Phase 5)**: Configured TLS transport, quorum queue support, scheduled data retention cleaner, API key access control, Prometheus metrics exporter (`:9090`), Grafana dashboards, and audit-critical transactional outbox.
-
-#### 3. Zero-Trust Security & Identity (Phase 2)
-- [x] **JWT Gateway Authentication & Token Minting (GAP-SEC-01)**: Implemented cryptographic HMAC-SHA256 JWT validation at API Gateway with claims schema (`sub`, `roles`, `scopes`, `exp`). Added dev minting endpoint `/api/v1/auth/token`.
-- [x] **Insecure Direct Object Reference (IDOR) Protection (GAP-SEC-01)**: Enforced identity ownership (`sub == wallet_id`) across transfers, balance inquiries, and ledger queries. Cross-account access is strictly rejected with HTTP 403 Forbidden unless caller possesses `admin` role.
-- [x] **Administrative Access Control for Failover (GAP-SEC-03)**: Restricted `POST /api/v1/cluster/failover` behind administrative RBAC requiring role `admin` or scope `cluster:admin`.
-- [x] **Mutual TLS (mTLS) for Inter-Service gRPC (GAP-SEC-02)**: Configured bidirectional TLS verification with `tls.RequireAndVerifyClientCert` and root CA pools across `api-gateway`, `wallet-service`, and `ledger-service`. Activated dynamically via `GRPC_TLS_ENABLED=true` with standalone cert generator script (`scripts/generate_certs.go`).
-- [x] **Gateway Defense-in-Depth (GAP-SEC-05 & GAP-REL-02)**: Token-bucket rate limiting (60 rps, 100 burst), 1MB payload limits (`http.MaxBytesReader`), standard security headers (`HSTS`, `CSP`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`), and Slowloris timeout protection (`ReadHeaderTimeout: 3s`).
-- [x] **Duplicate Wallet Prevention**: Enforced strict `InsertOne` semantics with `codes.AlreadyExists` / HTTP 409 Conflict preventing account balance overwrites.
-- [x] **Secrets & Configuration Management (GAP-SEC-04)**: Externalized all configuration and certificate paths into `.env.example`.
-
-#### 4. High Availability, Resilience & Distributed Tracing (Phase 3)
-- [x] **Graceful Process Lifecycle & Request Draining (GAP-REL-01)**: Implemented OS signal capture (`SIGTERM`/`SIGINT`) with HTTP `server.Shutdown()` (15s drain window) and `grpcServer.GracefulStop()` across `api-gateway`, `wallet-service`, and `ledger-service`. Decoupled background `LedgerRelay` workers safely shut down via `relay.Stop()`.
-- [x] **Distributed Failover Coordination (GAP-HA-01)**: Replaced single-process in-memory state with a pluggable `FailoverCoordinator` backed by MongoDB `cluster_state` collection (`_id: "active_target"`) featuring 1-second TTL cache for sub-microsecond gateway routing. Atomic updates propagate immediately across all gateway replicas and persist across restarts.
-- [x] **Standby Write Fencing & Role Consensus (GAP-HA-02)**: Enforced write fencing on standby wallet instances. Mutation RPCs (`CreateWallet`, `TransferFunds`) are rejected on standby with `codes.FailedPrecondition`, while read queries (`GetBalance`) and health checks remain fully accessible.
-- [x] **Standard gRPC Health Probes (GAP-REL-03)**: Implemented official `grpc.health.v1.Health` protocol on `wallet-service` (Primary & Standby) and `ledger-service`. Integrated API Gateway `/readyz` endpoint with live gRPC health validation of the active target node.
-- [x] **OpenTelemetry Distributed Tracing (GAP-OBS-01)**: Integrated official OpenTelemetry Go SDK (`go.opentelemetry.io/otel`) with global W3C `TraceContext` propagator. Added `TraceHTTPMiddleware` (injecting `X-Trace-ID` and `traceparent` headers) and gRPC client/server interceptors for end-to-end distributed span propagation.
-- [x] **Core Service Prometheus Exporters (GAP-OBS-02)**: Exposed dedicated management HTTP servers on `:9094` (`wallet-primary`), `:9093` (`wallet-standby`), and `:9092` (`ledger-service`), serving Prometheus `/metrics` (gRPC latency histograms, request counters, active target gauge) and `/healthz`. Configured automated Prometheus scrape jobs.
-- [x] **High-Concurrency Automated Test Suite (GAP-QA-01)**: Implemented race-verified concurrency tests (`cmd/wallet-service/concurrency_test.go`) covering 50-thread concurrent overdraft debit races ($100 balance, exactly 10 succeed, 40 fail, ending balance strictly $0.00 with zero leakage), 20-thread idempotent replays, standby write fencing, and gRPC health checks. 100% race-free under `go test -race ./...`.
-
----
-
-#### 5. Container Hardening, Kubernetes Suite, Double-Entry & Account Controls (Phase 4)
-- [x] **Hardened Non-Root Container Images (GAP-OPS-01 & GAP-OPS-02)**: Multi-stage Docker build running under unprivileged `appuser:appgroup` (UID 10001, GID 10001) with deterministic dependency caching (`COPY go.mod go.sum` -> `RUN go mod download`) and explicit management port declarations.
-- [x] **Production Kubernetes Manifest Suite (GAP-OPS-03 & GAP-HA-03)**: Comprehensive 10-manifest suite covering a 3-node HA MongoDB StatefulSet with headless DNS, automated `rs0` replica-set initiation, dynamic PVCs, resource requests/limits, securityContexts, liveness/readiness probes, RabbitMQ, Logging Service, NGINX Ingress with TLS, ConfigMaps/Secrets, HPA, and PDB.
-- [x] **GAAP/IFRS True Double-Entry Bookkeeping (GAP-FIN-02)**: Implemented balanced journal postings ($\sum \text{Debits} == \sum \text{Credits}$) for all financial movements, rejecting unbalanced legs before persistence.
-- [x] **Cryptographic SHA-256 Audit Chaining & Verification (GAP-FIN-02)**: Every ledger entry cryptographically chains its SHA-256 hash back to `GenesisHash` (`0000...0000`). Management HTTP endpoint `GET /audit/verify?wallet_id=<id>` on port `:9092` verifies entry equilibrium and flags any historical audit tampering.
-- [x] **Wallet Account Status & Operational Fencing (GAP-FIN-05)**: Added operational account states (`ACTIVE`, `FROZEN`, `CLOSED`). Prohibits transfers to or from frozen/closed accounts. Added management HTTP endpoint `GET|POST|PUT /admin/wallet/status` on ports `:9094`/`:9093` for live operational freeze/unfreeze actions.
-
----
-
-#### 6. Continuous Integration & Continuous Deployment (Phase 5 / CI/CD)
-- [x] **Automated Go Quality Gates & Contract Verification**: Automated GitHub Actions workflow (`.github/workflows/ci.yml`) compiling Protobuf v3 contracts (`wallet`, `ledger`, `auth`), verifying `gofmt` code formatting, and executing full unit tests and race condition detector (`go test -race ./...`).
-- [x] **Multi-Stage Matrix Docker Builds**: Automated parallel builds across 5 microservices using Docker Buildx and GitHub Actions cache (`type=gha`), creating optimized production container images.
-- [x] **Docker Hub Distribution & Semantic Tagging**: Automatic container image publishing to Docker Hub with `latest` (from `main`), semantic release versions (`v*`), and Git SHA tags.
-- [x] **Continuous Deployment via Self-Hosted Runner**: Automated deployment pipeline targeting self-hosted environments (`[self-hosted, Windows]`) using native `cmd` scripts to pull updated images and perform zero-downtime rolling updates of all modular Docker Compose stacks.
-
----
-
-### Future Enhancements Roadmap
-
-- [ ] **Foreign Exchange (FX) Engine (GAP-FIN-03)**: Support cross-currency transfers with guaranteed quote validity windows (30–60s) and multi-currency journal legs.
-- [ ] **Circuit Breaking & Mesh Telemetry (GAP-REL-04)**: Dynamic circuit breaking (e.g., `sony/gobreaker` or Envoy service mesh) for automatic fast-failing during degraded downstream network conditions.
-
----
 
 ## CI/CD Pipeline & Automated Deployment
 
@@ -810,6 +752,7 @@ Both Postman and Bruno test runners validate:
 | [.github/workflows/ci.yml](.github/workflows/ci.yml) | Automated GitHub Actions CI/CD pipeline: Protobuf verification, Go formatting/race test quality gates, Docker Hub matrix builds, and self-hosted deployment. |
 | [postman/](postman/) | Automated 28-test integration collection, environment, and BloomRPC JSON presets. |
 | [SECURITY.md](SECURITY.md) | Security policy, vulnerability reporting guidelines, and development boundaries. |
+| [docs/AI_DEMO_GUIDE.md](docs/AI_DEMO_GUIDE.md) | Operations and integration guide for the Gemini AI Fraud Detection engine, including payload schemas and testing procedures. |
 
 
 ---
