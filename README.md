@@ -150,6 +150,7 @@ flowchart TB
         subgraph CoreLedger["Core Ledger Domain"]
             LS["ledger-service (:50052)<br/>- Immutable Audit Ledger<br/>- Cursor-Based Pagination<br/>- Management HTTP (:9092)"]
         end
+        AI["Gemini 3.1 Flash<br/>AI Fraud Detection"]
     end
 
     subgraph Persistence["Persistence Layer (MongoDB 7.0 rs0)"]
@@ -185,6 +186,8 @@ flowchart TB
     GW -->|"gRPC"| LS
     GW <-->|"Failover Consensus"| MDB_C
 
+    WP -->|"Fraud Context (RPC)"| AI
+    WS -.->|"Fraud Context (RPC)"| AI
     WP -->|"ACID Multi-Doc TX"| MDB
     WS -.->|"ACID Multi-Doc TX"| MDB
     WP -->|"Fast-Path gRPC / Relay"| LS
@@ -230,6 +233,10 @@ sequenceDiagram
     GW->>WS: gRPC TransferFunds(IdempotencyKey, Source, Dest, Amount)
     
     Note over WS: Generate association_id, transaction_id & outbox_task_id
+
+    participant AI as Gemini 3.1 Flash AI
+    WS->>AI: Evaluate Fraud Risk(Alice, Bob, $250)
+    AI-->>WS: Risk Score: 0.1 (SAFE)
 
     rect rgb(238, 246, 255)
         Note over WS,MDB: MongoDB Multi-Document ACID Transaction
@@ -383,6 +390,10 @@ graph TD
         Allow -->|"gRPC over mTLS (Verified Client Cert)"| WP["wallet-primary (:50051)<br/>tls.RequireAndVerifyClientCert"]
         Allow -->|"gRPC over mTLS (Verified Client Cert)"| WS["wallet-standby (:50053)<br/>tls.RequireAndVerifyClientCert"]
         Allow -->|"gRPC over mTLS (Verified Client Cert)"| LS["ledger-service (:50052)<br/>tls.RequireAndVerifyClientCert"]
+        
+        WP -->|"Evaluate Risk"| AI["Gemini AI Fraud Detection"]
+        WS -->|"Evaluate Risk"| AI
+        
         WP -->|"gRPC over mTLS"| LS
         WS -->|"gRPC over mTLS"| LS
     end
@@ -816,6 +827,7 @@ Both Postman and Bruno test runners validate:
 | [.github/workflows/ci.yml](.github/workflows/ci.yml) | Automated GitHub Actions CI/CD pipeline: Protobuf verification, Go formatting/race test quality gates, Docker Hub matrix builds, and self-hosted deployment. |
 | [postman/](postman/) | Automated 28-test integration collection, environment, and BloomRPC JSON presets. |
 | [SECURITY.md](SECURITY.md) | Security policy, vulnerability reporting guidelines, and development boundaries. |
+| [docs/AI_DEMO_GUIDE.md](docs/AI_DEMO_GUIDE.md) | Operations and integration guide for the Gemini AI Fraud Detection engine, including payload schemas and testing procedures. |
 
 
 ---
