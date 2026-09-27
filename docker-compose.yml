@@ -44,6 +44,11 @@ services:
       - ENVIRONMENT=local
       - LOGGING_RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - LOGGING_SPOOL_PATH=data/logging/wallet-primary.jsonl
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL}
+      - AI_FRAUD_THRESHOLD=${AI_FRAUD_THRESHOLD}
+      - AI_FRAUD_ENFORCEMENT=${AI_FRAUD_ENFORCEMENT}
+      - AI_INFERENCE_TIMEOUT_MS=${AI_INFERENCE_TIMEOUT_MS}
     ports:
       - "50051:50051"
       - "9094:9094"
@@ -72,6 +77,11 @@ services:
       - ENVIRONMENT=local
       - LOGGING_RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - LOGGING_SPOOL_PATH=data/logging/wallet-standby.jsonl
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL}
+      - AI_FRAUD_THRESHOLD=${AI_FRAUD_THRESHOLD}
+      - AI_FRAUD_ENFORCEMENT=${AI_FRAUD_ENFORCEMENT}
+      - AI_INFERENCE_TIMEOUT_MS=${AI_INFERENCE_TIMEOUT_MS}
     ports:
       - "50053:50053"
       - "9093:9093"

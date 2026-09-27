@@ -28,6 +28,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/readconcern"
 	"go.mongodb.org/mongo-driver/mongo/writeconcern"
 
+	"wallet-system/pkg/ai"
 	"wallet-system/pkg/coordinator"
 	"wallet-system/pkg/db"
 	"wallet-system/pkg/observability"
@@ -50,6 +51,9 @@ type server struct {
 	outbox *observability.MongoOutbox // nil when outbox is disabled
 	// Phase 1 (GAP-FIN-01): transactional outbox relay for decoupled ledger entries.
 	ledgerRelay *LedgerRelay
+	// Phase AI-01: AI-powered fraud detection — nil when GEMINI_API_KEY is not set.
+	aiClient      *ai.Client
+	fraudDetector *ai.FraudDetector
 }
 
 func (s *server) db() *mongo.Database {
@@ -297,6 +301,42 @@ func (s *server) validateTransferRequest(ctx context.Context, req *walletv1.Tran
 			HandledByRegion: s.region,
 		}, status.Errorf(codes.FailedPrecondition, errStandbyReplicaFmt, s.region)
 	}
+	// ── AI Fraud Detection (Phase AI-01) ─────────────────────────────────────
+	// Runs last so all business validations take priority.
+	// Fail-open: any AI error returns ALLOW — AI is never a payment blocker.
+	if s.fraudDetector != nil && s.fraudDetector.IsEnabled() {
+		signals := ai.FraudSignals{
+			SourceWalletID:      req.SourceWalletId,
+			DestinationWalletID: req.DestinationWalletId,
+			AmountUnits:         req.Amount.Units,
+			Currency:            req.Amount.Currency,
+			Region:              s.region,
+			Timestamp:           time.Now().UTC(),
+			IsRoundNumber:       req.Amount.Units%10000 == 0,
+		}
+		decision, _ := s.fraudDetector.Score(ctx, signals)
+		s.emit(ctx, "wallet.transfer.fraud_scored", observability.LevelInfo,
+			"AI fraud score computed", map[string]any{
+				"risk_score":      decision.RiskScore,
+				"decision":        decision.Decision,
+				"reason":          decision.Reason,
+				"idempotency_key": req.IdempotencyKey,
+			})
+		if decision.Decision == "BLOCK" {
+			durationMS := time.Since(startTime).Milliseconds()
+			s.emitTerminal(ctx, eventWalletTransferFailed, observability.LevelWarn,
+				"Transfer blocked by AI fraud detection", durationMS, false, map[string]any{
+					"risk_score": decision.RiskScore,
+					"reason":     decision.Reason,
+				})
+			return &walletv1.TransferFundsResponse{
+				Status:          walletv1.TransferFundsResponse_INTERNAL_ERROR,
+				ErrorMessage:    "Transfer blocked: " + decision.Reason,
+				HandledByRegion: s.region,
+			}, status.Errorf(codes.PermissionDenied, "blocked by fraud detection: %s", decision.Reason)
+		}
+	}
+	// ── End AI Fraud Detection ────────────────────────────────────────────────
 	return nil, nil
 }
 
@@ -1021,16 +1061,34 @@ func runWalletServer(ctx context.Context) error {
 
 	walletOutbox, outboxPublisher := initWalletOutbox(subCtx, client)
 
+	// ── AI Fraud Detection (Phase AI-01) ─────────────────────────────────────
+	// NewClient returns nil (not an error) when GEMINI_API_KEY is not set,
+	// so all AI features are simply disabled — no crashes, no impact on transfers.
+	aiClient, aiErr := ai.NewClient(subCtx)
+	if aiErr != nil {
+		log.Printf("[WALLET-SERVICE] AI client init warning: %v (AI disabled)", aiErr)
+	}
+	if aiClient != nil && aiClient.IsEnabled() {
+		log.Printf("[WALLET-SERVICE] AI fraud detection ENABLED (model=%s enforcement=%s)",
+			os.Getenv("GEMINI_MODEL"), os.Getenv("AI_FRAUD_ENFORCEMENT"))
+		defer aiClient.Close()
+	} else {
+		log.Printf("[WALLET-SERVICE] AI fraud detection DISABLED (set GEMINI_API_KEY to enable)")
+	}
+	// ── End AI Init ───────────────────────────────────────────────────────────
+
 	srv := &server{
-		mongoClient:  client,
-		ledgerClient: ledgerClient,
-		region:       region,
-		isActive:     isActive,
-		targetRole:   resolveWalletRole(isActive),
-		coordinator:  coord,
-		logger:       observability.LoggerFromEnvironment(walletServiceName, environment, region, os.Stdout),
-		outbox:       walletOutbox,
-		ledgerRelay:  ledgerRelay,
+		mongoClient:   client,
+		ledgerClient:  ledgerClient,
+		region:        region,
+		isActive:      isActive,
+		targetRole:    resolveWalletRole(isActive),
+		coordinator:   coord,
+		logger:        observability.LoggerFromEnvironment(walletServiceName, environment, region, os.Stdout),
+		outbox:        walletOutbox,
+		ledgerRelay:   ledgerRelay,
+		aiClient:      aiClient,
+		fraudDetector: ai.NewFraudDetector(aiClient),
 	}
 	walletv1.RegisterWalletServiceServer(grpcServer, srv)
 
