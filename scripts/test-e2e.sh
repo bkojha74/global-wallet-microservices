@@ -57,7 +57,7 @@ fi
 echo ""
 
 echo -e "\n7. SIMULATING REGIONAL FAILOVER (Switching to Standby DR Region)..."
-curl -s -X POST "${BASE_URL}/api/v1/cluster/failover"
+curl -s -f -X POST "${BASE_URL}/api/v1/cluster/failover" -H "Authorization: Bearer $TOKEN"
 echo ""
 
 echo -e "\n8. Executing Second Transfer via STANDBY Region (Bob sends $100 to Alice)..."
