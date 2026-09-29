@@ -289,7 +289,6 @@ jobs:
       - name: Set up Docker Networks & Volumes
         run: |
           docker network inspect wallet_shared_net >/dev/null 2>&1 || docker network create wallet_shared_net
-          docker volume inspect global-wallet-microservices_mongo_data >/dev/null 2>&1 || docker volume create global-wallet-microservices_mongo_data
           docker volume inspect wallet_rabbitmq_data >/dev/null 2>&1 || docker volume create wallet_rabbitmq_data
           docker volume inspect wallet_rabbitmq_data_2 >/dev/null 2>&1 || docker volume create wallet_rabbitmq_data_2
           docker volume inspect wallet_rabbitmq_data_3 >/dev/null 2>&1 || docker volume create wallet_rabbitmq_data_3
@@ -305,6 +304,11 @@ jobs:
           docker compose -f docker-compose.auth.yml up --build -d
           docker compose -f docker-compose.logging.yml up --build -d
           docker compose -f docker-compose.yml up --build -d
+
+      - name: Verify MongoDB 3-Node Replica Set Health
+        run: |
+          echo "Verifying MongoDB 3-node replica set status..."
+          docker exec wallet_mongodb_1 mongosh --port 27018 --quiet --eval "rs.status().members.map(m => ({id: m._id, name: m.name, stateStr: m.stateStr, health: m.health}))"
 
       - name: Wait for API Gateway Readiness
         run: |

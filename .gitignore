@@ -95,4 +95,7 @@ Desktop.ini
 # Postman and BloomRPC test preset files
 *.postman_environment.json
 *.postman_collection.json
-BloomRPC_Test_Presets.json
+BloomRPC_Test_Presets.json
+
+# Documents, resumes and PDF files
+*.pdf
