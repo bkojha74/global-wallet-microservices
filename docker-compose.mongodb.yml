@@ -1,29 +1,67 @@
 name: wallet-mongodb
 
 services:
-  mongodb:
+  mongo1:
     image: mongo:7.0
-    container_name: wallet_mongodb
+    container_name: wallet_mongodb_1
     restart: always
-    command: ["--replSet", "rs0", "--bind_ip_all"]
+    command: [ "--replSet", "rs0", "--bind_ip_all", "--port", "27018" ]
+    ports:
+      - "27018:27018"
+    volumes:
+      - mongo1_data:/data/db
+    networks:
+      - wallet_shared_net
     healthcheck:
-      test: ["CMD-SHELL", "mongosh --quiet --host 127.0.0.1:27017 --eval \"db.adminCommand({ ping: 1 }).ok\" | grep 1"]
+      test: [ "CMD-SHELL", "mongosh --port 27018 --eval \"db.adminCommand({ ping: 1 }).ok\" --quiet | grep 1" ]
       interval: 5s
       timeout: 5s
       retries: 20
+
+  mongo2:
+    image: mongo:7.0
+    container_name: wallet_mongodb_2
+    restart: always
+    command: [ "--replSet", "rs0", "--bind_ip_all", "--port", "27019" ]
     ports:
-      - "27017:27017"
+      - "27019:27019"
     volumes:
-      - mongo_data:/data/db
+      - mongo2_data:/data/db
     networks:
       - wallet_shared_net
+    healthcheck:
+      test: [ "CMD-SHELL", "mongosh --port 27019 --eval \"db.adminCommand({ ping: 1 }).ok\" --quiet | grep 1" ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mongo3:
+    image: mongo:7.0
+    container_name: wallet_mongodb_3
+    restart: always
+    command: [ "--replSet", "rs0", "--bind_ip_all", "--port", "27020" ]
+    ports:
+      - "27020:27020"
+    volumes:
+      - mongo3_data:/data/db
+    networks:
+      - wallet_shared_net
+    healthcheck:
+      test: [ "CMD-SHELL", "mongosh --port 27020 --eval \"db.adminCommand({ ping: 1 }).ok\" --quiet | grep 1" ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   mongo-init:
     image: mongo:7.0
     container_name: wallet_mongo_init
     restart: "no"
     depends_on:
-      mongodb:
+      mongo1:
+        condition: service_healthy
+      mongo2:
+        condition: service_healthy
+      mongo3:
         condition: service_healthy
     networks:
       - wallet_shared_net
@@ -32,17 +70,42 @@ services:
       - -c
       - |
         set -e
-        echo 'Waiting for MongoDB to become ready...'
-        until mongosh --quiet --host mongodb:27017 --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1; do
+        echo 'Waiting for all MongoDB instances to respond...'
+        until mongosh --quiet --host mongo1 --port 27018 --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1; do
           sleep 2
         done
-        mongosh --quiet --host mongodb:27017 --eval 'try { rs.status() } catch (e) { rs.initiate({_id: "rs0", members: [{_id: 0, host: "mongodb:27017"}]}) }'
-        echo 'MongoDB Replica Set initialized successfully!'
+        until mongosh --quiet --host mongo2 --port 27019 --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1; do
+          sleep 2
+        done
+        until mongosh --quiet --host mongo3 --port 27020 --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1; do
+          sleep 2
+        done
+
+        echo 'Initiating 3-node Replica Set rs0...'
+        mongosh --host mongo1 --port 27018 --eval '
+          try {
+            var status = rs.status();
+            if (status.ok === 1) {
+              print("Replica set already initialized.");
+            }
+          } catch (e) {
+            var cfg = {
+              _id: "rs0",
+              members: [
+                { _id: 0, host: "mongo1:27018", priority: 2 },
+                { _id: 1, host: "mongo2:27019", priority: 1 },
+                { _id: 2, host: "mongo3:27020", priority: 1 }
+              ]
+            };
+            rs.initiate(cfg);
+            print("MongoDB 3-node Replica Set rs0 initialized successfully!");
+          }
+        '
 
 volumes:
-  mongo_data:
-    name: global-wallet-microservices_mongo_data
-    external: true
+  mongo1_data:
+  mongo2_data:
+  mongo3_data:
 
 networks:
   wallet_shared_net:

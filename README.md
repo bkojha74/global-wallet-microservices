@@ -164,24 +164,32 @@ flowchart TB
         AI["Gemini 3.1 Flash<br/>AI Fraud Detection"]
     end
 
-    subgraph Persistence["Persistence Layer (MongoDB 7.0 rs0)"]
-        MDB[("MongoDB Replica Set<br/>banking_db")]
-        MDB_W[("Collection: wallets")]
-        MDB_I[("Collection: idempotency_records<br/>(30-day TTL)")]
-        MDB_O[("Collection: ledger_tasks<br/>(Outbox)")]
-        MDB_L[("Collection: ledger_entries<br/>(Indexed)")]
-        MDB_C[("Collection: cluster_state<br/>(Consensus)")]
-        MDB --- MDB_W
-        MDB --- MDB_I
-        MDB --- MDB_O
-        MDB --- MDB_L
-        MDB --- MDB_C
+    subgraph Persistence["Persistence Layer: MongoDB 7.0 3-Node Replica Set (rs0)"]
+        direction TB
+        subgraph RSCluster["High-Availability 3-Node Topology"]
+            direction LR
+            MDB1[("<b>mongo1 (:27018)</b><br/>PRIMARY (Priority: 2)<br/>Leader / Writes / Reads")]
+            MDB2[("<b>mongo2 (:27019)</b><br/>SECONDARY (Priority: 1)<br/>Hot Standby / Oplog Sync")]
+            MDB3[("<b>mongo3 (:27020)</b><br/>SECONDARY (Priority: 1)<br/>Hot Standby / Quorum")]
+            MDB1 <--->|"Heartbeat & Consensus"| MDB2
+            MDB2 <--->|"Heartbeat & Consensus"| MDB3
+            MDB1 <--->|"Heartbeat & Consensus"| MDB3
+        end
+        subgraph Collections["Replicated Databases & ACID Collections"]
+            MDB_W[("banking_db.wallets")]
+            MDB_I[("banking_db.idempotency_records<br/>(30-day TTL)")]
+            MDB_O[("banking_db.ledger_tasks<br/>(Transactional Outbox)")]
+            MDB_L[("banking_db.ledger_entries<br/>(Indexed Audit)")]
+            MDB_C[("banking_db.cluster_state<br/>(Consensus)")]
+            MDB_A[("auth_db<br/>users & tokens")]
+            MDB_LOG[("logging_db<br/>events")]
+        end
+        RSCluster --- Collections
     end
 
     subgraph ObservabilityLayer["Centralized Logging & Observability Layer"]
         RMQ{{"RabbitMQ 3.13 (:5672)<br/>Exchange: wallet.logs.v1<br/>Queue: wallet.logging.ingest.v1<br/>DLQ: wallet.logging.dead.v1"}}
         LOG_SVC["logging-service (:8090)<br/>- AMQP Consumer & Deduplicator<br/>- Query REST API<br/>- Metrics Exporter (:9090)"]
-        LOG_DB[("MongoDB Replica Set<br/>logging_db / events")]
         PROM["Prometheus (:9091)<br/>Metrics Collector"]
         GRAF["Grafana (:3000)<br/>Dashboards & Visualizations"]
     end
@@ -199,11 +207,11 @@ flowchart TB
 
     WP -->|"Fraud Context (RPC)"| AI
     WS -.->|"Fraud Context (RPC)"| AI
-    WP -->|"ACID Multi-Doc TX"| MDB
-    WS -.->|"ACID Multi-Doc TX"| MDB
+    WP -->|"ACID Multi-Doc TX"| RSCluster
+    WS -.->|"ACID Multi-Doc TX"| RSCluster
     WP -->|"Fast-Path gRPC / Relay"| LS
     WS -.->|"Fast-Path gRPC / Relay"| LS
-    LS -->|"Read / Write Entries"| MDB
+    LS -->|"Read / Write Entries"| RSCluster
 
     WP -->|"Async Event / Spool"| RMQ
     WS -->|"Async Event / Spool"| RMQ
@@ -211,7 +219,7 @@ flowchart TB
     GW -->|"Async Event / Spool"| RMQ
 
     RMQ -->|"AMQP Consume"| LOG_SVC
-    LOG_SVC -->|"Persist Logs"| LOG_DB
+    LOG_SVC -->|"Persist Logs"| MDB_LOG
     REST -->|"Log & Trace Queries"| LOG_SVC
 
     PROM -->|"Scrape :8081"| GW
@@ -428,7 +436,7 @@ The platform is structured into **6 modular Docker Compose projects** that can b
 | **Async Queue (RabbitMQ)** | `global-async-queue` | `wallet_rabbitmq` | AMQP `:5672`<br/>Management `:15672` | High-throughput asynchronous message broker (`docker-compose.rabbitmq.yml`). Direct and dead-letter exchanges, quorum queues, and management UI. |
 | **Prometheus** | `global-monitoring` | `wallet_prometheus` | HTTP `:9091` | Time-series metrics collection server (`docker-compose.monitoring.yml`) scraping gateway, primary/standby wallets, ledger, logging, and rabbitmq. |
 | **Grafana** | `global-monitoring` | `wallet_grafana` | HTTP `:3000` | Observability dashboards auto-provisioned with metrics visualization (`docker-compose.monitoring.yml`). |
-| **MongoDB** | `wallet-mongodb` | `wallet_mongodb` | TCP `:27017` | Multi-document ACID transactional datastore running replica set `rs0` (`docker-compose.mongodb.yml`). Hosts `banking_db` (including `cluster_state`) and `logging_db`. |
+| **MongoDB Replica Set** | `wallet-mongodb` | `wallet_mongodb_1`<br/>`wallet_mongodb_2`<br/>`wallet_mongodb_3` | TCP `:27018` (Primary)<br/>TCP `:27019` (Secondary)<br/>TCP `:27020` (Secondary) | 3-node High-Availability ACID transactional replica set `rs0` (`docker-compose.mongodb.yml`) with automated failover & consensus. Hosts `banking_db`, `auth_db`, and `logging_db`. |
 
 ---
 
@@ -533,11 +541,10 @@ docker pull bkojha74/wallet-api-gateway:latest
 The project uses modular Docker Compose stacks connected via a shared external network (`wallet_shared_net`):
 
 ```bash
-# 1. Create the shared network and volume
+# 1. Create the shared network
 docker network create wallet_shared_net 2>/dev/null || true
-docker volume create global-wallet-microservices_mongo_data >/dev/null 2>&1 || true
 
-# 2. Start MongoDB Replica Set (Project: wallet-mongodb)
+# 2. Start MongoDB 3-Node Replica Set (Project: wallet-mongodb)
 docker compose -f docker-compose.mongodb.yml up -d
 
 # 3. Start Async Message Queue (Project: global-async-queue)

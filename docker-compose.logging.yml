@@ -10,7 +10,7 @@ services:
     container_name: wallet_logging_service
     restart: always
     environment:
-      - MONGO_URI=mongodb://mongodb:27017/?replicaSet=rs0&directConnection=true
+      - MONGO_URI=mongodb://mongo1:27018,mongo2:27019,mongo3:27020/?replicaSet=rs0&readPreference=primaryPreferred&retryWrites=true&w=majority
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - HTTP_PORT=8090
       - METRICS_PORT=9090
