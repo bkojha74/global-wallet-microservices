@@ -31,6 +31,10 @@ type LedgerTask struct {
 	DestinationWalletID string             `bson:"destination_wallet_id"`
 	Amount              int64              `bson:"amount"`
 	Currency            string             `bson:"currency"`
+	DestinationAmount   int64              `bson:"destination_amount,omitempty"`
+	DestinationCurrency string             `bson:"destination_currency,omitempty"`
+	ExchangeRate        float64            `bson:"exchange_rate,omitempty"`
+	FXQuoteID           string             `bson:"fx_quote_id,omitempty"`
 	Region              string             `bson:"region"`
 	Status              string             `bson:"status"` // pending | completed | failed
 	CreatedAt           time.Time          `bson:"created_at"`
@@ -152,6 +156,10 @@ func (r *LedgerRelay) DispatchImmediate(ctx context.Context, task LedgerTask) er
 		Amount:              task.Amount,
 		Currency:            task.Currency,
 		Region:              task.Region,
+		DestinationAmount:   task.DestinationAmount,
+		DestinationCurrency: task.DestinationCurrency,
+		ExchangeRate:        task.ExchangeRate,
+		FxQuoteId:           task.FXQuoteID,
 	})
 	if err != nil || resp == nil || !resp.Success {
 		errMsg := "unknown error"
@@ -225,6 +233,10 @@ func (r *LedgerRelay) ProcessBatch(ctx context.Context) (int, error) {
 			Amount:              task.Amount,
 			Currency:            task.Currency,
 			Region:              task.Region,
+			DestinationAmount:   task.DestinationAmount,
+			DestinationCurrency: task.DestinationCurrency,
+			ExchangeRate:        task.ExchangeRate,
+			FxQuoteId:           task.FXQuoteID,
 		})
 		cancel()
 

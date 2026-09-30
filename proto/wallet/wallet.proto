@@ -43,6 +43,8 @@ message TransferFundsRequest {
   string source_wallet_id = 2;
   string destination_wallet_id = 3;
   Money amount = 4;
+  // Optional: Locked FX Quote ID from fx-service (e.g., fxq_...) for cross-currency transfers
+  string fx_quote_id = 5;
 }
 
 message TransferFundsResponse {
@@ -57,6 +59,9 @@ message TransferFundsResponse {
   Status status = 2;
   string error_message = 3;
   string handled_by_region = 4;
+  string fx_quote_id = 5;
+  double exchange_rate = 6;
+  Money converted_amount = 7;
 }
 
 message HealthRequest {}

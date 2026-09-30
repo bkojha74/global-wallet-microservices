@@ -75,6 +75,10 @@ type LedgerDocument struct {
 	DestinationWalletID string             `bson:"destination_wallet_id"`
 	Amount              int64              `bson:"amount"`
 	Currency            string             `bson:"currency"`
+	DestinationAmount   int64              `bson:"destination_amount,omitempty"`
+	DestinationCurrency string             `bson:"destination_currency,omitempty"`
+	ExchangeRate        float64            `bson:"exchange_rate,omitempty"`
+	FXQuoteID           string             `bson:"fx_quote_id,omitempty"`
 	Region              string             `bson:"region"`
 	Timestamp           time.Time          `bson:"timestamp"`
 	Postings            []JournalPosting   `bson:"postings,omitempty"`
@@ -154,7 +158,7 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 	}
 	ctx = observability.WithCorrelation(ctx, correlation)
 	s.emit(ctx, "ledger.record.request_received", observability.LevelInfo, "Record transaction request received", map[string]any{"source_wallet_id": req.SourceWalletId, "destination_wallet_id": req.DestinationWalletId})
-	log.Printf("[LEDGER] proto request received: trace_id=%s source=%s destination=%s amount=%d currency=%s region=%s", req.IdempotencyKey, req.SourceWalletId, req.DestinationWalletId, req.Amount, req.Currency, req.Region)
+	log.Printf("[LEDGER] proto request received: trace_id=%s source=%s destination=%s amount=%d currency=%s dest_amount=%d dest_currency=%s region=%s", req.IdempotencyKey, req.SourceWalletId, req.DestinationWalletId, req.Amount, req.Currency, req.DestinationAmount, req.DestinationCurrency, req.Region)
 	if req.IdempotencyKey == "" {
 		log.Printf("[LEDGER] trace_id=%s step=validation_failed reason=missing_idempotency_key", req.IdempotencyKey)
 		durationMS := time.Since(startTime).Milliseconds()
@@ -166,6 +170,11 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 		durationMS := time.Since(startTime).Milliseconds()
 		s.emitTerminal(ctx, eventLedgerRecordFailed, observability.LevelError, "Validation failed", durationMS, false, map[string]any{"reason": err.Error()})
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if req.DestinationCurrency != "" && req.DestinationCurrency != req.Currency {
+		if err := db.ValidateAmount(req.DestinationAmount, req.DestinationCurrency); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid destination FX amount/currency: %v", err)
+		}
 	}
 
 	if s.mongoClient == nil {
@@ -180,8 +189,15 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 
 	docID := parseTransactionDocID(req.TransactionId)
 
-	// GAAP/IFRS Double-Entry Postings (GAP-FIN-02)
-	postings, postErr := CreateTransferPostings(req.SourceWalletId, req.DestinationWalletId, req.Amount, req.Currency)
+	// GAAP/IFRS Double-Entry Postings (GAP-FIN-02 & GAP-FIN-03 Multi-Currency FX Settlement)
+	postings, postErr := CreateMultiCurrencyTransferPostings(
+		req.SourceWalletId,
+		req.DestinationWalletId,
+		req.Amount,
+		req.Currency,
+		req.DestinationAmount,
+		req.DestinationCurrency,
+	)
 	if postErr != nil {
 		log.Printf("[LEDGER] trace_id=%s step=double_entry_failed reason=%v", req.IdempotencyKey, postErr)
 		durationMS := time.Since(startTime).Milliseconds()
@@ -202,6 +218,10 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 		DestinationWalletID: req.DestinationWalletId,
 		Amount:              req.Amount,
 		Currency:            req.Currency,
+		DestinationAmount:   req.DestinationAmount,
+		DestinationCurrency: req.DestinationCurrency,
+		ExchangeRate:        req.ExchangeRate,
+		FXQuoteID:           req.FxQuoteId,
 		Region:              s.region,
 		Timestamp:           now,
 		Postings:            postings,
@@ -235,11 +255,15 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 		IdempotencyKey: correlation.IdempotencyKey,
 		DurationMS:     durationMS,
 		Attributes: map[string]any{
-			"transaction_id": doc.ID.Hex(),
-			"source":         req.SourceWalletId,
-			"dest":           req.DestinationWalletId,
-			"amount":         req.Amount,
-			"currency":       req.Currency,
+			"transaction_id":       doc.ID.Hex(),
+			"source":               req.SourceWalletId,
+			"dest":                 req.DestinationWalletId,
+			"amount":               req.Amount,
+			"currency":             req.Currency,
+			"destination_amount":   req.DestinationAmount,
+			"destination_currency": req.DestinationCurrency,
+			"exchange_rate":        req.ExchangeRate,
+			"fx_quote_id":          req.FxQuoteId,
 		},
 	}
 	s.emitTerminal(ctx, auditEvt.EventType, auditEvt.Level, auditEvt.Message, durationMS, true, auditEvt.Attributes)
@@ -291,6 +315,10 @@ func decodeLedgerEntries(ctx context.Context, cursor *mongo.Cursor) []*ledgerv1.
 			Currency:            doc.Currency,
 			Timestamp:           doc.Timestamp.Format(time.RFC3339),
 			Region:              doc.Region,
+			DestinationAmount:   doc.DestinationAmount,
+			DestinationCurrency: doc.DestinationCurrency,
+			ExchangeRate:        doc.ExchangeRate,
+			FxQuoteId:           doc.FXQuoteID,
 		})
 	}
 	return entries
