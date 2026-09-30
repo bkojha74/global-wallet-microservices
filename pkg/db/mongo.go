@@ -14,15 +14,18 @@ import (
 )
 
 // DefaultMongoURI returns MONGO_URI from env if set.
-// If unset, it checks if "mongodb" resolves (inside Docker). If not, it falls back to 127.0.0.1:27017 for native host execution.
+// If unset, it checks if "mongo1" resolves (inside Docker). If not, it checks "mongodb", and falls back to localhost replica set ports (27018, 27019, 27020).
 func DefaultMongoURI() string {
 	if uri := os.Getenv("MONGO_URI"); uri != "" {
 		return uri
 	}
+	if _, err := net.LookupHost("mongo1"); err == nil {
+		return "mongodb://mongo1:27018,mongo2:27019,mongo3:27020/?replicaSet=rs0&readPreference=primaryPreferred&retryWrites=true&w=majority"
+	}
 	if _, err := net.LookupHost("mongodb"); err == nil {
 		return "mongodb://mongodb:27017/?replicaSet=rs0&directConnection=true"
 	}
-	return "mongodb://127.0.0.1:27017/?directConnection=true"
+	return "mongodb://127.0.0.1:27018,127.0.0.1:27019,127.0.0.1:27020/?replicaSet=rs0&readPreference=primaryPreferred&retryWrites=true&w=majority"
 }
 
 // ConnectWithRetry connects to MongoDB with exponential backoff to handle replica set initialization

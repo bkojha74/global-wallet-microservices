@@ -11,7 +11,7 @@ services:
     restart: always
     environment:
       - PORT=50052
-      - MONGO_URI=mongodb://mongodb:27017/?replicaSet=rs0&directConnection=true
+      - MONGO_URI=mongodb://mongo1:27018,mongo2:27019,mongo3:27020/?replicaSet=rs0&readPreference=primaryPreferred&retryWrites=true&w=majority
       - REGION_NAME=global-core
       - INSTANCE_ID=ledger-service-1
       - ENVIRONMENT=local
@@ -34,7 +34,7 @@ services:
     restart: always
     environment:
       - PORT=50051
-      - MONGO_URI=mongodb://mongodb:27017/?replicaSet=rs0&directConnection=true
+      - MONGO_URI=mongodb://mongo1:27018,mongo2:27019,mongo3:27020/?replicaSet=rs0&readPreference=primaryPreferred&retryWrites=true&w=majority
       - LEDGER_SERVICE_ADDR=ledger-service:50052
       - REGION_NAME=us-east-1 (Primary Active)
       - IS_ACTIVE=true
@@ -67,7 +67,7 @@ services:
     restart: always
     environment:
       - PORT=50053
-      - MONGO_URI=mongodb://mongodb:27017/?replicaSet=rs0&directConnection=true
+      - MONGO_URI=mongodb://mongo1:27018,mongo2:27019,mongo3:27020/?replicaSet=rs0&readPreference=primaryPreferred&retryWrites=true&w=majority
       - LEDGER_SERVICE_ADDR=ledger-service:50052
       - REGION_NAME=eu-west-1 (Standby Hot DR)
       - IS_ACTIVE=false
@@ -100,7 +100,7 @@ services:
     restart: always
     environment:
       - HTTP_PORT=8080
-      - MONGO_URI=mongodb://mongodb:27017/?replicaSet=rs0&directConnection=true
+      - MONGO_URI=mongodb://mongo1:27018,mongo2:27019,mongo3:27020/?replicaSet=rs0&readPreference=primaryPreferred&retryWrites=true&w=majority
       - PRIMARY_WALLET_ADDR=wallet-primary:50051
       - STANDBY_WALLET_ADDR=wallet-standby:50053
       - LEDGER_ADDR=ledger-service:50052
