@@ -71,15 +71,13 @@ Severity Levels:
   - Added monotonic sequence number assignment and MongoDB index `idx_ledger_sequence_number`.
   - Implemented online verification endpoint `GET /audit/verify?wallet_id=<id>` on management port `:9092` to detect tampering or broken balance chains.
 
-#### GAP-FIN-03 [🟠 HIGH]: Missing Multi-Currency FX Engine
-- **Location**: [cmd/wallet-service/main.go#L293-L309](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/cmd/wallet-service/main.go#L293-L309)
-- **Current State**:
-  The system rejects transfers if the source currency does not match the destination wallet currency (`Destination wallet not found or currency mismatch`).
-- **Production Risks**:
-  - System is named "Global Multi-Currency Wallet", but cannot execute any cross-currency transactions.
-- **Expected Production Standard**:
-  - Integrate an FX (Foreign Exchange) rate engine with fixed-rate quotes (quote ID with a 30–60 second validity window).
-  - Support multi-currency atomic exchange legs in transfers (Debit USD, Credit EUR at locked exchange rate with fee deduction).
+#### GAP-FIN-03 [🟢 RESOLVED]: Multi-Currency FX Engine Microservice (`global-fx-service`)
+- **Location**: [cmd/fx-service/](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/cmd/fx-service), [proto/fx/fx.proto](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/proto/fx/fx.proto), [cmd/wallet-service/main.go](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/cmd/wallet-service/main.go), [cmd/ledger-service/double_entry.go](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/cmd/ledger-service/double_entry.go)
+- **Resolution**:
+  - Built standalone **FX Engine Microservice** (`fx-service`, gRPC `:50055`, B2B HTTP REST `:8086`, Prometheus `:9096`) providing real-time Foreign Exchange pricing, RFQ quote locking, and idempotent currency conversion for both internal microservices and 3rd-party B2B partners.
+  - Integrated live 3rd-party exchange rate providers (`FrankfurterProvider` ECB reference rates, `ExchangeRateAPIProvider`, and configurable custom HTTP provider) with automated periodic sync and resilient institutional baseline fallback.
+  - Implemented ISO-4217 currency catalog (alphabetic/numeric codes, minor-unit scales), USD cross-pair triangulation, Bid/Ask/Mid-market spreads in basis points (`spread_bps`), and IEEE 754 Banker's Rounding (`RoundToEven`).
+  - Integrated cross-currency conversion in `wallet-service` *prior* to opening the MongoDB ACID transaction (preserving `GAP-FIN-01`) and implemented 4-leg GAAP/IFRS multi-currency settlement postings (`FX_LIQUIDITY_POOL_<CURRENCY>`) in `ledger-service` (preserving `GAP-FIN-02` per-currency equilibrium).
 
 #### GAP-FIN-04 [🟠 HIGH]: Money Representation & Decimal Scale
 - **Location**: [proto/wallet/wallet.proto](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/proto/wallet/wallet.proto) & [cmd/wallet-service/main.go#L66-L71](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/cmd/wallet-service/main.go#L66-L71)

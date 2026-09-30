@@ -1,6 +1,6 @@
-.PHONY: up up-mongodb up-queue up-auth up-logging up-monitoring up-quality up-app down down-mongodb down-queue down-auth down-logging down-monitoring down-quality down-app logs test clean k8s-build k8s-deploy sonar-scan sast-scan
+.PHONY: up up-mongodb up-queue up-auth up-fx up-logging up-monitoring up-quality up-app down down-mongodb down-queue down-auth down-fx down-logging down-monitoring down-quality down-app logs test clean k8s-build k8s-deploy sonar-scan sast-scan
 
-up: up-mongodb up-queue up-auth up-logging
+up: up-mongodb up-queue up-auth up-fx up-logging
 	docker compose -f docker-compose.yml up --build -d
 	@echo "Services are spinning up. Run 'make logs' or wait 10s then 'make test'."
 
@@ -16,6 +16,10 @@ up-queue:
 up-auth:
 	docker network inspect wallet_shared_net >/dev/null 2>&1 || docker network create wallet_shared_net
 	docker compose -f docker-compose.auth.yml up --build -d
+
+up-fx:
+	docker network inspect wallet_shared_net >/dev/null 2>&1 || docker network create wallet_shared_net
+	docker compose -f docker-compose.fx.yml up --build -d
 
 up-logging:
 	docker network inspect wallet_shared_net >/dev/null 2>&1 || docker network create wallet_shared_net
@@ -35,6 +39,7 @@ up-app:
 
 down:
 	docker compose -f docker-compose.yml down
+	docker compose -f docker-compose.fx.yml down
 	docker compose -f docker-compose.logging.yml down
 	docker compose -f docker-compose.auth.yml down
 	docker compose -f docker-compose.monitoring.yml down
@@ -43,6 +48,9 @@ down:
 
 down-app:
 	docker compose -f docker-compose.yml down
+
+down-fx:
+	docker compose -f docker-compose.fx.yml down
 
 down-monitoring:
 	docker compose -f docker-compose.monitoring.yml down
@@ -79,6 +87,7 @@ sast-scan:
 
 clean:
 	docker compose -f docker-compose.yml down -v --rmi all
+	docker compose -f docker-compose.fx.yml down -v
 	docker compose -f docker-compose.monitoring.yml down -v
 	docker compose -f docker-compose.logging.yml down -v
 	docker compose -f docker-compose.auth.yml down -v

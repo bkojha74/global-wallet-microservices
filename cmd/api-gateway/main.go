@@ -30,6 +30,7 @@ import (
 	"wallet-system/pkg/observability"
 	"wallet-system/pkg/tlsutil"
 	authv1 "wallet-system/proto/auth"
+	fxv1 "wallet-system/proto/fx"
 	ledgerv1 "wallet-system/proto/ledger"
 	walletv1 "wallet-system/proto/wallet"
 )
@@ -45,6 +46,7 @@ type Gateway struct {
 	standbyClient  walletv1.WalletServiceClient
 	ledgerClient   ledgerv1.LedgerServiceClient
 	authClient     authv1.AuthServiceClient // auth-service gRPC client
+	fxClient       fxv1.FXServiceClient   // fx-service gRPC client
 	primaryAddress string
 	standbyAddress string
 	logger         observability.Logger
@@ -287,6 +289,7 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		DestWallet          string `json:"dest_wallet"`
 		Amount              int64  `json:"amount"`
 		Currency            string `json:"currency"`
+		FXQuoteID           string `json:"fx_quote_id"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		log.Printf("[TRACE] trace_id=%s step=http_json_decode_failed error=%v", traceID, err)
@@ -327,6 +330,7 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		"dest_wallet":   destWallet,
 		"amount":        req.Amount,
 		"currency":      req.Currency,
+		"fx_quote_id":   req.FXQuoteID,
 	})
 	traceID = correlation.AssociationID
 	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=transfer source=%s destination=%s amount=%d currency=%s", traceID, sourceWallet, destWallet, req.Amount, req.Currency)
@@ -335,6 +339,7 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		SourceWalletId:      sourceWallet,
 		DestinationWalletId: destWallet,
 		Amount:              &walletv1.Money{Currency: req.Currency, Units: req.Amount},
+		FxQuoteId:           strings.TrimSpace(req.FXQuoteID),
 	}
 	logProto(traceID, "http_json_to_wallet_proto_request", protoReq)
 
@@ -382,13 +387,23 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		"transaction_id": resp.TransactionId,
 	})
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	respMap := map[string]interface{}{
 		"transaction_id": resp.TransactionId,
 		"status":         resp.Status.String(),
 		"error_message":  resp.ErrorMessage,
 		"routed_gateway": target,
 		"handled_region": resp.HandledByRegion,
-	})
+	}
+	if resp.FxQuoteId != "" {
+		respMap["fx_quote_id"] = resp.FxQuoteId
+	}
+	if resp.ExchangeRate > 0 {
+		respMap["exchange_rate"] = resp.ExchangeRate
+	}
+	if resp.ConvertedAmount != nil {
+		respMap["converted_amount"] = resp.ConvertedAmount
+	}
+	writeJSON(w, http.StatusOK, respMap)
 }
 
 func (g *Gateway) handleLedger(w http.ResponseWriter, r *http.Request) {
@@ -838,10 +853,238 @@ func (gw *Gateway) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (gw *Gateway) handleFXCurrencies(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+	currencies := db.ListSupportedCurrencies()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"standard":   "ISO-4217",
+		"count":      len(currencies),
+		"currencies": currencies,
+	})
+}
+
+func (gw *Gateway) handleFXRates(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+	if gw.fxClient == nil {
+		http.Error(w, "FX service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	base := strings.TrimSpace(r.URL.Query().Get("base"))
+	if base == "" {
+		base = strings.TrimSpace(r.URL.Query().Get("base_currency"))
+	}
+	if base == "" {
+		base = "USD"
+	}
+	target := strings.TrimSpace(r.URL.Query().Get("target"))
+	if target == "" {
+		target = strings.TrimSpace(r.URL.Query().Get("target_currency"))
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
+	defer cancel()
+
+	if target != "" {
+		resp, err := gw.fxClient.GetExchangeRate(ctx, &fxv1.GetExchangeRateRequest{
+			BaseCurrency:   base,
+			TargetCurrency: target,
+		})
+		if err != nil {
+			http.Error(w, fmt.Sprintf("FX rate lookup failed: %v", err), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, resp.Rate)
+		return
+	}
+
+	listResp, err := gw.fxClient.ListExchangeRates(ctx, &fxv1.ListExchangeRatesRequest{
+		BaseCurrency: base,
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("FX rate list failed: %v", err), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, listResp)
+}
+
+func (gw *Gateway) handleFXQuotes(w http.ResponseWriter, r *http.Request) {
+	if gw.fxClient == nil {
+		http.Error(w, "FX service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
+	defer cancel()
+
+	if r.Method == http.MethodGet {
+		quoteID := strings.TrimSpace(r.URL.Query().Get("quote_id"))
+		if quoteID == "" {
+			quoteID = strings.TrimSpace(r.URL.Query().Get("id"))
+		}
+		resp, err := gw.fxClient.GetQuote(ctx, &fxv1.GetQuoteRequest{QuoteId: quoteID})
+		if err != nil {
+			http.Error(w, fmt.Sprintf("FX quote lookup failed: %v", err), http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, resp.Quote)
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		var req struct {
+			BaseCurrency   string `json:"base_currency"`
+			TargetCurrency string `json:"target_currency"`
+			SourceAmount   int64  `json:"source_amount"`
+			Amount         int64  `json:"amount"`
+			ClientID       string `json:"client_id"`
+			TTLSeconds     int32  `json:"ttl_seconds"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		amt := req.SourceAmount
+		if amt <= 0 {
+			amt = req.Amount
+		}
+		clientID := req.ClientID
+		if clientID == "" {
+			if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+				clientID = claims.Subject
+			}
+		}
+		resp, err := gw.fxClient.CreateQuote(ctx, &fxv1.CreateQuoteRequest{
+			BaseCurrency:   req.BaseCurrency,
+			TargetCurrency: req.TargetCurrency,
+			SourceAmount:   amt,
+			ClientId:       clientID,
+			TtlSeconds:     req.TTLSeconds,
+		})
+		if err != nil {
+			http.Error(w, fmt.Sprintf("FX quote creation failed: %v", err), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusCreated, resp.Quote)
+		return
+	}
+
+	http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+}
+
+func (gw *Gateway) handleFXConvert(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+	if gw.fxClient == nil {
+		http.Error(w, "FX service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		IdempotencyKey string `json:"idempotency_key"`
+		QuoteID        string `json:"quote_id"`
+		BaseCurrency   string `json:"base_currency"`
+		TargetCurrency string `json:"target_currency"`
+		SourceAmount   int64  `json:"source_amount"`
+		Amount         int64  `json:"amount"`
+		ClientID       string `json:"client_id"`
+		ReferenceID    string `json:"reference_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	amt := req.SourceAmount
+	if amt <= 0 {
+		amt = req.Amount
+	}
+	clientID := req.ClientID
+	if clientID == "" {
+		if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+			clientID = claims.Subject
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
+	defer cancel()
+
+	resp, err := gw.fxClient.ConvertCurrency(ctx, &fxv1.ConvertCurrencyRequest{
+		IdempotencyKey: req.IdempotencyKey,
+		QuoteId:        req.QuoteID,
+		BaseCurrency:   req.BaseCurrency,
+		TargetCurrency: req.TargetCurrency,
+		SourceAmount:   amt,
+		ClientId:       clientID,
+		ReferenceId:    req.ReferenceID,
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("FX conversion failed: %v", err), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (gw *Gateway) handleFXRatesRefresh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		if !claims.HasRole(auth.RoleAdmin) && !claims.HasScope(auth.ScopeClusterAdmin) {
+			writeAuthError(w, http.StatusForbidden, "Forbidden: FX rate refresh/override requires admin privileges")
+			return
+		}
+	}
+	if gw.fxClient == nil {
+		http.Error(w, "FX service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		BaseCurrency        string  `json:"base_currency"`
+		TargetCurrency      string  `json:"target_currency"`
+		MidRate             float64 `json:"mid_rate"`
+		SpreadBps           int32   `json:"spread_bps"`
+		TriggerUpstreamSync bool    `json:"trigger_upstream_sync"`
+		SourceProvider      string  `json:"source_provider"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	if req.BaseCurrency == "" && req.TargetCurrency == "" && req.MidRate == 0 {
+		req.TriggerUpstreamSync = true
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+
+	resp, err := gw.fxClient.UpdateExchangeRate(ctx, &fxv1.UpdateExchangeRateRequest{
+		BaseCurrency:        req.BaseCurrency,
+		TargetCurrency:      req.TargetCurrency,
+		MidRate:             req.MidRate,
+		SpreadBps:           req.SpreadBps,
+		TriggerUpstreamSync: req.TriggerUpstreamSync,
+		SourceProvider:      req.SourceProvider,
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("FX rate update failed: %v", err), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 func registerGatewayRoutes(mux *http.ServeMux, gw *Gateway) {
 	mux.HandleFunc("/api/v1/wallets", gw.handleWallets)
 	mux.HandleFunc("/api/v1/transfers", gw.handleTransfer)
 	mux.HandleFunc("/api/v1/ledger", gw.handleLedger)
+	mux.HandleFunc("/api/v1/fx/currencies", gw.handleFXCurrencies)
+	mux.HandleFunc("/api/v1/fx/rates", gw.handleFXRates)
+	mux.HandleFunc("/api/v1/fx/quotes", gw.handleFXQuotes)
+	mux.HandleFunc("/api/v1/fx/convert", gw.handleFXConvert)
+	mux.HandleFunc("/api/v1/fx/rates/refresh", gw.handleFXRatesRefresh)
 	mux.HandleFunc("/api/v1/cluster/status", gw.handleClusterStatus)
 	mux.HandleFunc("/api/v1/cluster/failover", gw.handleFailover)
 	mux.HandleFunc("/api/v1/auth/login", gw.handleLogin)
@@ -864,6 +1107,8 @@ func wrapGatewayMiddleware(handler http.Handler, authClient authv1.AuthServiceCl
 		"/api/v1/auth/refresh":   true,
 		"/api/v1/auth/token":     true,
 		"/api/v1/cluster/status": true,
+		"/api/v1/fx/currencies":  true,
+		"/api/v1/fx/rates":       true,
 	}
 
 	cacheFingerprintSecret := os.Getenv("CACHE_FINGERPRINT_SECRET")
@@ -893,6 +1138,7 @@ func runGatewayServer(ctx context.Context) error {
 		httpPort = "8080"
 	}
 	primaryAddr, standbyAddr, ledgerAddr, authAddr := resolveGatewayServiceAddresses()
+	fxAddr := resolveServiceAddress("FX_SERVICE_ADDR", "fx-service", "50055")
 
 	log.Println("[API-GATEWAY] Establishing gRPC connections...")
 	environment := os.Getenv("ENVIRONMENT")
@@ -942,6 +1188,13 @@ func runGatewayServer(ctx context.Context) error {
 	}
 	defer lConn.Close()
 
+	fxConn, fxErr := grpc.NewClient(fxAddr, dialOpts...)
+	var fxClient fxv1.FXServiceClient
+	if fxErr == nil {
+		defer fxConn.Close()
+		fxClient = fxv1.NewFXServiceClient(fxConn)
+	}
+
 	coord, cleanupCoord := initFailoverCoordinator(os.Getenv("MONGO_URI"))
 	defer cleanupCoord()
 
@@ -952,6 +1205,7 @@ func runGatewayServer(ctx context.Context) error {
 		standbyClient:  walletv1.NewWalletServiceClient(sConn),
 		ledgerClient:   ledgerv1.NewLedgerServiceClient(lConn),
 		authClient:     authv1.NewAuthServiceClient(aConn),
+		fxClient:       fxClient,
 		primaryAddress: primaryAddr,
 		standbyAddress: standbyAddr,
 		logger:         logger,

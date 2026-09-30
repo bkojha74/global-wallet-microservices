@@ -26,6 +26,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readconcern"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
 	"go.mongodb.org/mongo-driver/mongo/writeconcern"
 
 	"wallet-system/pkg/ai"
@@ -33,6 +34,7 @@ import (
 	"wallet-system/pkg/db"
 	"wallet-system/pkg/observability"
 	"wallet-system/pkg/tlsutil"
+	fxv1 "wallet-system/proto/fx"
 	ledgerv1 "wallet-system/proto/ledger"
 	walletv1 "wallet-system/proto/wallet"
 )
@@ -41,6 +43,7 @@ type server struct {
 	walletv1.UnimplementedWalletServiceServer
 	mongoClient  *mongo.Client
 	ledgerClient ledgerv1.LedgerServiceClient
+	fxClient     fxv1.FXServiceClient
 	region       string
 	isActive     bool
 	targetRole   string // "PRIMARY" or "STANDBY"
@@ -241,12 +244,119 @@ func (s *server) GetBalance(ctx context.Context, req *walletv1.GetBalanceRequest
 }
 
 type transferExecutionState struct {
-	finalTxnID    string
-	outboxTaskID  primitive.ObjectID
-	outboxTask    LedgerTask
-	txnStatus     walletv1.TransferFundsResponse_Status
-	txnErrMsg     string
-	sourceDebited bool
+	finalTxnID      string
+	outboxTaskID    primitive.ObjectID
+	outboxTask      LedgerTask
+	txnStatus       walletv1.TransferFundsResponse_Status
+	txnErrMsg       string
+	sourceDebited   bool
+	destCurrency    string
+	destUnits       int64
+	exchangeRate    float64
+	fxQuoteID       string
+	isCrossCurrency bool
+}
+
+var fallbackBaselineUSDRates = map[string]float64{
+	"USD": 1.0000,
+	"EUR": 0.9200,
+	"GBP": 0.7900,
+	"CAD": 1.3600,
+	"AUD": 1.5200,
+	"JPY": 150.0000,
+	"CHF": 0.8800,
+	"SGD": 1.3400,
+	"INR": 83.5000,
+	"BHD": 0.3760,
+}
+
+func computeFallbackFX(base, target string, sourceUnits int64) (int64, float64, string) {
+	base = db.NormalizeCurrency(base)
+	target = db.NormalizeCurrency(target)
+	if base == target {
+		return sourceUnits, 1.0, ""
+	}
+	bRate := fallbackBaselineUSDRates[base]
+	tRate := fallbackBaselineUSDRates[target]
+	if bRate <= 0 || tRate <= 0 {
+		return sourceUnits, 1.0, ""
+	}
+	midRate := tRate / bRate
+	effectiveRate := midRate * (1.0 - 0.0025) // 25 bps standard spread
+	targetUnits := db.ConvertUnitsBankers(sourceUnits, effectiveRate)
+	return targetUnits, effectiveRate, "fxq_local_fallback"
+}
+
+func (s *server) prepareFXConversion(ctx context.Context, req *walletv1.TransferFundsRequest, state *transferExecutionState) error {
+	state.destCurrency = db.NormalizeCurrency(req.Amount.Currency)
+	state.destUnits = req.Amount.Units
+	state.exchangeRate = 1.0
+	state.fxQuoteID = strings.TrimSpace(req.FxQuoteId)
+
+	if s.db() == nil {
+		return nil
+	}
+	walletsCol := s.db().Collection("wallets")
+	var dstWallet WalletModel
+	if err := walletsCol.FindOne(ctx, bson.M{"_id": req.DestinationWalletId}).Decode(&dstWallet); err != nil {
+		// Let validateWalletsOperational inside the transaction handle missing destination wallet
+		return nil
+	}
+
+	srcCurr := db.NormalizeCurrency(req.Amount.Currency)
+	dstCurr := db.NormalizeCurrency(dstWallet.Currency)
+	if srcCurr == dstCurr && state.fxQuoteID == "" {
+		return nil
+	}
+	if s.fxClient == nil {
+		return nil
+	}
+
+	state.isCrossCurrency = srcCurr != dstCurr
+	state.destCurrency = dstCurr
+
+	// Call standalone FX Engine microservice BEFORE opening the MongoDB ACID transaction (preserving GAP-FIN-01)
+	if s.fxClient != nil {
+		callCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		defer cancel()
+		convResp, err := s.fxClient.ConvertCurrency(callCtx, &fxv1.ConvertCurrencyRequest{
+			IdempotencyKey: "wallet_fx_" + req.IdempotencyKey,
+			QuoteId:        state.fxQuoteID,
+			BaseCurrency:   srcCurr,
+			TargetCurrency: dstCurr,
+			SourceAmount:   req.Amount.Units,
+			ClientId:       walletServiceName,
+			ReferenceId:    state.finalTxnID,
+		})
+		if err == nil && convResp != nil {
+			state.destUnits = convResp.TargetAmount
+			state.exchangeRate = convResp.EffectiveRate
+			state.fxQuoteID = convResp.QuoteId
+			s.emit(ctx, "wallet.transfer.fx_converted", observability.LevelInfo, "Cross-currency FX conversion resolved via fx-service", map[string]any{
+				"source_currency": srcCurr,
+				"target_currency": dstCurr,
+				"source_amount":   req.Amount.Units,
+				"target_amount":   state.destUnits,
+				"exchange_rate":   state.exchangeRate,
+				"fx_quote_id":     state.fxQuoteID,
+			})
+			return nil
+		}
+		if state.fxQuoteID != "" && err != nil {
+			state.txnStatus = walletv1.TransferFundsResponse_INTERNAL_ERROR
+			state.txnErrMsg = fmt.Sprintf("FX quote validation failed: %v", err)
+			return err
+		}
+		log.Printf("[WALLET-FX] fx-service unreachable (%v); falling back to local institutional FX rate book", err)
+	}
+
+	targetUnits, effectiveRate, fallbackQuoteID := computeFallbackFX(srcCurr, dstCurr, req.Amount.Units)
+	state.destUnits = targetUnits
+	state.exchangeRate = effectiveRate
+	if state.fxQuoteID == "" {
+		state.fxQuoteID = fallbackQuoteID
+	}
+	return nil
 }
 
 func (s *server) validateTransferRequest(ctx context.Context, req *walletv1.TransferFundsRequest, startTime time.Time) (*walletv1.TransferFundsResponse, error) {
@@ -406,6 +516,15 @@ func (s *server) validateWalletsOperational(sessCtx mongo.SessionContext, wallet
 }
 
 func (s *server) executeDebitAndCredit(sessCtx mongo.SessionContext, ctx context.Context, walletsCol *mongo.Collection, req *walletv1.TransferFundsRequest, correlation observability.Correlation, state *transferExecutionState) error {
+	destCurrency := state.destCurrency
+	if destCurrency == "" {
+		destCurrency = req.Amount.Currency
+	}
+	destUnits := state.destUnits
+	if destUnits <= 0 {
+		destUnits = req.Amount.Units
+	}
+
 	filterSource := bson.M{
 		"_id":      req.SourceWalletId,
 		"currency": req.Amount.Currency,
@@ -456,10 +575,10 @@ func (s *server) executeDebitAndCredit(sessCtx mongo.SessionContext, ctx context
 
 	filterDest := bson.M{
 		"_id":      req.DestinationWalletId,
-		"currency": req.Amount.Currency,
+		"currency": destCurrency,
 	}
 	updateDest := bson.M{
-		"$inc": bson.M{"balance": req.Amount.Units},
+		"$inc": bson.M{"balance": destUnits},
 		"$set": bson.M{"updated_at": time.Now().UTC().Format(time.RFC3339)},
 	}
 	resDest, err := walletsCol.UpdateOne(sessCtx, filterDest, updateDest)
@@ -471,7 +590,8 @@ func (s *server) executeDebitAndCredit(sessCtx mongo.SessionContext, ctx context
 		state.txnErrMsg = "Destination wallet not found or currency mismatch"
 		return fmt.Errorf("destination wallet not found")
 	}
-	log.Printf("[WALLET-TX] trace_id=%s step=destination_wallet_credited modified_count=%d", req.IdempotencyKey, resDest.ModifiedCount)
+	log.Printf("[WALLET-TX] trace_id=%s step=destination_wallet_credited modified_count=%d credit_units=%d credit_currency=%s",
+		req.IdempotencyKey, resDest.ModifiedCount, destUnits, destCurrency)
 
 	auditCreditEvt := observability.Event{
 		SchemaVersion:  1,
@@ -488,8 +608,10 @@ func (s *server) executeDebitAndCredit(sessCtx mongo.SessionContext, ctx context
 		IdempotencyKey: correlation.IdempotencyKey,
 		Attributes: observability.RedactAttributes(map[string]any{
 			"dest_wallet":   req.DestinationWalletId,
-			"credit_amount": req.Amount.Units,
-			"currency":      req.Amount.Currency,
+			"credit_amount": destUnits,
+			"currency":      destCurrency,
+			"exchange_rate": state.exchangeRate,
+			"fx_quote_id":   state.fxQuoteID,
 		}),
 	}
 	s.emit(ctx, auditCreditEvt.EventType, auditCreditEvt.Level, auditCreditEvt.Message, auditCreditEvt.Attributes)
@@ -542,6 +664,15 @@ func (s *server) executeTransferTransaction(sessCtx mongo.SessionContext, ctx co
 		return err
 	}
 
+	destCurrency := state.destCurrency
+	if destCurrency == "" {
+		destCurrency = req.Amount.Currency
+	}
+	destUnits := state.destUnits
+	if destUnits <= 0 {
+		destUnits = req.Amount.Units
+	}
+
 	state.outboxTask = LedgerTask{
 		ID:                  state.outboxTaskID,
 		TransactionID:       state.finalTxnID,
@@ -550,6 +681,10 @@ func (s *server) executeTransferTransaction(sessCtx mongo.SessionContext, ctx co
 		DestinationWalletID: req.DestinationWalletId,
 		Amount:              req.Amount.Units,
 		Currency:            req.Amount.Currency,
+		DestinationAmount:   destUnits,
+		DestinationCurrency: destCurrency,
+		ExchangeRate:        state.exchangeRate,
+		FXQuoteID:           state.fxQuoteID,
 		Region:              s.region,
 		Status:              LedgerTaskStatusPending,
 		CreatedAt:           time.Now().UTC(),
@@ -622,9 +757,13 @@ func (s *server) handleTransferSuccess(ctx context.Context, req *walletv1.Transf
 		"dest_wallet":    req.DestinationWalletId,
 		"amount":         req.Amount.Units,
 		"currency":       req.Amount.Currency,
+		"dest_amount":    state.destUnits,
+		"dest_currency":  state.destCurrency,
+		"exchange_rate":  state.exchangeRate,
+		"fx_quote_id":    state.fxQuoteID,
 	})
-	log.Printf("[WALLET-TX] SUCCESS: TX=%s | %s -> %s (%d %s) [Region: %s]",
-		state.finalTxnID, req.SourceWalletId, req.DestinationWalletId, req.Amount.Units, req.Amount.Currency, s.region)
+	log.Printf("[WALLET-TX] SUCCESS: TX=%s | %s -> %s (%d %s -> %d %s @ %.6f) [Region: %s]",
+		state.finalTxnID, req.SourceWalletId, req.DestinationWalletId, req.Amount.Units, req.Amount.Currency, state.destUnits, state.destCurrency, state.exchangeRate, s.region)
 }
 
 // TransferFunds executes an ACID multi-document MongoDB transaction
@@ -648,6 +787,17 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 	})
 	log.Printf("[WALLET-TX] trace_id=%s step=wallet_proto_request_received source=%s destination=%s amount=%d currency=%s region=%s", req.IdempotencyKey, req.SourceWalletId, req.DestinationWalletId, req.Amount.GetUnits(), req.Amount.GetCurrency(), s.region)
 
+	state := transferExecutionState{
+		finalTxnID:   primitive.NewObjectID().Hex(),
+		outboxTaskID: primitive.NewObjectID(),
+		txnStatus:    walletv1.TransferFundsResponse_SUCCESS,
+	}
+
+	if fxErr := s.prepareFXConversion(ctx, req, &state); fxErr != nil {
+		durationMS := time.Since(startTime).Milliseconds()
+		return s.handleTransferFailure(ctx, req, &state, fxErr, durationMS), nil
+	}
+
 	session, err := s.mongoClient.StartSession()
 	if err != nil {
 		durationMS := time.Since(startTime).Milliseconds()
@@ -662,13 +812,8 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 
 	txnOpts := options.Transaction().
 		SetWriteConcern(writeconcern.Majority()).
-		SetReadConcern(readconcern.Snapshot())
-
-	state := transferExecutionState{
-		finalTxnID:   primitive.NewObjectID().Hex(),
-		outboxTaskID: primitive.NewObjectID(),
-		txnStatus:    walletv1.TransferFundsResponse_SUCCESS,
-	}
+		SetReadConcern(readconcern.Snapshot()).
+		SetReadPreference(readpref.Primary())
 
 	_, err = session.WithTransaction(ctx, func(sessCtx mongo.SessionContext) (interface{}, error) {
 		return nil, s.executeTransferTransaction(sessCtx, ctx, req, correlation, &state)
@@ -680,11 +825,20 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 	}
 
 	s.handleTransferSuccess(ctx, req, &state, durationMS)
-	return &walletv1.TransferFundsResponse{
+	resp := &walletv1.TransferFundsResponse{
 		TransactionId:   state.finalTxnID,
 		Status:          state.txnStatus,
 		HandledByRegion: s.region,
-	}, nil
+		FxQuoteId:       state.fxQuoteID,
+		ExchangeRate:    state.exchangeRate,
+	}
+	if state.destCurrency != "" && state.destUnits > 0 {
+		resp.ConvertedAmount = &walletv1.Money{
+			Currency: state.destCurrency,
+			Units:    state.destUnits,
+		}
+	}
+	return resp, nil
 }
 
 func (s *server) UpdateWalletStatus(ctx context.Context, walletID, newStatus string) error {
@@ -933,6 +1087,34 @@ func resolveLedgerAddress() string {
 	return "127.0.0.1:50052"
 }
 
+func resolveFXAddress() string {
+	fxAddr := os.Getenv("FX_SERVICE_ADDR")
+	if fxAddr != "" {
+		return fxAddr
+	}
+	if _, err := net.LookupHost("fx-service"); err == nil {
+		return "fx-service:50055"
+	}
+	return "127.0.0.1:50055"
+}
+
+func dialFXClient(fxAddr string) (*grpc.ClientConn, fxv1.FXServiceClient, error) {
+	log.Printf("[WALLET-SERVICE] Connecting to FX Service at %s...", fxAddr)
+	dialOpt, err := getOutboundDialOption()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to initialize outbound mTLS dial credentials: %w", err)
+	}
+	fxDialOpts := []grpc.DialOption{
+		dialOpt,
+		grpc.WithUnaryInterceptor(observability.UnaryClientTraceInterceptor(walletServiceName)),
+	}
+	conn, err := grpc.NewClient(fxAddr, fxDialOpts...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to connect to fx service: %w", err)
+	}
+	return conn, fxv1.NewFXServiceClient(conn), nil
+}
+
 func setupWalletGRPCServer(port string) (*grpc.Server, *health.Server, net.Listener, error) {
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
@@ -1048,6 +1230,13 @@ func runWalletServer(ctx context.Context) error {
 	}
 	defer conn.Close()
 
+	fxConn, fxClient, fxErr := dialFXClient(resolveFXAddress())
+	if fxErr != nil {
+		log.Printf("[WALLET-SERVICE] FX client dial warning (%v) — using local FX fallback", fxErr)
+	} else {
+		defer fxConn.Close()
+	}
+
 	grpcServer, healthServer, lis, err := setupWalletGRPCServer(port)
 	if err != nil {
 		return fmt.Errorf("failed to setup gRPC server: %w", err)
@@ -1080,6 +1269,7 @@ func runWalletServer(ctx context.Context) error {
 	srv := &server{
 		mongoClient:   client,
 		ledgerClient:  ledgerClient,
+		fxClient:      fxClient,
 		region:        region,
 		isActive:      isActive,
 		targetRole:    resolveWalletRole(isActive),
