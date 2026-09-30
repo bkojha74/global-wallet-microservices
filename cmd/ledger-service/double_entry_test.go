@@ -308,4 +308,3 @@ func TestMultiCurrencyFXSettlementPostings(t *testing.T) {
 		t.Fatalf("unexpected EUR FX liquidity pool leg: %+v", postings[2])
 	}
 }
-

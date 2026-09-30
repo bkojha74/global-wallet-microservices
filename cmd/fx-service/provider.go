@@ -73,6 +73,7 @@ func (p *FrankfurterProvider) FetchRates(ctx context.Context, baseCurrency strin
 		base = "USD"
 	}
 	reqURL := fmt.Sprintf("%s?base=%s", p.Endpoint, base)
+	// #nosec G704 -- outbound request to public ECB rate feed with normalized ISO-4217 base currency
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
@@ -80,6 +81,7 @@ func (p *FrankfurterProvider) FetchRates(ctx context.Context, baseCurrency strin
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "global-wallet-fx-engine/1.0")
 
+	// #nosec G704 -- outbound request to public ECB rate feed
 	resp, err := p.HTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("frankfurter request failed: %w", err)
@@ -160,6 +162,7 @@ func (p *ExchangeRateAPIProvider) FetchRates(ctx context.Context, baseCurrency s
 		base = "USD"
 	}
 	reqURL := fmt.Sprintf("%s/%s", p.BaseURL, base)
+	// #nosec G704 -- outbound request to configured ExchangeRate-API provider
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
@@ -170,6 +173,7 @@ func (p *ExchangeRateAPIProvider) FetchRates(ctx context.Context, baseCurrency s
 		req.Header.Set("Authorization", "Bearer "+p.APIKey)
 	}
 
+	// #nosec G704 -- outbound request to configured ExchangeRate-API provider
 	resp, err := p.HTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("exchangerate-api request failed: %w", err)
@@ -332,4 +336,3 @@ func (c *CompositeRateProvider) FetchRates(ctx context.Context, baseCurrency str
 		FetchedAt:    fetchedAt,
 	}, nil
 }
-

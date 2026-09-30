@@ -130,5 +130,3 @@ func ConvertUnitsScaleBankers(sourceUnits int64, baseCurrency, targetCurrency st
 	}
 	return int64(converted)
 }
-
-

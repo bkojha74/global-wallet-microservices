@@ -153,4 +153,3 @@ func EnsureFXIndexes(ctx context.Context, database *mongo.Database) error {
 	log.Printf("[DB-INDEX] Ensured FX Engine indexes on fx_rates, fx_quotes, and fx_conversions")
 	return nil
 }
-

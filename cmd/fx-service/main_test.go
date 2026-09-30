@@ -272,5 +272,3 @@ func TestFXScaleAwareQuoteCreation(t *testing.T) {
 		t.Fatalf("expected 3760 BHD fils for 1000 USD cents at 0.376 rate, got %d", quoteBHD.TargetAmount)
 	}
 }
-
-

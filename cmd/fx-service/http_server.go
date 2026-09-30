@@ -299,4 +299,3 @@ func (s *fxServer) handleHTTPRefreshRates(w http.ResponseWriter, r *http.Request
 	}
 	writeFXJSON(w, http.StatusOK, resp)
 }
-

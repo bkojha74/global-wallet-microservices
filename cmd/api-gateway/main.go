@@ -46,7 +46,7 @@ type Gateway struct {
 	standbyClient  walletv1.WalletServiceClient
 	ledgerClient   ledgerv1.LedgerServiceClient
 	authClient     authv1.AuthServiceClient // auth-service gRPC client
-	fxClient       fxv1.FXServiceClient   // fx-service gRPC client
+	fxClient       fxv1.FXServiceClient     // fx-service gRPC client
 	primaryAddress string
 	standbyAddress string
 	logger         observability.Logger

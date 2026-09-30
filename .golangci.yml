@@ -27,5 +27,6 @@ issues:
     - proto/wallet
     - proto/ledger
     - proto/auth
+    - proto/fx
   exclude-files:
     - ".*\\.pb\\.go$"

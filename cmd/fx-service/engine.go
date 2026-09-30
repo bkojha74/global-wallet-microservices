@@ -329,8 +329,10 @@ func rateDocToProto(doc ExchangeRateDoc) *fxv1.ExchangeRate {
 		SpreadBps:      doc.SpreadBps,
 		SourceProvider: doc.SourceProvider,
 		UpdatedAt:      doc.UpdatedAt.UTC().Format(time.RFC3339),
-		BaseScale:      int32(baseScale),
-		TargetScale:    int32(targetScale),
+		// #nosec G115 -- ISO-4217 minor unit scale exponent is between 0 and 4
+		BaseScale: int32(baseScale),
+		// #nosec G115 -- ISO-4217 minor unit scale exponent is between 0 and 4
+		TargetScale: int32(targetScale),
 	}
 }
 
@@ -719,8 +721,8 @@ func conversionDocToProto(doc *ConversionDoc, status string) *fxv1.ConvertCurren
 func (e *FXEngine) HealthSummary() (string, int32, int32, string) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+	// #nosec G115 -- currency count is bounded by ISO-4217 catalog size
 	numCurrencies := int32(len(db.SupportedCurrencies))
 	activePairs := numCurrencies * (numCurrencies - 1)
 	return e.sourceProvider, numCurrencies, activePairs, e.lastSyncedAt.UTC().Format(time.RFC3339)
 }
-

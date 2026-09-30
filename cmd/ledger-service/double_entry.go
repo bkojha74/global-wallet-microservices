@@ -188,7 +188,6 @@ func CreateMultiCurrencyTransferPostings(
 	return postings, nil
 }
 
-
 // ComputeEntryHash produces an immutable SHA-256 cryptographic hash of the journal entry,
 // mathematically sealing the sequence number, transaction IDs, timestamp, double-entry postings,
 // and the previous entry hash.

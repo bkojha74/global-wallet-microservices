@@ -89,4 +89,3 @@ func TestConvertUnitsScaleBankers(t *testing.T) {
 		t.Fatalf("expected 376 BHD fils, got %d", resBHD)
 	}
 }
-

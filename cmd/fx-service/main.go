@@ -161,8 +161,9 @@ func (s *fxServer) UpdateExchangeRate(ctx context.Context, req *fxv1.UpdateExcha
 			"source_provider": prov,
 		})
 		return &fxv1.UpdateExchangeRateResponse{
-			Success:        true,
-			Message:        fmt.Sprintf("Synced %d FX pairs from %s", pairs, prov),
+			Success: true,
+			Message: fmt.Sprintf("Synced %d FX pairs from %s", pairs, prov),
+			// #nosec G115 -- pairs count is bounded by supported currency pairs count
 			PairsUpdated:   int32(pairs),
 			SourceProvider: prov,
 			UpdatedAt:      time.Now().UTC().Format(time.RFC3339),
@@ -234,11 +235,13 @@ func parseFXConfig() fxConfig {
 		environment = "local"
 	}
 	spreadBps := int32(defaultSpreadBps)
-	if sVal, err := strconv.Atoi(os.Getenv("FX_DEFAULT_SPREAD_BPS")); err == nil && sVal >= 0 {
+	if sVal, err := strconv.ParseInt(os.Getenv("FX_DEFAULT_SPREAD_BPS"), 10, 32); err == nil && sVal >= 0 {
+		// #nosec G115 -- bounded by ParseInt bitSize 32
 		spreadBps = int32(sVal)
 	}
 	feeBps := int32(0)
-	if fVal, err := strconv.Atoi(os.Getenv("FX_FEE_BPS")); err == nil && fVal >= 0 {
+	if fVal, err := strconv.ParseInt(os.Getenv("FX_FEE_BPS"), 10, 32); err == nil && fVal >= 0 {
+		// #nosec G115 -- bounded by ParseInt bitSize 32
 		feeBps = int32(fVal)
 	}
 	syncInterval := 5 * time.Minute
@@ -246,7 +249,7 @@ func parseFXConfig() fxConfig {
 	if secStr == "" {
 		secStr = os.Getenv("FX_SYNC_INTERVAL_SECONDS")
 	}
-	if secVal, err := strconv.Atoi(secStr); err == nil && secVal > 0 {
+	if secVal, err := strconv.ParseInt(secStr, 10, 64); err == nil && secVal > 0 {
 		syncInterval = time.Duration(secVal) * time.Second
 	}
 	partnerKey := os.Getenv("FX_B2B_API_KEYS")
@@ -430,4 +433,3 @@ func main() {
 		log.Fatalf("[FATAL] %v", err)
 	}
 }
-
