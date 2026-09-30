@@ -15,6 +15,7 @@ import (
 
 	"wallet-system/pkg/db"
 	"wallet-system/pkg/observability"
+	fxv1 "wallet-system/proto/fx"
 	ledgerv1 "wallet-system/proto/ledger"
 	walletv1 "wallet-system/proto/wallet"
 )
@@ -569,5 +570,102 @@ func TestAdminWalletStatusHandlersDetailed(t *testing.T) {
 	srv.handleAdminWalletStatusUpdate(recUpdateNotFound, reqUpdateNotFound)
 	if recUpdateNotFound.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 Not Found, got %d", recUpdateNotFound.Code)
+	}
+}
+
+type fakeFXServiceClient struct {
+	fxv1.FXServiceClient
+}
+
+func (f *fakeFXServiceClient) ConvertCurrency(_ context.Context, req *fxv1.ConvertCurrencyRequest, _ ...grpc.CallOption) (*fxv1.ConvertCurrencyResponse, error) {
+	return &fxv1.ConvertCurrencyResponse{
+		ConversionId:   "fxc_test_123",
+		QuoteId:        req.QuoteId,
+		BaseCurrency:   req.BaseCurrency,
+		TargetCurrency: req.TargetCurrency,
+		SourceAmount:   req.SourceAmount,
+		TargetAmount:   9200, // $100.00 -> €92.00
+		EffectiveRate:  0.92,
+		MidRate:        0.922,
+		SpreadBps:      25,
+		Status:         "EXECUTED",
+	}, nil
+}
+
+func TestCrossCurrencyTransferFXEngine(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	mClient, err := db.ConnectWithRetry(ctx, db.DefaultMongoURI(), 1)
+	if err != nil {
+		t.Skipf("MongoDB unavailable: %v", err)
+		return
+	}
+	defer func() { _ = mClient.Disconnect(ctx) }()
+
+	_ = mClient.Database("banking_db").Collection("wallets").Drop(ctx)
+	_ = mClient.Database("banking_db").Collection("idempotency_records").Drop(ctx)
+	_ = mClient.Database("banking_db").Collection("ledger_tasks").Drop(ctx)
+
+	srv := &server{
+		mongoClient: mClient,
+		fxClient:    &fakeFXServiceClient{},
+		region:      "US_EAST",
+		isActive:    true,
+		logger:      observability.NewMemoryLogger(),
+	}
+
+	_, err = srv.CreateWallet(ctx, &walletv1.CreateWalletRequest{
+		WalletId:       "w_usd_fx",
+		InitialBalance: 20000, // $200.00 USD
+		Currency:       "USD",
+	})
+	if err != nil {
+		t.Fatalf("create source USD wallet failed: %v", err)
+	}
+
+	_, err = srv.CreateWallet(ctx, &walletv1.CreateWalletRequest{
+		WalletId:       "w_eur_fx",
+		InitialBalance: 5000, // €50.00 EUR
+		Currency:       "EUR",
+	})
+	if err != nil {
+		t.Fatalf("create destination EUR wallet failed: %v", err)
+	}
+
+	resp, err := srv.TransferFunds(ctx, &walletv1.TransferFundsRequest{
+		IdempotencyKey:      "idemp_fx_usd_eur_1",
+		SourceWalletId:      "w_usd_fx",
+		DestinationWalletId: "w_eur_fx",
+		Amount:              &walletv1.Money{Currency: "USD", Units: 10000}, // $100.00 USD
+		FxQuoteId:           "fxq_quote_test_1",
+	})
+	if err != nil {
+		t.Fatalf("cross-currency TransferFunds failed: %v", err)
+	}
+	if resp.Status != walletv1.TransferFundsResponse_SUCCESS {
+		t.Fatalf("expected TransferFunds SUCCESS, got %s: %s", resp.Status.String(), resp.ErrorMessage)
+	}
+	if resp.ConvertedAmount == nil || resp.ConvertedAmount.Units != 9200 || resp.ConvertedAmount.Currency != "EUR" {
+		t.Fatalf("expected ConvertedAmount=9200 EUR (€92.00), got %+v", resp.ConvertedAmount)
+	}
+	if resp.ExchangeRate != 0.92 {
+		t.Fatalf("expected ExchangeRate=0.92, got %f", resp.ExchangeRate)
+	}
+
+	srcBal, err := srv.GetBalance(ctx, &walletv1.GetBalanceRequest{WalletId: "w_usd_fx"})
+	if err != nil {
+		t.Fatalf("GetBalance source failed: %v", err)
+	}
+	if len(srcBal.Balances) == 0 || srcBal.Balances[0].Units != 10000 {
+		t.Fatalf("expected source USD balance 10000, got %+v", srcBal.Balances)
+	}
+
+	dstBal, err := srv.GetBalance(ctx, &walletv1.GetBalanceRequest{WalletId: "w_eur_fx"})
+	if err != nil {
+		t.Fatalf("GetBalance dest failed: %v", err)
+	}
+	if len(dstBal.Balances) == 0 || dstBal.Balances[0].Units != 14200 {
+		t.Fatalf("expected dest EUR balance 14200 (5000 + 9200), got %+v", dstBal.Balances)
 	}
 }

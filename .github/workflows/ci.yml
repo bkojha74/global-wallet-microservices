@@ -62,7 +62,8 @@ jobs:
             --go-grpc_out=. --go-grpc_opt=paths=source_relative \
             proto/wallet/wallet.proto \
             proto/ledger/ledger.proto \
-            proto/auth/auth.proto
+            proto/auth/auth.proto \
+            proto/fx/fx.proto
 
       - name: Verify Binaries Buildability
         run: go build ./cmd/...
@@ -98,7 +99,8 @@ jobs:
             --go-grpc_out=. --go-grpc_opt=paths=source_relative \
             proto/wallet/wallet.proto \
             proto/ledger/ledger.proto \
-            proto/auth/auth.proto
+            proto/auth/auth.proto \
+            proto/fx/fx.proto
 
       - name: Check Go Formatting
         shell: bash
@@ -147,7 +149,8 @@ jobs:
             --go-grpc_out=. --go-grpc_opt=paths=source_relative \
             proto/wallet/wallet.proto \
             proto/ledger/ledger.proto \
-            proto/auth/auth.proto
+            proto/auth/auth.proto \
+            proto/fx/fx.proto
 
       - name: Dependency Vulnerability Scan (govulncheck)
         run: |
@@ -202,7 +205,8 @@ jobs:
             --go-grpc_out=. --go-grpc_opt=paths=source_relative \
             proto/wallet/wallet.proto \
             proto/ledger/ledger.proto \
-            proto/auth/auth.proto
+            proto/auth/auth.proto \
+            proto/fx/fx.proto
 
       - name: Run Unit Tests with Race Detector & Coverage
         run: |
@@ -240,7 +244,7 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           protoc --go_out=. --go_opt=paths=source_relative \
             --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-            proto/wallet/wallet.proto proto/ledger/ledger.proto proto/auth/auth.proto
+            proto/wallet/wallet.proto proto/ledger/ledger.proto proto/auth/auth.proto proto/fx/fx.proto
 
       - name: Start Ephemeral Keycloak Container
         run: |
@@ -302,6 +306,7 @@ jobs:
           docker compose -f docker-compose.mongodb.yml up -d
           docker compose -f docker-compose.rabbitmq.yml up -d
           docker compose -f docker-compose.auth.yml up --build -d
+          docker compose -f docker-compose.fx.yml up --build -d
           docker compose -f docker-compose.logging.yml up --build -d
           docker compose -f docker-compose.yml up --build -d
 
@@ -341,6 +346,7 @@ jobs:
         run: |
           docker compose -f docker-compose.yml down -v || true
           docker compose -f docker-compose.logging.yml down -v || true
+          docker compose -f docker-compose.fx.yml down -v || true
           docker compose -f docker-compose.auth.yml down -v || true
           docker compose -f docker-compose.rabbitmq.yml down -v || true
           docker compose -f docker-compose.mongodb.yml down -v || true
@@ -375,6 +381,8 @@ jobs:
             target: ledger-service
           - name: wallet-auth-service
             target: auth-service
+          - name: wallet-fx-service
+            target: fx-service
           - name: wallet-logging-service
             target: logging-service
     steps:
@@ -495,6 +503,7 @@ jobs:
           docker compose -f docker-compose.mongodb.yml pull
           docker compose -f docker-compose.rabbitmq.yml pull
           docker compose -f docker-compose.auth.yml pull
+          docker compose -f docker-compose.fx.yml pull
           docker compose -f docker-compose.logging.yml pull
           docker compose -f docker-compose.yml pull
 
@@ -513,6 +522,7 @@ jobs:
           docker compose -f docker-compose.mongodb.yml up -d
           docker compose -f docker-compose.rabbitmq.yml up -d
           docker compose -f docker-compose.auth.yml up -d
+          docker compose -f docker-compose.fx.yml up -d
           docker compose -f docker-compose.logging.yml up -d
           docker compose -f docker-compose.yml up -d
 

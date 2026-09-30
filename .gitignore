@@ -57,6 +57,7 @@ part_*
 /ledger-service
 /logging-service
 /wallet-service
+/fx-service
 
 # Security and code scanner artifacts (Sonar, SAST, Trivy)
 .scannerwork/

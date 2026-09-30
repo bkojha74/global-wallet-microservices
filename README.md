@@ -75,7 +75,8 @@ The system decomposes financial operations into autonomous, loosely-coupled micr
 | **Keycloak IdP (global-auth-service)** | HTTP `:8085` | • OpenID Connect (OIDC) / OAuth 2.0 Identity Provider<br>• Realm `wallet-realm`, user/role management, JWKS public key distribution | Embedded H2 / Postgres |
 | **Wallet Service (Primary)** | gRPC `:50051`<br>Management `:9094` | • Core banking engine for `us-east-1-primary`<br>• Multi-document ACID transactions (`Majority`/`Snapshot`)<br>• Atomic Transactional Outbox relay for ledger decoupling<br>• OTel W3C tracing, gRPC health, Prometheus metrics | `banking_db.wallets`<br>`banking_db.idempotency_records`<br>`banking_db.ledger_tasks` (Outbox) |
 | **Wallet Service (Standby)** | gRPC `:50053`<br>Management `:9093` | • Hot disaster recovery replica for `eu-west-1-standby`<br>• Real-time takeover target with Standby Write Fencing<br>• OTel W3C tracing, gRPC health, Prometheus metrics | Shared replica set `rs0`<br>(instant failover target) |
-| **Ledger Service** | gRPC `:50052`<br>Management `:9092` | • Immutable financial journal & audit ledger<br>• Reverse-chronological cursor-based queries<br>• Compound and unique indexing eliminating COLLSCAN<br>• OTel W3C tracing, gRPC health, Prometheus metrics | `banking_db.ledger_entries` |
+| **Ledger Service** | gRPC `:50052`<br>Management `:9092` | • Immutable financial journal & audit ledger<br>• 4-leg multi-currency FX settlement double-entry postings<br>• Reverse-chronological cursor-based queries<br>• OTel W3C tracing, gRPC health, Prometheus metrics | `banking_db.ledger_entries` |
+| **FX Engine Service (global-fx-service)** | gRPC `:50055`<br>B2B HTTP `:8086`<br>Prometheus `:9096` | • Standalone SaaS & B2B Foreign Exchange Engine<br>• Live 3rd-party rate sync (Frankfurter ECB, Open ExchangeRate-API)<br>• ISO-4217 catalog, USD triangulation, Bid/Ask spread (bps), Banker's Rounding<br>• RFQ fixed-rate quote locking (`fxq_...`) & idempotent conversion | `fx_db.exchange_rates`<br>`fx_db.fx_quotes`<br>`fx_db.fx_conversions` |
 | **Logging Service (global-logging-service)** | HTTP `:8090`<br>Prometheus `:9090` | • Standalone SaaS centralized logging & tracing service<br>• High-throughput AMQP consumer, deduplicator & retention scheduler<br>• Log Search API, Trace Reconstruction (`/api/v1/traces`), optional API key auth | `logging_db.events` |
 
 * **Strict Contract-First Communication**: Internal inter-service communication operates exclusively over gRPC using Protobuf v3 contracts (`proto/wallet/wallet.proto` and `proto/ledger/ledger.proto`), guaranteeing type safety, high throughput, and backward compatibility.
@@ -422,21 +423,22 @@ graph TD
 
 ## Microservice Directory & Port Matrix
 
-The platform is structured into **6 modular Docker Compose projects** that can be started, stopped, or scaled independently:
+The platform is structured into **7 modular Docker Compose projects** that can be started, stopped, or scaled independently:
 
 | Service | Docker Compose Project | Container Name | Protocol / Ports | Role & Responsibilities |
 |---|---|---|---|---|
-| **API Gateway** | `global-wallet-microservices` | `wallet_api_gateway` | HTTP `:8080`<br/>Prometheus `:8081` | REST ingress, request validation, gRPC reverse proxy, distributed failover coordinator router. |
-| **Wallet Service (Primary)** | `global-wallet-microservices` | `wallet_primary_active` | gRPC `:50051`<br/>Management `:9094` | Primary active banking engine (`us-east-1`). ACID multi-doc transactions, balance management, `LedgerRelay` outbox worker, gRPC health probe, Prometheus `/metrics` and `/healthz`. |
+| **API Gateway** | `global-wallet-microservices` | `wallet_api_gateway` | HTTP `:8080`<br/>Prometheus `:8081` | REST ingress, request validation, gRPC reverse proxy, distributed failover coordinator router, `/api/v1/fx/*` gateway endpoints. |
+| **Wallet Service (Primary)** | `global-wallet-microservices` | `wallet_primary_active` | gRPC `:50051`<br/>Management `:9094` | Primary active banking engine (`us-east-1`). ACID multi-doc transactions, cross-currency FX conversion via `fx-service`, `LedgerRelay` outbox worker, gRPC health probe, Prometheus `/metrics` and `/healthz`. |
 | **Wallet Service (Standby)** | `global-wallet-microservices` | `wallet_standby_hot_dr` | gRPC `:50053`<br/>Management `:9093` | Hot standby disaster recovery replica (`eu-west-1`). Identical engine with Standby Write Fencing ready for instant promotion, gRPC health probe, Prometheus `/metrics` and `/healthz`. |
-| **Ledger Service** | `global-wallet-microservices` | `wallet_ledger_service` | gRPC `:50052`<br/>Management `:9092` | Immutable financial ledger, transaction journal recording, reverse-chronological cursor-based queries, gRPC health probe, Prometheus `/metrics` and `/healthz`. |
+| **Ledger Service** | `global-wallet-microservices` | `wallet_ledger_service` | gRPC `:50052`<br/>Management `:9092` | Immutable financial ledger, 2-leg same-currency & 4-leg multi-currency FX settlement double-entry postings, reverse-chronological cursor-based queries, gRPC health probe, Prometheus `/metrics` and `/healthz`. |
+| **FX Engine Service** | `global-fx-service` | `wallet_fx_service` | gRPC `:50055`<br/>B2B HTTP `:8086`<br/>Metrics `:9096` | Standalone Foreign Exchange microservice (`docker-compose.fx.yml`). Live 3rd-party rate sync (Frankfurter ECB, Open ExchangeRate-API), ISO-4217 catalog, USD triangulation, RFQ quote lock (`fxq_...`), idempotent conversion (`fxc_...`). |
 | **Auth Service** | `global-auth-service` | `wallet_auth_service` | gRPC `:50054`<br/>Metrics `:9095` | Standalone SaaS-ready authentication microservice. Pluggable hybrid identity provider, MongoDB user repository, HMAC/RSA token engine, TTL token blocklist. |
 | **Keycloak IdP** | `global-auth-service` | `wallet_keycloak` | HTTP `:8085` | Enterprise OIDC / OAuth2 Identity Provider. Self-service account portal, admin console, realm import, and JWKS public key distribution. |
 | **Logging Service** | `global-logging-service` | `wallet_logging_service` | HTTP `:8090`<br/>Prometheus `:9090` | Standalone SaaS-ready centralized logging microservice. AMQP log consumer, validation, deduplication, Log Search API (`/api/v1/logs`), Trace Reconstruction (`/api/v1/traces/{id}`), retention scheduler. |
 | **Async Queue (RabbitMQ)** | `global-async-queue` | `wallet_rabbitmq` | AMQP `:5672`<br/>Management `:15672` | High-throughput asynchronous message broker (`docker-compose.rabbitmq.yml`). Direct and dead-letter exchanges, quorum queues, and management UI. |
 | **Prometheus** | `global-monitoring` | `wallet_prometheus` | HTTP `:9091` | Time-series metrics collection server (`docker-compose.monitoring.yml`) scraping gateway, primary/standby wallets, ledger, logging, and rabbitmq. |
 | **Grafana** | `global-monitoring` | `wallet_grafana` | HTTP `:3000` | Observability dashboards auto-provisioned with metrics visualization (`docker-compose.monitoring.yml`). |
-| **MongoDB Replica Set** | `wallet-mongodb` | `wallet_mongodb_1`<br/>`wallet_mongodb_2`<br/>`wallet_mongodb_3` | TCP `:27018` (Primary)<br/>TCP `:27019` (Secondary)<br/>TCP `:27020` (Secondary) | 3-node High-Availability ACID transactional replica set `rs0` (`docker-compose.mongodb.yml`) with automated failover & consensus. Hosts `banking_db`, `auth_db`, and `logging_db`. |
+| **MongoDB Replica Set** | `wallet-mongodb` | `wallet_mongodb_1`<br/>`wallet_mongodb_2`<br/>`wallet_mongodb_3` | TCP `:27018` (Primary)<br/>TCP `:27019` (Secondary)<br/>TCP `:27020` (Secondary) | 3-node High-Availability ACID transactional replica set `rs0` (`docker-compose.mongodb.yml`) with automated failover & consensus. Hosts `banking_db`, `fx_db`, `auth_db`, and `logging_db`. |
 
 ---
 
@@ -495,8 +497,8 @@ The platform utilizes a comprehensive 9-stage CI/CD pipeline configured in [`.gi
 4. **`integration-tests` (Integration Testing)**: Spawns real containerized service dependencies (`mongo:7.0` replica set and `rabbitmq:3.13` broker) to test transactional outbox relays and message delivery.
 5. **`system-tests` (System End-to-End Testing)**: Boots microservice test instances to validate edge-to-core flows through the API Gateway, including token generation, balance inquiries, and failover status.
 6. **`security-audit` (Vulnerability Auditing)**: Runs `govulncheck ./...` against the official Go Vulnerability Database to prevent known CVEs from entering production.
-7. **`build-artifacts` (Binary Build Verification)**: Natively compiles all 5 microservice binaries (`api-gateway`, `wallet-service`, `ledger-service`, `auth-service`, `logging-service`) to catch link-time or architectural compile errors.
-8. **`docker-publish` (Multi-Target Container Packaging)**: Compiles and publishes 5 hardened production container images to Docker Hub in parallel using Buildx and GitHub Actions layer caching (`type=gha`).
+7. **`build-artifacts` (Binary Build Verification)**: Natively compiles all microservice binaries (`api-gateway`, `wallet-service`, `ledger-service`, `fx-service`, `auth-service`, `logging-service`) to catch link-time or architectural compile errors.
+8. **`docker-publish` (Multi-Target Container Packaging)**: Compiles and publishes hardened production container images to Docker Hub in parallel using Buildx and GitHub Actions layer caching (`type=gha`).
 9. **`deploy` (Continuous Deployment to Self-Hosted Environment)**: Executes on a self-hosted Windows runner with pre-flight Docker daemon health verification and rolling stack restarts.
 
 ### Secrets & Configuration
@@ -519,6 +521,7 @@ All microservices are published to Docker Hub and can be referenced directly or 
 | **API Gateway** | `bkojha74/wallet-api-gateway` | `${DOCKERHUB_USERNAME:-bkojha74}/wallet-api-gateway:latest` |
 | **Wallet Service (Primary & Standby)** | `bkojha74/wallet-service` | `${DOCKERHUB_USERNAME:-bkojha74}/wallet-service:latest` |
 | **Ledger Service** | `bkojha74/wallet-ledger-service` | `${DOCKERHUB_USERNAME:-bkojha74}/wallet-ledger-service:latest` |
+| **FX Engine Service** | `bkojha74/wallet-fx-service` | `${DOCKERHUB_USERNAME:-bkojha74}/wallet-fx-service:latest` |
 | **Auth Service** | `bkojha74/wallet-auth-service` | `${DOCKERHUB_USERNAME:-bkojha74}/wallet-auth-service:latest` |
 | **Logging Service** | `bkojha74/wallet-logging-service` | `${DOCKERHUB_USERNAME:-bkojha74}/wallet-logging-service:latest` |
 
@@ -553,16 +556,19 @@ docker compose -f docker-compose.rabbitmq.yml up -d
 # 4. Start Identity & Auth Service (Project: global-auth-service)
 docker compose -f docker-compose.auth.yml up --build -d
 
-# 5. Start Centralized Logging Microservice (Project: global-logging-service)
+# 5. Start Foreign Exchange (FX) Engine Service (Project: global-fx-service)
+docker compose -f docker-compose.fx.yml up --build -d
+
+# 6. Start Centralized Logging Microservice (Project: global-logging-service)
 docker compose -f docker-compose.logging.yml up --build -d
 
-# 6. Start Observability & Telemetry Monitoring (Project: global-monitoring)
+# 7. Start Observability & Telemetry Monitoring (Project: global-monitoring)
 docker compose -f docker-compose.monitoring.yml up -d
 
-# 7. Start Code Quality & SonarQube Server (Project: global-quality)
+# 8. Start Code Quality & SonarQube Server (Project: global-quality)
 docker compose -f docker-compose.quality.yml up -d
 
-# 8. Start Core Application Microservices (Project: global-wallet-microservices)
+# 9. Start Core Application Microservices (Project: global-wallet-microservices)
 docker compose -f docker-compose.yml up --build -d
 ```
 
@@ -576,9 +582,10 @@ docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 A convenient `Makefile` is provided in the repository root:
 
 ```bash
-make up            # Start all stacks in dependency order (MongoDB -> Queue -> Auth -> Logging -> Core App)
+make up            # Start all stacks in dependency order (MongoDB -> Queue -> Auth -> FX -> Logging -> Core App)
 make up-queue      # Start standalone global-async-queue (RabbitMQ)
 make up-auth       # Start standalone global-auth-service (Keycloak + Auth Service)
+make up-fx         # Start standalone global-fx-service (FX Engine on :50055 / :8086)
 make up-logging    # Start standalone global-logging-service
 make up-monitoring # Start standalone global-monitoring (Prometheus & Grafana)
 make up-mongodb    # Start MongoDB replica set
@@ -586,6 +593,7 @@ make up-app        # Start core wallet application microservices
 make down          # Stop all application, platform, and infrastructure stacks safely
 make down-queue    # Stop async queue stack
 make down-auth     # Stop auth service stack
+make down-fx       # Stop FX Engine service stack
 make down-logging  # Stop logging service stack
 make down-monitoring # Stop monitoring stack
 make test          # Run Go unit and race detector tests
@@ -668,6 +676,46 @@ curl -s -X POST http://localhost:8080/api/v1/transfers \
     "amount": 250,
     "currency": "USD"
   }' | jq .
+```
+
+### 3b. Multi-Currency FX Engine & Cross-Currency Transfers (B2B & Gateway)
+Query ISO-4217 currencies, live FX rates, lock a fixed-rate RFQ quote (`fxq_...`), and execute a cross-currency transfer (e.g., USD -> EUR) with 4-leg GAAP/IFRS settlement postings:
+
+```bash
+# 1. List ISO-4217 Supported Currencies & Minor-Unit Scales
+curl -s "http://localhost:8080/api/v1/fx/currencies" | jq .
+
+# 2. Get Live USD -> EUR Exchange Rate (or call B2B port :8086 directly)
+curl -s "http://localhost:8080/api/v1/fx/rates?base=USD&target=EUR" | jq .
+
+# 3. Lock a Fixed-Rate FX Quote (RFQ with 60s TTL)
+FX_QUOTE_ID=$(curl -s -X POST "http://localhost:8080/api/v1/fx/quotes" \
+  -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"base_currency":"USD","target_currency":"EUR","source_amount":10000,"ttl_seconds":60}' | jq -r .quote_id)
+
+# 4. Create Euro Wallet for Hans & Transfer $100.00 USD -> EUR using Locked FX Quote
+curl -s -X POST http://localhost:8080/api/v1/wallets \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"wallet_id":"hans-eur","currency":"EUR","initial_balance":5000}' | jq .
+
+curl -s -X POST http://localhost:8080/api/v1/transfers \
+  -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"idempotency_key\": \"tx-fx-usd-eur-001\",
+    \"source_wallet_id\": \"alice\",
+    \"destination_wallet_id\": \"hans-eur\",
+    \"amount\": 10000,
+    \"currency\": \"USD\",
+    \"fx_quote_id\": \"$FX_QUOTE_ID\"
+  }" | jq .
+
+# 5. Trigger Live 3rd-Party FX Rate Refresh (Frankfurter ECB / Open ExchangeRate-API) on B2B Port :8086
+curl -s -X POST "http://localhost:8086/api/v1/fx/rates/refresh" \
+  -H "Content-Type: application/json" \
+  -d '{"trigger_upstream_sync":true}' | jq .
 ```
 
 ### 4. Regional Disaster Recovery Failover Simulation

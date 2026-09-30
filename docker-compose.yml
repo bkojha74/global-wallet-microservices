@@ -36,6 +36,7 @@ services:
       - PORT=50051
       - MONGO_URI=mongodb://mongo1:27018,mongo2:27019,mongo3:27020/?replicaSet=rs0&readPreference=primaryPreferred&retryWrites=true&w=majority
       - LEDGER_SERVICE_ADDR=ledger-service:50052
+      - FX_SERVICE_ADDR=fx-service:50055
       - REGION_NAME=us-east-1 (Primary Active)
       - IS_ACTIVE=true
       - COORDINATOR_ROLE=PRIMARY
@@ -69,6 +70,7 @@ services:
       - PORT=50053
       - MONGO_URI=mongodb://mongo1:27018,mongo2:27019,mongo3:27020/?replicaSet=rs0&readPreference=primaryPreferred&retryWrites=true&w=majority
       - LEDGER_SERVICE_ADDR=ledger-service:50052
+      - FX_SERVICE_ADDR=fx-service:50055
       - REGION_NAME=eu-west-1 (Standby Hot DR)
       - IS_ACTIVE=false
       - COORDINATOR_ROLE=STANDBY
@@ -105,6 +107,7 @@ services:
       - STANDBY_WALLET_ADDR=wallet-standby:50053
       - LEDGER_ADDR=ledger-service:50052
       - AUTH_SERVICE_ADDR=auth-service:50054
+      - FX_SERVICE_ADDR=fx-service:50055
       - INSTANCE_ID=api-gateway-1
       - ENVIRONMENT=local
       - LOGGING_RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
