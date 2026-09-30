@@ -292,3 +292,20 @@ func TestAuditVerificationChainIntegrity(t *testing.T) {
 		fmt.Printf("[TEST] Correctly caught tamper: %s\n", result.ErrorMessage)
 	})
 }
+
+func TestMultiCurrencyFXSettlementPostings(t *testing.T) {
+	postings, err := CreateMultiCurrencyTransferPostings("alice_usd", "bob_eur", 10000, "USD", 9200, "EUR")
+	if err != nil {
+		t.Fatalf("expected valid 4-leg FX postings, got error: %v", err)
+	}
+	if len(postings) != 4 {
+		t.Fatalf("expected 4 postings for cross-currency transfer, got %d", len(postings))
+	}
+	if postings[1].AccountID != "FX_LIQUIDITY_POOL_USD" || postings[1].Direction != PostingCredit || postings[1].Amount != 10000 {
+		t.Fatalf("unexpected USD FX liquidity pool leg: %+v", postings[1])
+	}
+	if postings[2].AccountID != "FX_LIQUIDITY_POOL_EUR" || postings[2].Direction != PostingDebit || postings[2].Amount != 9200 {
+		t.Fatalf("unexpected EUR FX liquidity pool leg: %+v", postings[2])
+	}
+}
+

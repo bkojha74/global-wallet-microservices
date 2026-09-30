@@ -94,3 +94,63 @@ func EnsureWalletIndexes(ctx context.Context, db *mongo.Database) error {
 
 	return nil
 }
+
+// EnsureFXIndexes creates production indexes for the FX Engine collections:
+//   - fx_rates: unique index on pair (BASE/TARGET) + updated_at index
+//   - fx_quotes: TTL index on expires_at (auto-purges after 24h) + client_id index
+//   - fx_conversions: unique index on idempotency_key + quote_id lookup index
+func EnsureFXIndexes(ctx context.Context, database *mongo.Database) error {
+	if database == nil {
+		return nil
+	}
+
+	ratesCol := database.Collection("fx_rates")
+	rateIndexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{bson.E{Key: "base_currency", Value: 1}, bson.E{Key: "target_currency", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("idx_fx_rates_pair_unique"),
+		},
+		{
+			Keys:    bson.D{bson.E{Key: "updated_at", Value: -1}},
+			Options: options.Index().SetName("idx_fx_rates_updated_at"),
+		},
+	}
+	if _, err := ratesCol.Indexes().CreateMany(ctx, rateIndexes); err != nil {
+		return fmt.Errorf("failed to create fx_rates indexes: %w", err)
+	}
+
+	quotesCol := database.Collection("fx_quotes")
+	quoteIndexes := []mongo.IndexModel{
+		{
+			// Retain expired quotes for 24h for audit/troubleshooting before MongoDB TTL cleanup
+			Keys:    bson.D{bson.E{Key: "expires_at", Value: 1}},
+			Options: options.Index().SetExpireAfterSeconds(86400).SetName("idx_fx_quotes_ttl_24h"),
+		},
+		{
+			Keys:    bson.D{bson.E{Key: "client_id", Value: 1}, bson.E{Key: "created_at", Value: -1}},
+			Options: options.Index().SetName("idx_fx_quotes_client_time"),
+		},
+	}
+	if _, err := quotesCol.Indexes().CreateMany(ctx, quoteIndexes); err != nil {
+		return fmt.Errorf("failed to create fx_quotes indexes: %w", err)
+	}
+
+	convCol := database.Collection("fx_conversions")
+	convIndexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{bson.E{Key: "idempotency_key", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("idx_fx_conversions_idempotency_unique"),
+		},
+		{
+			Keys:    bson.D{bson.E{Key: "quote_id", Value: 1}},
+			Options: options.Index().SetName("idx_fx_conversions_quote_id"),
+		},
+	}
+	if _, err := convCol.Indexes().CreateMany(ctx, convIndexes); err != nil {
+		return fmt.Errorf("failed to create fx_conversions indexes: %w", err)
+	}
+
+	log.Printf("[DB-INDEX] Ensured FX Engine indexes on fx_rates, fx_quotes, and fx_conversions")
+	return nil
+}
+

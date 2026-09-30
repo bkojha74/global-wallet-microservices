@@ -1,0 +1,157 @@
+syntax = "proto3";
+
+package fx.v1;
+option go_package = "wallet-system/proto/fx;fxv1";
+
+// FXService provides enterprise Foreign Exchange (FX) pricing, live 3rd-party market rate
+// aggregation, Request-for-Quote (RFQ) rate locking with TTL, and idempotent multi-currency
+// conversion for both 3rd-party B2B consumers and internal global-wallet microservices.
+service FXService {
+  // GetExchangeRate returns the live spot mid-market, bid, and ask rate for a currency pair.
+  rpc GetExchangeRate (GetExchangeRateRequest) returns (GetExchangeRateResponse);
+
+  // ListExchangeRates returns all supported currency pair rates for a base currency.
+  rpc ListExchangeRates (ListExchangeRatesRequest) returns (ListExchangeRatesResponse);
+
+  // CreateQuote generates a guaranteed fixed-rate FX quote locked for a configurable TTL window.
+  rpc CreateQuote (CreateQuoteRequest) returns (CreateQuoteResponse);
+
+  // GetQuote retrieves the status and details of an existing FX quote.
+  rpc GetQuote (GetQuoteRequest) returns (GetQuoteResponse);
+
+  // ConvertCurrency executes an atomic currency conversion (via a locked quote_id or spot rate)
+  // for 3rd-party B2B callers or internal cross-currency wallet transfers.
+  rpc ConvertCurrency (ConvertCurrencyRequest) returns (ConvertCurrencyResponse);
+
+  // UpdateExchangeRate allows administrative rate overrides or triggers an immediate 3rd-party API sync.
+  rpc UpdateExchangeRate (UpdateExchangeRateRequest) returns (UpdateExchangeRateResponse);
+
+  // HealthCheck reports service readiness, upstream provider status, and active rate count.
+  rpc HealthCheck (FXHealthRequest) returns (FXHealthResponse);
+}
+
+message ExchangeRate {
+  string base_currency = 1;     // ISO-4217 3-letter code (e.g., "USD")
+  string target_currency = 2;   // ISO-4217 3-letter code (e.g., "EUR")
+  double mid_rate = 3;          // Institutional mid-market spot rate
+  double bid_rate = 4;          // Market bid rate (mid_rate - half spread)
+  double ask_rate = 5;          // Market ask rate (mid_rate + half spread)
+  double effective_rate = 6;    // Applied customer conversion rate (after spread)
+  double inverse_rate = 7;      // 1 / effective_rate
+  int32 spread_bps = 8;         // Applied spread in basis points (1 bps = 0.01%)
+  string source_provider = 9;   // e.g., "frankfurter-ecb", "open-exchangerate-api", "institutional-baseline"
+  string updated_at = 10;       // RFC3339 timestamp of rate observation
+  int32 base_scale = 11;        // ISO-4217 minor unit decimal scale for base_currency
+  int32 target_scale = 12;      // ISO-4217 minor unit decimal scale for target_currency
+}
+
+message GetExchangeRateRequest {
+  string base_currency = 1;
+  string target_currency = 2;
+}
+
+message GetExchangeRateResponse {
+  ExchangeRate rate = 1;
+}
+
+message ListExchangeRatesRequest {
+  string base_currency = 1;
+}
+
+message ListExchangeRatesResponse {
+  string base_currency = 1;
+  repeated ExchangeRate rates = 2;
+  string source_provider = 3;
+  string updated_at = 4;
+}
+
+message Quote {
+  string quote_id = 1;          // Unique quote identifier (e.g., "fxq_...")
+  string base_currency = 2;
+  string target_currency = 3;
+  int64 source_amount = 4;      // Input amount in base_currency units
+  int64 target_amount = 5;      // Converted amount in target_currency units
+  int64 fee_amount = 6;         // Fee amount in base_currency units
+  double mid_rate = 7;
+  double effective_rate = 8;
+  int32 spread_bps = 9;
+  string status = 10;           // "ACTIVE", "EXECUTED", "EXPIRED"
+  string client_id = 11;        // 3rd-party partner ID or internal service name
+  string source_provider = 12;
+  string created_at = 13;       // RFC3339
+  string expires_at = 14;       // RFC3339
+}
+
+message CreateQuoteRequest {
+  string base_currency = 1;
+  string target_currency = 2;
+  int64 source_amount = 3;
+  string client_id = 4;         // e.g., "global-wallet-service" or 3rd-party tenant ID
+  int32 ttl_seconds = 5;        // Optional quote lock validity window (default: 60s)
+}
+
+message CreateQuoteResponse {
+  Quote quote = 1;
+}
+
+message GetQuoteRequest {
+  string quote_id = 1;
+}
+
+message GetQuoteResponse {
+  Quote quote = 1;
+}
+
+message ConvertCurrencyRequest {
+  string idempotency_key = 1;
+  string quote_id = 2;          // Optional: if provided, consumes the locked quote
+  string base_currency = 3;
+  string target_currency = 4;
+  int64 source_amount = 5;
+  string client_id = 6;         // Calling microservice or 3rd-party partner identifier
+  string reference_id = 7;      // Optional external reference / wallet transaction ID
+}
+
+message ConvertCurrencyResponse {
+  string conversion_id = 1;
+  string quote_id = 2;
+  string base_currency = 3;
+  string target_currency = 4;
+  int64 source_amount = 5;
+  int64 target_amount = 6;
+  int64 fee_amount = 7;
+  double mid_rate = 8;
+  double effective_rate = 9;
+  int32 spread_bps = 10;
+  string status = 11;           // "COMPLETED", "DUPLICATE_REPLAY"
+  string source_provider = 12;
+  string executed_at = 13;
+}
+
+message UpdateExchangeRateRequest {
+  string base_currency = 1;
+  string target_currency = 2;
+  double mid_rate = 3;
+  int32 spread_bps = 4;
+  bool trigger_upstream_sync = 5; // If true, fetches latest rates from 3rd-party FX APIs
+  string source_provider = 6;
+}
+
+message UpdateExchangeRateResponse {
+  bool success = 1;
+  string message = 2;
+  int32 pairs_updated = 3;
+  string source_provider = 4;
+  string updated_at = 5;
+}
+
+message FXHealthRequest {}
+
+message FXHealthResponse {
+  string status = 1;
+  string source_provider = 2;
+  int32 supported_currencies = 3;
+  int32 active_pairs = 4;
+  string last_synced_at = 5;
+}
+

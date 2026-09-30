@@ -1,4 +1,18 @@
-.PHONY: up up-mongodb up-queue up-auth up-fx up-logging up-monitoring up-quality up-app down down-mongodb down-queue down-auth down-fx down-logging down-monitoring down-quality down-app logs test clean k8s-build k8s-deploy sonar-scan sast-scan
+.PHONY: build build-linux proto up up-mongodb up-queue up-auth up-fx up-logging up-monitoring up-quality up-app down down-mongodb down-queue down-auth down-fx down-logging down-monitoring down-quality down-app logs test clean k8s-build k8s-deploy sonar-scan sast-scan
+
+proto:
+	protoc --go_out=. --go_opt=paths=source_relative \
+	       --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+	       proto/wallet/wallet.proto \
+	       proto/ledger/ledger.proto \
+	       proto/auth/auth.proto \
+	       proto/fx/fx.proto
+
+build:
+	go build -v -o bin/ ./cmd/...
+
+build-linux:
+	CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o bin/ ./cmd/...
 
 up: up-mongodb up-queue up-auth up-fx up-logging
 	docker compose -f docker-compose.yml up --build -d

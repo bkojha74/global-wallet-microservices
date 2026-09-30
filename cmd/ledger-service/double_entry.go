@@ -135,6 +135,60 @@ func CreateTransferPostings(sourceWalletID, destWalletID string, amount int64, c
 	return postings, nil
 }
 
+// CreateMultiCurrencyTransferPostings generates balanced GAAP/IFRS double-entry journal postings
+// for both single-currency transfers (2-leg) and cross-currency FX settlement (4-leg multi-currency accounting).
+// In a cross-currency transfer:
+// 1. Debit Source Customer Liability (reduces liability to sender in source currency)
+// 2. Credit Bank FX Liquidity Pool (source currency settlement asset credited)
+// 3. Debit Bank FX Liquidity Pool (target currency settlement asset debited)
+// 4. Credit Destination Customer Liability (increases liability to recipient in target currency)
+func CreateMultiCurrencyTransferPostings(
+	sourceWalletID, destWalletID string,
+	sourceAmount int64, sourceCurrency string,
+	destAmount int64, destCurrency string,
+) ([]JournalPosting, error) {
+	if destCurrency == "" || destCurrency == sourceCurrency || destAmount <= 0 || (destAmount == sourceAmount && destCurrency == sourceCurrency) {
+		return CreateTransferPostings(sourceWalletID, destWalletID, sourceAmount, sourceCurrency)
+	}
+
+	postings := []JournalPosting{
+		{
+			AccountID:   sourceWalletID,
+			AccountType: AccountTypeCustomerLiability,
+			Direction:   PostingDebit,
+			Amount:      sourceAmount,
+			Currency:    sourceCurrency,
+		},
+		{
+			AccountID:   "FX_LIQUIDITY_POOL_" + sourceCurrency,
+			AccountType: AccountTypeSettlementAsset,
+			Direction:   PostingCredit,
+			Amount:      sourceAmount,
+			Currency:    sourceCurrency,
+		},
+		{
+			AccountID:   "FX_LIQUIDITY_POOL_" + destCurrency,
+			AccountType: AccountTypeSettlementAsset,
+			Direction:   PostingDebit,
+			Amount:      destAmount,
+			Currency:    destCurrency,
+		},
+		{
+			AccountID:   destWalletID,
+			AccountType: AccountTypeCustomerLiability,
+			Direction:   PostingCredit,
+			Amount:      destAmount,
+			Currency:    destCurrency,
+		},
+	}
+
+	if err := ValidatePostings(postings); err != nil {
+		return nil, err
+	}
+	return postings, nil
+}
+
+
 // ComputeEntryHash produces an immutable SHA-256 cryptographic hash of the journal entry,
 // mathematically sealing the sequence number, transaction IDs, timestamp, double-entry postings,
 // and the previous entry hash.

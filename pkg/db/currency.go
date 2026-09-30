@@ -96,6 +96,8 @@ func ValidateAmount(units int64, currency string) error {
 
 // ConvertUnitsBankers applies an exchange rate to a positive integer amount using
 // IEEE 754 Round-Half-To-Even (Banker's Rounding) to eliminate systematic rounding bias.
+// Note: This assumes identical minor unit scales for both currencies. For multi-scale conversions,
+// use ConvertUnitsScaleBankers.
 func ConvertUnitsBankers(sourceUnits int64, effectiveRate float64) int64 {
 	if sourceUnits <= 0 || effectiveRate <= 0 {
 		return 0
@@ -106,4 +108,27 @@ func ConvertUnitsBankers(sourceUnits int64, effectiveRate float64) int64 {
 	}
 	return int64(converted)
 }
+
+// ConvertUnitsScaleBankers converts minor units from base currency to target currency
+// accounting for differences in ISO-4217 minor unit decimal scales (e.g. USD cents [scale 2] -> JPY [scale 0] -> BHD fils [scale 3])
+// and applies IEEE 754 Round-Half-To-Even (Banker's Rounding).
+func ConvertUnitsScaleBankers(sourceUnits int64, baseCurrency, targetCurrency string, effectiveRate float64) int64 {
+	if sourceUnits <= 0 || effectiveRate <= 0 {
+		return 0
+	}
+	baseScale, err1 := CurrencyScale(baseCurrency)
+	targetScale, err2 := CurrencyScale(targetCurrency)
+	if err1 != nil || err2 != nil {
+		return ConvertUnitsBankers(sourceUnits, effectiveRate)
+	}
+
+	scaleDiff := targetScale - baseScale
+	scaleFactor := math.Pow(10, float64(scaleDiff))
+	converted := math.RoundToEven(float64(sourceUnits) * effectiveRate * scaleFactor)
+	if converted < 1 && sourceUnits > 0 {
+		return 1
+	}
+	return int64(converted)
+}
+
 

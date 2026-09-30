@@ -17,6 +17,10 @@ message LedgerEntry {
   string currency = 6;
   string timestamp = 7;
   string region = 8;
+  int64 destination_amount = 9;
+  string destination_currency = 10;
+  double exchange_rate = 11;
+  string fx_quote_id = 12;
 }
 
 message RecordTransactionRequest {
@@ -27,6 +31,10 @@ message RecordTransactionRequest {
   string currency = 5;
   string region = 6;
   string transaction_id = 7;
+  int64 destination_amount = 8;
+  string destination_currency = 9;
+  double exchange_rate = 10;
+  string fx_quote_id = 11;
 }
 
 message RecordTransactionResponse {

@@ -1,0 +1,39 @@
+name: global-fx-service
+
+services:
+  fx-service:
+    image: ${DOCKERHUB_USERNAME:-bkojha74}/wallet-fx-service:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: fx-service
+    container_name: wallet_fx_service
+    restart: always
+    environment:
+      - FX_GRPC_PORT=50055
+      - FX_HTTP_PORT=8086
+      - METRICS_PORT=9096
+      - MONGO_URI=mongodb://mongo1:27018,mongo2:27019,mongo3:27020/?replicaSet=rs0&readPreference=primaryPreferred&retryWrites=true&w=majority
+      - FX_DEFAULT_SPREAD_BPS=${FX_DEFAULT_SPREAD_BPS:-15}
+      - FX_SYNC_INTERVAL_SEC=${FX_SYNC_INTERVAL_SEC:-300}
+      - FX_PROVIDER_URL=${FX_PROVIDER_URL:-}
+      - FX_PROVIDER_API_KEY=${FX_PROVIDER_API_KEY:-}
+      - FX_B2B_API_KEYS=${FX_B2B_API_KEYS:-}
+      - INSTANCE_ID=fx-service-1
+      - ENVIRONMENT=local
+      - LOGGING_RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - LOGGING_SPOOL_PATH=data/logging/fx-service.jsonl
+    ports:
+      - "50055:50055"
+      - "8086:8086"
+      - "9096:9096"
+    networks:
+      wallet_shared_net:
+        aliases:
+          - fx-service
+
+networks:
+  wallet_shared_net:
+    name: wallet_shared_net
+    external: true
+

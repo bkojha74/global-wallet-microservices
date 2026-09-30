@@ -283,7 +283,7 @@ func computeFallbackFX(base, target string, sourceUnits int64) (int64, float64, 
 	}
 	midRate := tRate / bRate
 	effectiveRate := midRate * (1.0 - 0.0025) // 25 bps standard spread
-	targetUnits := db.ConvertUnitsBankers(sourceUnits, effectiveRate)
+	targetUnits := db.ConvertUnitsScaleBankers(sourceUnits, base, target, effectiveRate)
 	return targetUnits, effectiveRate, "fxq_local_fallback"
 }
 
