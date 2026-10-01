@@ -150,7 +150,7 @@ func (c *BalanceCache) Invalidate(walletIDs ...string) {
 	}
 
 	c.mu.Lock()
-	evictedCount := 0
+	var evictedCount uint64
 	for _, id := range walletIDs {
 		if id == "" {
 			continue
@@ -160,7 +160,7 @@ func (c *BalanceCache) Invalidate(walletIDs ...string) {
 			evictedCount++
 		}
 	}
-	c.invalids += uint64(evictedCount)
+	c.invalids += evictedCount
 	c.mu.Unlock()
 
 	if evictedCount > 0 {
