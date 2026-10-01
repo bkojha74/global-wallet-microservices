@@ -146,21 +146,26 @@ flowchart TB
         REST[HTTP / REST Client]
         RPC[gRPC Client / BloomRPC]
         Ops[DevOps / SRE Terminal]
+        B2B[External B2B Partners / Liquidity Consumers]
+        MktFeeds[External Live Market Feeds<br/>open.er-api.com & ECB]
     end
 
     subgraph Ingress["Ingress & Routing Layer"]
-        GW["API Gateway (:8080)<br/>- REST to gRPC Translation<br/>- Dynamic Failover Router<br/>- Metrics Exporter (:8081)"]
+        GW["API Gateway (:8080)<br/>- REST to gRPC Translation<br/>- Dynamic Failover Router<br/>- FX Proxy (/api/v1/fx/*)<br/>- Metrics Exporter (:8081)"]
     end
 
     subgraph CoreServices["Core Financial Services Layer"]
         subgraph PrimaryRegion["us-east-1 (Primary Active)"]
-            WP["wallet-primary (:50051)<br/>- ACID Transfer Engine<br/>- Ledger Outbox Relay Worker<br/>- Management HTTP (:9094)"]
+            WP["wallet-primary (:50051)<br/>- ACID Transfer Engine<br/>- Read-Through Balance Cache<br/>- Ledger Outbox Relay Worker<br/>- Management HTTP (:9094)"]
         end
         subgraph StandbyRegion["eu-west-1 (Standby Hot DR)"]
-            WS["wallet-standby (:50053)<br/>- Standby Hot Replica (Fenced)<br/>- Instant Takeover Target<br/>- Management HTTP (:9093)"]
+            WS["wallet-standby (:50053)<br/>- Standby Hot Replica (Fenced)<br/>- Read-Through Balance Cache<br/>- Instant Takeover Target<br/>- Management HTTP (:9093)"]
         end
         subgraph CoreLedger["Core Ledger Domain"]
-            LS["ledger-service (:50052)<br/>- Immutable Audit Ledger<br/>- Cursor-Based Pagination<br/>- Management HTTP (:9092)"]
+            LS["ledger-service (:50052)<br/>- Immutable Audit Ledger<br/>- 4-Leg Multi-Currency Settlement<br/>- Cursor-Based Pagination<br/>- Management HTTP (:9092)"]
+        end
+        subgraph FXDomain["Foreign Exchange (FX) Domain"]
+            FX["fx-service (:50055)<br/>- Live Rate Triangulation (USD Anchor)<br/>- RFQ Guaranteed Quotes & TTL<br/>- Standalone B2B REST (:8086)<br/>- Management HTTP (:9096)"]
         end
         AI["Gemini 3.1 Flash<br/>AI Fraud Detection"]
     end
@@ -184,6 +189,7 @@ flowchart TB
             MDB_C[("banking_db.cluster_state<br/>(Consensus)")]
             MDB_A[("auth_db<br/>users & tokens")]
             MDB_LOG[("logging_db<br/>events")]
+            MDB_FX[("fx_db<br/>rates, quotes & conversions")]
         end
         RSCluster --- Collections
     end
@@ -204,7 +210,13 @@ flowchart TB
     GW -->|"gRPC (Active)"| WP
     GW -.->|"gRPC (Standby)"| WS
     GW -->|"gRPC"| LS
+    GW -->|"gRPC / FX Proxy"| FX
     GW <-->|"Failover Consensus"| MDB_C
+
+    MktFeeds -->|"HTTPS Live Rates"| FX
+    B2B -->|"REST X-API-Key (:8086)"| FX
+    WP -->|"Cross-Currency Rate/Quote"| FX
+    WS -.->|"Cross-Currency Rate/Quote"| FX
 
     WP -->|"Fraud Context (RPC)"| AI
     WS -.->|"Fraud Context (RPC)"| AI
@@ -213,11 +225,13 @@ flowchart TB
     WP -->|"Fast-Path gRPC / Relay"| LS
     WS -.->|"Fast-Path gRPC / Relay"| LS
     LS -->|"Read / Write Entries"| RSCluster
+    FX -->|"Rates, Quotes & Conversions"| RSCluster
 
     WP -->|"Async Event / Spool"| RMQ
     WS -->|"Async Event / Spool"| RMQ
     LS -->|"Async Event / Spool"| RMQ
     GW -->|"Async Event / Spool"| RMQ
+    FX -->|"Async Event / Spool"| RMQ
 
     RMQ -->|"AMQP Consume"| LOG_SVC
     LOG_SVC -->|"Persist Logs"| MDB_LOG
@@ -227,6 +241,7 @@ flowchart TB
     PROM -->|"Scrape :9094"| WP
     PROM -->|"Scrape :9093"| WS
     PROM -->|"Scrape :9092"| LS
+    PROM -->|"Scrape :9096"| FX
     PROM -->|"Scrape :9090"| LOG_SVC
     GRAF -->|"Visualize Data"| PROM
 ```
