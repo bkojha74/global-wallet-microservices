@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"wallet-system/pkg/observability"
@@ -27,6 +28,7 @@ type BalanceCache struct {
 	maxEntries  int
 	serviceName string
 	stopCleanup chan struct{}
+	closeOnce   sync.Once
 	hits        uint64
 	misses      uint64
 	invalids    uint64
@@ -91,9 +93,7 @@ func (c *BalanceCache) Get(walletID string) (*walletv1.GetBalanceResponse, bool)
 	entry, found := c.entries[walletID]
 	if !found {
 		c.mu.RUnlock()
-		c.mu.Lock()
-		c.misses++
-		c.mu.Unlock()
+		atomic.AddUint64(&c.misses, 1)
 		observability.DefaultMetrics.IncCacheMisses(c.serviceName, "wallet_balance")
 		return nil, false
 	}
@@ -101,19 +101,21 @@ func (c *BalanceCache) Get(walletID string) (*walletv1.GetBalanceResponse, bool)
 	now := time.Now()
 	if now.After(entry.expiresAt) {
 		c.mu.RUnlock()
-		// Expired: prune lazily
+		// Expired: prune lazily under write lock
 		c.mu.Lock()
-		delete(c.entries, walletID)
-		c.misses++
+		if e, exists := c.entries[walletID]; exists && time.Now().After(e.expiresAt) {
+			delete(c.entries, walletID)
+		}
 		c.mu.Unlock()
+		atomic.AddUint64(&c.misses, 1)
 		observability.DefaultMetrics.IncCacheMisses(c.serviceName, "wallet_balance")
 		return nil, false
 	}
 
 	cloned := cloneGetBalanceResponse(entry.response)
-	c.hits++
 	c.mu.RUnlock()
 
+	atomic.AddUint64(&c.hits, 1)
 	observability.DefaultMetrics.IncCacheHits(c.serviceName, "wallet_balance")
 	return cloned, true
 }
@@ -160,10 +162,10 @@ func (c *BalanceCache) Invalidate(walletIDs ...string) {
 			evictedCount++
 		}
 	}
-	c.invalids += evictedCount
 	c.mu.Unlock()
 
 	if evictedCount > 0 {
+		atomic.AddUint64(&c.invalids, evictedCount)
 		observability.DefaultMetrics.IncCacheInvalidations(c.serviceName, "wallet_balance")
 	}
 }
@@ -178,17 +180,14 @@ func (c *BalanceCache) Clear() {
 	c.entries = make(map[string]cachedBalanceEntry)
 }
 
-// Close stops the background eviction goroutine.
+// Close stops the background eviction goroutine safely via sync.Once.
 func (c *BalanceCache) Close() {
 	if c == nil {
 		return
 	}
-	select {
-	case <-c.stopCleanup:
-		// already closed
-	default:
+	c.closeOnce.Do(func() {
 		close(c.stopCleanup)
-	}
+	})
 }
 
 // Stats returns cumulative hits, misses, invalidations, and current entry count.
@@ -197,8 +196,9 @@ func (c *BalanceCache) Stats() (hits, misses, invalids uint64, count int) {
 		return 0, 0, 0, 0
 	}
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.hits, c.misses, c.invalids, len(c.entries)
+	count = len(c.entries)
+	c.mu.RUnlock()
+	return atomic.LoadUint64(&c.hits), atomic.LoadUint64(&c.misses), atomic.LoadUint64(&c.invalids), count
 }
 
 func (c *BalanceCache) runBackgroundCleanup(interval time.Duration) {
