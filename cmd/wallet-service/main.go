@@ -57,6 +57,12 @@ type server struct {
 	// Phase AI-01: AI-powered fraud detection — nil when GEMINI_API_KEY is not set.
 	aiClient      *ai.Client
 	fraudDetector *ai.FraudDetector
+	// In-memory read-through balance cache with immediate write invalidation
+	balanceCache *BalanceCache
+}
+
+func (s *server) cache() *BalanceCache {
+	return s.balanceCache
 }
 
 func (s *server) db() *mongo.Database {
@@ -204,6 +210,10 @@ func (s *server) CreateWallet(ctx context.Context, req *walletv1.CreateWalletReq
 		return nil, status.Errorf(codes.Internal, "failed to create wallet: %v", err)
 	}
 
+	if c := s.cache(); c != nil {
+		c.Invalidate(req.WalletId)
+	}
+
 	log.Printf("[WALLET] Wallet initialized: ID=%s, Currency=%s, Balance=%d (Region: %s)",
 		req.WalletId, req.Currency, req.InitialBalance, s.region)
 
@@ -218,29 +228,46 @@ func (s *server) GetBalance(ctx context.Context, req *walletv1.GetBalanceRequest
 	if req == nil || strings.TrimSpace(req.WalletId) == "" {
 		return nil, status.Errorf(codes.InvalidArgument, errWalletIDRequired)
 	}
+
+	walletID := strings.TrimSpace(req.WalletId)
+
+	// Check high-speed in-memory read-through cache first
+	if c := s.cache(); c != nil {
+		if cached, hit := c.Get(walletID); hit && cached != nil {
+			return cached, nil
+		}
+	}
+
 	correlation := observability.FromIncomingContext(ctx)
 	ctx = observability.WithCorrelation(ctx, correlation)
-	s.emit(ctx, "wallet.balance.request_received", observability.LevelInfo, "Get balance request received", map[string]any{"wallet_id": req.WalletId})
-	log.Printf("[WALLET] GetBalance proto received: wallet_id=%s region=%s", req.WalletId, s.region)
+	s.emit(ctx, "wallet.balance.request_received", observability.LevelInfo, "Get balance request received", map[string]any{"wallet_id": walletID})
+	log.Printf("[WALLET] GetBalance proto received (cache-miss): wallet_id=%s region=%s", walletID, s.region)
 	col := s.db().Collection("wallets")
 
 	var wallet WalletModel
-	err := col.FindOne(ctx, bson.M{"_id": req.WalletId}).Decode(&wallet)
+	err := col.FindOne(ctx, bson.M{"_id": walletID}).Decode(&wallet)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
-			return nil, status.Errorf(codes.NotFound, "wallet %s not found", req.WalletId)
+			return nil, status.Errorf(codes.NotFound, "wallet %s not found", walletID)
 		}
 		return nil, status.Errorf(codes.Internal, "db error: %v", err)
 	}
 
-	return &walletv1.GetBalanceResponse{
-		WalletId: req.WalletId,
+	resp := &walletv1.GetBalanceResponse{
+		WalletId: walletID,
 		Balances: []*walletv1.Money{
 			{Currency: wallet.Currency, Units: wallet.Balance},
 		},
 		HandledByRegion: s.region,
 		Status:          wallet.EffectiveStatus(),
-	}, nil
+	}
+
+	// Populate in-memory cache for subsequent sub-millisecond reads
+	if c := s.cache(); c != nil {
+		c.Set(walletID, resp)
+	}
+
+	return resp, nil
 }
 
 type transferExecutionState struct {
@@ -746,6 +773,10 @@ func (s *server) handleTransferSuccess(ctx context.Context, req *walletv1.Transf
 	traceID := req.IdempotencyKey
 	if state.txnStatus == walletv1.TransferFundsResponse_SUCCESS {
 		s.dispatchImmediateLedger(ctx, req, state.outboxTask, state.finalTxnID)
+		// Evict both source and destination wallets immediately to prevent stale balance reads
+		if c := s.cache(); c != nil {
+			c.Invalidate(req.SourceWalletId, req.DestinationWalletId)
+		}
 	}
 
 	log.Printf("[WALLET-TX] trace_id=%s step=wallet_proto_response_created status=%s transaction_id=%s", traceID, state.txnStatus.String(), state.finalTxnID)
@@ -860,6 +891,9 @@ func (s *server) UpdateWalletStatus(ctx context.Context, walletID, newStatus str
 	}
 	if res.MatchedCount == 0 {
 		return mongo.ErrNoDocuments
+	}
+	if c := s.cache(); c != nil {
+		c.Invalidate(walletID)
 	}
 	return nil
 }
@@ -1266,6 +1300,12 @@ func runWalletServer(ctx context.Context) error {
 	}
 	// ── End AI Init ───────────────────────────────────────────────────────────
 
+	balanceCache := NewBalanceCacheFromEnv(walletServiceName)
+	if balanceCache != nil {
+		defer balanceCache.Close()
+		log.Printf("[WALLET-SERVICE] Wallet balance in-memory cache ENABLED (ttl=%v maxEntries=%d)", balanceCache.ttl, balanceCache.maxEntries)
+	}
+
 	srv := &server{
 		mongoClient:   client,
 		ledgerClient:  ledgerClient,
@@ -1279,6 +1319,7 @@ func runWalletServer(ctx context.Context) error {
 		ledgerRelay:   ledgerRelay,
 		aiClient:      aiClient,
 		fraudDetector: ai.NewFraudDetector(aiClient),
+		balanceCache:  balanceCache,
 	}
 	walletv1.RegisterWalletServiceServer(grpcServer, srv)
 

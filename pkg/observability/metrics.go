@@ -34,6 +34,11 @@ type MetricsRegistry struct {
 	grpcLatencySum      map[string]float64 // grpc_request_duration_seconds_sum{service,method}
 	grpcLatencyCount    map[string]int64   // grpc_request_duration_seconds_count{service,method}
 	clusterActiveTarget map[string]int64   // cluster_active_target{service,target}
+
+	// Cache metrics
+	cacheHits          map[string]int64 // cache_hits_total{service,cache}
+	cacheMisses        map[string]int64 // cache_misses_total{service,cache}
+	cacheInvalidations map[string]int64 // cache_invalidations_total{service,cache}
 }
 
 // DefaultMetrics is the process-wide singleton registry used by all AsyncLogger instances.
@@ -52,6 +57,9 @@ func NewMetricsRegistry() *MetricsRegistry {
 		grpcLatencySum:      make(map[string]float64),
 		grpcLatencyCount:    make(map[string]int64),
 		clusterActiveTarget: make(map[string]int64),
+		cacheHits:           make(map[string]int64),
+		cacheMisses:         make(map[string]int64),
+		cacheInvalidations:  make(map[string]int64),
 	}
 }
 
@@ -84,6 +92,27 @@ func (m *MetricsRegistry) AddSpoolReplayed(service string, count int64) {
 	key := fmt.Sprintf(labelServiceFmt, service)
 	m.mu.Lock()
 	m.spoolReplayed[key] += count
+	m.mu.Unlock()
+}
+
+func (m *MetricsRegistry) IncCacheHits(service, cache string) {
+	key := fmt.Sprintf("service=%q,cache=%q", service, cache)
+	m.mu.Lock()
+	m.cacheHits[key]++
+	m.mu.Unlock()
+}
+
+func (m *MetricsRegistry) IncCacheMisses(service, cache string) {
+	key := fmt.Sprintf("service=%q,cache=%q", service, cache)
+	m.mu.Lock()
+	m.cacheMisses[key]++
+	m.mu.Unlock()
+}
+
+func (m *MetricsRegistry) IncCacheInvalidations(service, cache string) {
+	key := fmt.Sprintf("service=%q,cache=%q", service, cache)
+	m.mu.Lock()
+	m.cacheInvalidations[key]++
 	m.mu.Unlock()
 }
 
@@ -171,6 +200,9 @@ func (m *MetricsRegistry) Handler() http.Handler {
 		writeMetricFloats(&b, "grpc_request_duration_seconds_sum", "Total duration of gRPC requests in seconds.", "counter", "%.4f", m.grpcLatencySum)
 		writeMetricInts(&b, "grpc_request_duration_seconds_count", "Total count of recorded gRPC requests.", "counter", m.grpcLatencyCount)
 		writeMetricInts(&b, "cluster_active_target", "Cluster active routing target (1 for active, 0 for standby).", "gauge", m.clusterActiveTarget)
+		writeMetricInts(&b, "cache_hits_total", "Total cache hits by service and cache name.", "counter", m.cacheHits)
+		writeMetricInts(&b, "cache_misses_total", "Total cache misses by service and cache name.", "counter", m.cacheMisses)
+		writeMetricInts(&b, "cache_invalidations_total", "Total cache invalidations by service and cache name.", "counter", m.cacheInvalidations)
 
 		_, _ = w.Write([]byte(b.String()))
 	})
