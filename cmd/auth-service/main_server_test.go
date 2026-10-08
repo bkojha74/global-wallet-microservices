@@ -11,6 +11,7 @@ func TestRunAuthServer_CancelledContext(t *testing.T) {
 	t.Setenv("TEST_MOCK_DB", "false")
 	t.Setenv("MONGO_URI", "mongodb://127.0.0.1:27019/?connectTimeoutMS=100")
 	t.Setenv("AUTH_SERVICE_PORT", "59091")
+	t.Setenv("METRICS_PORT", "59095")
 	t.Setenv("ENVIRONMENT", "test")
 	t.Setenv("AUTH_PROVIDER", "local")
 
@@ -21,6 +22,7 @@ func TestRunAuthServer_CancelledContext(t *testing.T) {
 	// 2. Mock DB clean startup and shutdown path
 	t.Setenv("TEST_MOCK_DB", "true")
 	t.Setenv("AUTH_SERVICE_PORT", "59092")
+	t.Setenv("METRICS_PORT", "59096")
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel2()
@@ -33,6 +35,7 @@ func TestRunAuthServer_CancelledContext(t *testing.T) {
 
 func TestParseAuthConfig_DefaultsAndEnv(t *testing.T) {
 	t.Setenv("AUTH_SERVICE_PORT", "")
+	t.Setenv("METRICS_PORT", "")
 	t.Setenv("MONGO_URI", "")
 	t.Setenv("ENVIRONMENT", "")
 	t.Setenv("AUTH_PROVIDER", "")
@@ -42,14 +45,21 @@ func TestParseAuthConfig_DefaultsAndEnv(t *testing.T) {
 	if cfg.port != "50054" {
 		t.Errorf("expected default port 50054, got %s", cfg.port)
 	}
+	if cfg.metricsPort != "9095" {
+		t.Errorf("expected default metricsPort 9095, got %s", cfg.metricsPort)
+	}
 	if cfg.authProviderType != "local" {
 		t.Errorf("expected default authProviderType local, got %s", cfg.authProviderType)
 	}
 
 	t.Setenv("KEYCLOAK_URL", "http://localhost:8080")
+	t.Setenv("METRICS_PORT", "9999")
 	cfg2 := parseAuthConfig()
 	if cfg2.authProviderType != "hybrid" {
 		t.Errorf("expected authProviderType hybrid when KEYCLOAK_URL is set, got %s", cfg2.authProviderType)
+	}
+	if cfg2.metricsPort != "9999" {
+		t.Errorf("expected custom metricsPort 9999, got %s", cfg2.metricsPort)
 	}
 }
 

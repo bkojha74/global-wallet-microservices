@@ -7,6 +7,7 @@ metadata:
     app: mongodb
 spec:
   clusterIP: None
+  publishNotReadyAddresses: true
   ports:
     - port: 27017
       name: mongo
@@ -20,7 +21,7 @@ metadata:
   namespace: banking-system
 spec:
   serviceName: mongodb-service
-  replicas: 3
+  replicas: 1
   selector:
     matchLabels:
       app: mongodb
@@ -86,7 +87,7 @@ spec:
               until mongosh --eval "db.adminCommand('ping')" >/dev/null 2>&1; do
                 sleep 2;
               done;
-              echo "Initiating 3-node replica set rs0...";
+              echo "Initiating replica set rs0...";
               mongosh --quiet --eval '
                 try {
                   rs.status();
@@ -95,21 +96,21 @@ spec:
                   rs.initiate({
                     _id: "rs0",
                     members: [
-                      { _id: 0, host: "mongodb-0.mongodb-service.banking-system.svc.cluster.local:27017" },
-                      { _id: 1, host: "mongodb-1.mongodb-service.banking-system.svc.cluster.local:27017" },
-                      { _id: 2, host: "mongodb-2.mongodb-service.banking-system.svc.cluster.local:27017" }
+                      { _id: 0, host: "mongodb-0.mongodb-service.banking-system.svc.cluster.local:27017" }
                     ]
                   });
                   print("Replica set rs0 initialized successfully.");
                 }
               ';
+              echo "Replica set initialization complete. Sleeping indefinitely...";
+              exec sleep infinity;
           resources:
             requests:
               cpu: 50m
-              memory: 64Mi
-            limits:
-              cpu: 100m
               memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
   volumeClaimTemplates:
     - metadata:
         name: mongo-data

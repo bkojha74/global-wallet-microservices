@@ -110,4 +110,11 @@ clean:
 	docker volume rm global-wallet-microservices_mongo_data
 
 k8s-deploy:
-	kubectl apply -f k8s/
+	@chmod +x scripts/deploy-k8s.sh 2>/dev/null || true
+	@./scripts/deploy-k8s.sh
+
+k8s-status:
+	kubectl get pods,svc,ingress,hpa,pdb -n banking-system -o wide
+
+k8s-down:
+	kubectl delete -f k8s/ --ignore-not-found=true

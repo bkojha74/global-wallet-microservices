@@ -37,7 +37,30 @@ spec:
                 name: logging-service
                 port:
                   number: 8090
-          # Ingress to API Gateway (default backend for banking endpoints)
+          # Ingress to FX Engine Standalone B2B REST API
+          - path: /api/v1/fx/b2b
+            pathType: Prefix
+            backend:
+              service:
+                name: fx-service
+                port:
+                  number: 8086
+          # Ingress to Keycloak OIDC Identity Provider
+          - path: /realms
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak
+                port:
+                  number: 8085
+          - path: /auth
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak
+                port:
+                  number: 8085
+          # Ingress to API Gateway (default backend for banking & core API endpoints)
           - path: /
             pathType: Prefix
             backend:

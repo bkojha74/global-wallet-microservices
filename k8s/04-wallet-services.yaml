@@ -53,6 +53,8 @@ spec:
               value: "PRIMARY"
             - name: LEDGER_SERVICE_ADDR
               value: "ledger-service:50052"
+            - name: FX_SERVICE_ADDR
+              value: "fx-service:50055"
             - name: MONGO_URI
               valueFrom:
                 secretKeyRef:
@@ -161,6 +163,8 @@ spec:
               value: "STANDBY"
             - name: LEDGER_SERVICE_ADDR
               value: "ledger-service:50052"
+            - name: FX_SERVICE_ADDR
+              value: "fx-service:50055"
             - name: MONGO_URI
               valueFrom:
                 secretKeyRef:
