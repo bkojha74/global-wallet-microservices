@@ -53,11 +53,12 @@ flowchart TD
     end
 
     subgraph Phase5["Stage 5: Packaging & Release"]
-        Pub["8. docker-publish<br/>• Matrix build (5 microservices)<br/>• Docker Hub publication<br/>• GHA cache (type=gha)"]
+        Pub["8. docker-publish<br/>• Matrix build (6 microservices)<br/>• Docker Hub publication<br/>• GHA cache (type=gha)"]
     end
 
-    subgraph Phase6["Stage 6: Deployment"]
-        Deploy["9. deploy<br/>• Self-hosted Windows runner<br/>• Docker daemon pre-flight check<br/>• Rolling compose stack updates"]
+    subgraph Phase6["Stage 6: Multi-Target Deployment"]
+        DeployCompose["9A. deploy-compose<br/>• Self-hosted Windows runner<br/>• Rolling compose stack updates"]
+        DeployK8s["9B. deploy-k8s<br/>• Local Kubernetes cluster<br/>• 12-manifest rolling rollout<br/>• NodePort 30080 smoke check"]
     end
 
     Triggers --> Env
@@ -68,7 +69,8 @@ flowchart TD
     Sys --> Vuln
     Vuln --> Build
     Build --> Pub
-    Pub --> Deploy
+    Pub --> DeployCompose
+    Pub --> DeployK8s
 ```
 
 ---
@@ -218,7 +220,7 @@ on:
 
 ---
 
-### Stage 9: Continuous Deployment to Self-Hosted Environment (`deploy`)
+### Stage 9A: Continuous Deployment to Local Docker Compose (`deploy-compose`)
 * **Runner**: Self-hosted Windows runner (`[self-hosted, Windows]`)
 * **Shell**: Native Windows `cmd` (`shell: cmd`) to avoid PowerShell script execution policy restrictions.
 * **Pre-Flight Docker Daemon Readiness Check**:
@@ -237,9 +239,29 @@ on:
   1. `docker compose -f docker-compose.mongodb.yml pull && up -d` (MongoDB Replica Set)
   2. `docker compose -f docker-compose.rabbitmq.yml pull && up -d` (AMQP Broker)
   3. `docker compose -f docker-compose.auth.yml pull && up -d` (Keycloak & Auth Service)
-  4. `docker compose -f docker-compose.logging.yml pull && up -d` (Logging Service & Consumer)
-  5. `docker compose -f docker-compose.yml pull && up -d` (API Gateway, Wallets, Ledger)
+  4. `docker compose -f docker-compose.fx.yml pull && up -d` (FX Engine Service)
+  5. `docker compose -f docker-compose.logging.yml pull && up -d` (Logging Service & Consumer)
+  6. `docker compose -f docker-compose.yml pull && up -d` (API Gateway, Wallets, Ledger)
 * **Verification**: Executes `docker ps` to display live container statuses and exposed ports.
+
+---
+
+### Stage 9B: Continuous Deployment to Local Kubernetes Cluster (`deploy-k8s`)
+* **Runner**: Self-hosted Windows runner (`[self-hosted, Windows]`)
+* **Cluster Readiness Check**: Verifies connectivity to the local Kubernetes cluster (`kubectl cluster-info` and `kubectl get nodes`).
+* **Container Tagging**: Seamlessly maps registry images (`%DOCKERHUB_USERNAME%/<service>:latest`) to Kubernetes manifest specs (`wallet-system/<service>:latest`).
+* **Deterministic Manifest Rollout**:
+  1. `01-namespace.yaml` & `09-configmap-secrets.yaml` (Namespace `banking-system` & environment secrets)
+  2. `02-mongodb.yaml` & `06-rabbitmq.yaml` (Infrastructure StatefulSets)
+  3. `03-ledger-service.yaml`, `11-auth-service.yaml`, `12-fx-service.yaml`, `04-wallet-services.yaml`, `07-logging-service.yaml`, `05-api-gateway.yaml` (Microservices)
+  4. `08-ingress.yaml` & `10-hpa-pdb.yaml` (Edge routing, HPA autoscalers & disruption budgets)
+* **Rolling Update Verification**: Awaits `kubectl rollout status deployment/<service> -n banking-system --timeout=120s`.
+* **Verification & Smoke Test**: Probes the API Gateway on Kubernetes NodePort `30080`:
+  ```cmd
+  curl -s -f http://localhost:30080/healthz
+  curl -s -f http://localhost:30080/api/v1/cluster/status
+  ```
+* **Local Shortcut**: Execute `scripts\deploy-k8s.bat` or `make k8s-deploy`.
 
 ---
 

@@ -84,6 +84,13 @@ graph TD
 - [x] **K8S-06: `auth-service` Management & Observability Harmonization**
   - [x] Add HTTP management server on `METRICS_PORT` (`:9095`) with `/metrics` and `/healthz`.
   - [x] Update `monitoring/prometheus.yml` scrape configs for `auth-service` (:9095) and `fx-service` (:9096).
+- [x] **K8S-07: CI/CD Pipeline Local Kubernetes Autodeployment**
+  - [x] Add `deploy-k8s` dedicated stage to `.github/workflows/ci.yml` running on self-hosted Windows runner.
+  - [x] Add automated image tagging (`wallet-system/...:latest`) for cluster pod caching.
+  - [x] Implement deterministic dependency-ordered rollout with rolling restart and status checks.
+  - [x] Create standalone deployment scripts: `scripts/deploy-k8s.bat` (Windows) and `scripts/deploy-k8s.sh` (Linux/macOS).
+  - [x] Add `make k8s-deploy`, `make k8s-status`, and `make k8s-down` Makefile targets.
+  - [x] Configure dual smoke verification against Docker Compose (`:8080`) and Kubernetes NodePort (`:30080`).
 
 ---
 

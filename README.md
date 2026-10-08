@@ -514,7 +514,7 @@ The platform utilizes a comprehensive 9-stage CI/CD pipeline configured in [`.gi
 6. **`security-audit` (Vulnerability Auditing)**: Runs `govulncheck ./...` against the official Go Vulnerability Database to prevent known CVEs from entering production.
 7. **`build-artifacts` (Binary Build Verification)**: Natively compiles all microservice binaries (`api-gateway`, `wallet-service`, `ledger-service`, `fx-service`, `auth-service`, `logging-service`) to catch link-time or architectural compile errors.
 8. **`docker-publish` (Multi-Target Container Packaging)**: Compiles and publishes hardened production container images to Docker Hub in parallel using Buildx and GitHub Actions layer caching (`type=gha`).
-9. **`deploy` (Continuous Deployment to Self-Hosted Environment)**: Executes on a self-hosted Windows runner with pre-flight Docker daemon health verification and rolling stack restarts.
+9. **`deploy-compose` & `deploy-k8s` (Continuous Multi-Target Deployment to Self-Hosted Environment)**: Executes on a self-hosted Windows runner. Performs pre-flight Docker daemon and Kubernetes cluster readiness probes, pulls and tags microservice images, applies rolling updates to both the Docker Compose stack and the 12-manifest Kubernetes suite (`k8s/`), and runs automated smoke verification against both port `:8080` and NodePort `:30080`.
 
 ### Secrets & Configuration
 
