@@ -807,6 +807,7 @@ Both Postman and Bruno test runners validate:
 
 | Document | Description |
 |---|---|
+| [docs/NEXT_LEVEL_IMPROVEMENT_ROADMAP.md](docs/NEXT_LEVEL_IMPROVEMENT_ROADMAP.md) | Next-level architectural & operational improvement roadmap covering Kubernetes completeness, distributed caching, circuit breaking, and core banking expansion. |
 | [docs/PRODUCTION_READINESS_AUDIT.md](docs/PRODUCTION_READINESS_AUDIT.md) | Comprehensive 8-pillar production audit, gap catalog, risk analysis, and 4-phase remediation roadmap. |
 | [docs/PHASE1_IMPLEMENTATION.md](docs/PHASE1_IMPLEMENTATION.md) | Technical deep-dive on Phase 1: transactional outbox pattern, database indexing, TTL, and pagination. |
 | [docs/PHASE2_IMPLEMENTATION.md](docs/PHASE2_IMPLEMENTATION.md) | Technical deep-dive on Phase 2: JWT authentication, RBAC, IDOR protection, inter-service mTLS, rate limiting, and security headers. |

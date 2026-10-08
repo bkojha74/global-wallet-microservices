@@ -49,6 +49,20 @@ scrape_configs:
   # Scrape ledger-service management HTTP server on port 9092 (Phase 3 / GAP-OBS-02).
   - job_name: "ledger-service"
     static_configs:
-      - targets: ["host.docker.internal:9092", "wallet_ledger_service:9092"]
+      - targets: ["host.docker.internal:9092", "wallet_ledger_service:9092", "ledger-service:9092"]
+    metrics_path: /metrics
+
+  # ── Auth Service ──────────────────────────────────────────────────────────────
+  # Scrape auth-service management HTTP server on port 9095.
+  - job_name: "auth-service"
+    static_configs:
+      - targets: ["host.docker.internal:9095", "wallet_auth_service:9095", "auth-service:9095"]
+    metrics_path: /metrics
+
+  # ── FX Engine Service ─────────────────────────────────────────────────────────
+  # Scrape fx-service management HTTP server on port 9096.
+  - job_name: "fx-service"
+    static_configs:
+      - targets: ["host.docker.internal:9096", "wallet_fx_service:9096", "fx-service:9096"]
     metrics_path: /metrics
 

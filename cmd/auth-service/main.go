@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -26,6 +27,7 @@ const authServiceName = "auth-service"
 
 type authConfig struct {
 	port             string
+	metricsPort      string
 	mongoURI         string
 	environment      string
 	authProviderType string
@@ -35,6 +37,10 @@ func parseAuthConfig() authConfig {
 	port := os.Getenv("AUTH_SERVICE_PORT")
 	if port == "" {
 		port = "50054"
+	}
+	metricsPort := os.Getenv("METRICS_PORT")
+	if metricsPort == "" {
+		metricsPort = "9095"
 	}
 	mongoURI := os.Getenv("MONGO_URI")
 	if mongoURI == "" {
@@ -54,10 +60,33 @@ func parseAuthConfig() authConfig {
 	}
 	return authConfig{
 		port:             port,
+		metricsPort:      metricsPort,
 		mongoURI:         mongoURI,
 		environment:      environment,
 		authProviderType: authProviderType,
 	}
+}
+
+func startAuthMetricsServer(metricsPort string) *http.Server {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", observability.DefaultMetrics.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"SERVING","service":"auth-service"}`))
+	})
+	server := &http.Server{
+		Addr:              ":" + metricsPort,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		log.Printf("[AUTH-SERVICE] Management metrics server listening on :%s/metrics", metricsPort)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("[AUTH-SERVICE] Metrics server error: %v", err)
+		}
+	}()
+	return server
 }
 
 func initMongoDB(uri string) (*mongo.Client, *mongo.Database, error) {
@@ -152,12 +181,21 @@ func runAuthServer(ctx context.Context) error {
 		}
 	}()
 
+	metricsServer := startAuthMetricsServer(cfg.metricsPort)
+
 	// ── Graceful Shutdown ────────────────────────────────────────────────────
 	<-ctx.Done()
 	log.Println("[AUTH-SERVICE] Context cancelled, shutting down...")
 
 	healthSvc.SetServingStatus("auth.v1.AuthService", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
 	grpcServer.GracefulStop()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[AUTH-SERVICE] Metrics server shutdown error: %v", err)
+	}
+
 	log.Println("[AUTH-SERVICE] Shutdown complete.")
 	return nil
 }
