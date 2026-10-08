@@ -19,8 +19,18 @@ on:
       - 'LICENSE'
       - 'SECURITY.md'
       - '.gitignore'
-      - 'postman/**'
   workflow_dispatch:
+    inputs:
+      deploy_target:
+        description: 'Deployment Target on Local Runner'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - kubernetes
+          - docker-compose
+          - none
 
 permissions:
   contents: read
@@ -454,12 +464,12 @@ jobs:
           cache-to: type=gha,mode=max
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # STAGE 8: Deploy to Target / Local Server
+  # STAGE 8A: Deploy to Target / Local Docker Compose
   # ═══════════════════════════════════════════════════════════════════════════
-  deploy:
-    name: Deploy to Local Server
+  deploy-compose:
+    name: Deploy to Local Docker Compose
     needs: docker-publish
-    if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/feature/'))) || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/feature/'))) || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.deploy_target == 'all' || github.event.inputs.deploy_target == 'docker-compose' || github.event.inputs.deploy_target == ''))
     runs-on: [self-hosted, Windows]
     steps:
       - name: Check out repository
@@ -526,7 +536,7 @@ jobs:
           docker compose -f docker-compose.logging.yml up -d
           docker compose -f docker-compose.yml up -d
 
-      - name: Verify Running Services
+      - name: Verify Running Compose Containers
         if: env.DOCKER_READY == 'true'
         shell: cmd
         continue-on-error: true
@@ -534,23 +544,178 @@ jobs:
           docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
   # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 8B: Deploy to Target / Local Kubernetes Cluster
+  # ═══════════════════════════════════════════════════════════════════════════
+  deploy-k8s:
+    name: Deploy to Local Kubernetes Cluster
+    needs: docker-publish
+    if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/feature/'))) || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.deploy_target == 'all' || github.event.inputs.deploy_target == 'kubernetes' || github.event.inputs.deploy_target == ''))
+    runs-on: [self-hosted, Windows]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check Kubernetes Cluster Readiness
+        id: k8s_check
+        shell: cmd
+        continue-on-error: true
+        run: |
+          echo Checking Kubernetes cluster connectivity...
+          kubectl cluster-info
+          if errorlevel 1 (
+            echo.
+            echo ::warning::Kubernetes cluster is not running or accessible on this Windows runner.
+            echo Please ensure Docker Desktop Kubernetes (Settings -^> Kubernetes -^> Enable) or Minikube is started.
+            echo K8S_READY=false>> "%GITHUB_ENV%"
+          ) else (
+            echo.
+            echo Kubernetes cluster is active and reachable!
+            kubectl get nodes
+            echo K8S_READY=true>> "%GITHUB_ENV%"
+          )
+          exit /b 0
+
+      - name: Prepare Microservice Images for Kubernetes
+        if: env.K8S_READY == 'true'
+        shell: cmd
+        continue-on-error: true
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set DOCKER_USER=%DOCKERHUB_USERNAME%
+          if "%DOCKER_USER%"=="" set DOCKER_USER=bkojha74
+
+          echo Tagging microservice container images for local Kubernetes cluster...
+          docker tag %DOCKER_USER%/wallet-api-gateway:latest wallet-system/api-gateway:latest 2>nul
+          docker tag %DOCKER_USER%/wallet-service:latest wallet-system/wallet-service:latest 2>nul
+          docker tag %DOCKER_USER%/wallet-ledger-service:latest wallet-system/ledger-service:latest 2>nul
+          docker tag %DOCKER_USER%/wallet-auth-service:latest wallet-system/auth-service:latest 2>nul
+          docker tag %DOCKER_USER%/wallet-fx-service:latest wallet-system/fx-service:latest 2>nul
+          docker tag %DOCKER_USER%/wallet-logging-service:latest wallet-system/logging-service:latest 2>nul
+          exit /b 0
+
+      - name: Deploy Kubernetes Suite (k8s/)
+        if: env.K8S_READY == 'true'
+        shell: cmd
+        continue-on-error: true
+        run: |
+          echo Applying Kubernetes Namespace and Secrets...
+          kubectl apply -f k8s/01-namespace.yaml
+          kubectl apply -f k8s/09-configmap-secrets.yaml
+
+          echo Applying Infrastructure (MongoDB StatefulSet and RabbitMQ)...
+          kubectl apply -f k8s/02-mongodb.yaml
+          kubectl apply -f k8s/06-rabbitmq.yaml
+
+          echo Applying Microservices (Ledger, Auth, FX, Wallet, Logging, Gateway)...
+          kubectl apply -f k8s/03-ledger-service.yaml
+          kubectl apply -f k8s/11-auth-service.yaml
+          kubectl apply -f k8s/12-fx-service.yaml
+          kubectl apply -f k8s/04-wallet-services.yaml
+          kubectl apply -f k8s/07-logging-service.yaml
+          kubectl apply -f k8s/05-api-gateway.yaml
+
+          echo Applying Ingress, Autoscaling and Disruption Budgets...
+          kubectl apply -f k8s/08-ingress.yaml
+          kubectl apply -f k8s/10-hpa-pdb.yaml
+
+      - name: Trigger Rolling Update on Deployments
+        if: env.K8S_READY == 'true'
+        shell: cmd
+        continue-on-error: true
+        run: |
+          echo Triggering rolling update across microservices...
+          kubectl rollout restart deployment/api-gateway -n banking-system 2>nul
+          kubectl rollout restart deployment/wallet-primary -n banking-system 2>nul
+          kubectl rollout restart deployment/wallet-standby -n banking-system 2>nul
+          kubectl rollout restart deployment/ledger-service -n banking-system 2>nul
+          kubectl rollout restart deployment/auth-service -n banking-system 2>nul
+          kubectl rollout restart deployment/fx-service -n banking-system 2>nul
+          kubectl rollout restart deployment/logging-service -n banking-system 2>nul
+          exit /b 0
+
+      - name: Verify Rollout Status
+        if: env.K8S_READY == 'true'
+        shell: cmd
+        continue-on-error: true
+        run: |
+          echo Awaiting rollout completion (timeout: 120s per service)...
+          kubectl rollout status deployment/api-gateway -n banking-system --timeout=120s
+          kubectl rollout status deployment/wallet-primary -n banking-system --timeout=120s
+          kubectl rollout status deployment/ledger-service -n banking-system --timeout=120s
+          kubectl rollout status deployment/auth-service -n banking-system --timeout=120s
+          kubectl rollout status deployment/fx-service -n banking-system --timeout=120s
+          kubectl rollout status deployment/logging-service -n banking-system --timeout=120s
+          exit /b 0
+
+      - name: Inspect Active Kubernetes Workloads
+        if: env.K8S_READY == 'true'
+        shell: cmd
+        continue-on-error: true
+        run: |
+          echo ========================================================
+          echo  Active Pods in banking-system
+          echo ========================================================
+          kubectl get pods -n banking-system -o wide
+          echo.
+          echo ========================================================
+          echo  Active Services in banking-system
+          echo ========================================================
+          kubectl get svc -n banking-system
+          echo.
+          echo ========================================================
+          echo  Active Ingress and Autoscalers (HPA)
+          echo ========================================================
+          kubectl get ingress,hpa,pdb -n banking-system
+          exit /b 0
+
+      - name: Smoke Check Kubernetes API Gateway (NodePort 30080)
+        if: env.K8S_READY == 'true'
+        shell: cmd
+        continue-on-error: true
+        run: |
+          echo Probing API Gateway health on NodePort 30080...
+          curl -s -f http://localhost:30080/healthz
+          if errorlevel 1 (
+            echo ::warning::NodePort 30080 /healthz did not respond immediately. Checking /readyz...
+            curl -s -f http://localhost:30080/readyz
+          ) else (
+            echo.
+            echo API Gateway is healthy and responding on NodePort 30080!
+          )
+          exit /b 0
+
+  # ═══════════════════════════════════════════════════════════════════════════
   # STAGE 9: Post-Deployment Smoke Verification
   # ═══════════════════════════════════════════════════════════════════════════
   post-deploy-smoke:
     name: Post-Deploy Smoke Verification
-    needs: deploy
-    if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/feature/'))) || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: [deploy-compose, deploy-k8s]
+    if: always() && (needs.deploy-compose.result == 'success' || needs.deploy-k8s.result == 'success')
     runs-on: [self-hosted, Windows]
     steps:
-      - name: Verify API Gateway & Cluster Status
+      - name: Verify Docker Compose API Gateway & Cluster Status (Port 8080)
         shell: cmd
         continue-on-error: true
         run: |
-          echo Verifying cluster status after deployment...
+          echo Verifying Docker Compose cluster status after deployment...
           curl -s -f http://localhost:8080/api/v1/cluster/status
           if errorlevel 1 (
-            echo ::warning::Local cluster status check returned error or runner cannot reach localhost:8080.
+            echo ::warning::Docker Compose cluster status check returned error or runner cannot reach localhost:8080.
           ) else (
             echo.
-            echo Cluster is healthy and responding after deployment!
+            echo Docker Compose cluster is healthy and responding on http://localhost:8080!
+          )
+
+      - name: Verify Kubernetes API Gateway & Cluster Status (NodePort 30080)
+        shell: cmd
+        continue-on-error: true
+        run: |
+          echo Verifying Kubernetes cluster status on NodePort 30080...
+          curl -s -f http://localhost:30080/api/v1/cluster/status
+          if errorlevel 1 (
+            echo ::warning::Kubernetes cluster status check returned error or runner cannot reach localhost:30080.
+          ) else (
+            echo.
+            echo Kubernetes cluster is healthy and responding on http://localhost:30080!
           )
