@@ -130,17 +130,15 @@ spec:
               cpu: 1000m
               memory: 1024Mi
           livenessProbe:
-            httpGet:
-              path: /health/live
+            tcpSocket:
               port: 8080
-            initialDelaySeconds: 30
+            initialDelaySeconds: 45
             periodSeconds: 15
             timeoutSeconds: 5
           readinessProbe:
-            httpGet:
-              path: /health/ready
+            tcpSocket:
               port: 8080
-            initialDelaySeconds: 20
+            initialDelaySeconds: 30
             periodSeconds: 10
             timeoutSeconds: 5
       volumes:
@@ -256,16 +254,14 @@ spec:
               cpu: 500m
               memory: 256Mi
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: 9095
+            tcpSocket:
+              port: 50054
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 3
           readinessProbe:
-            httpGet:
-              path: /healthz
-              port: 9095
+            tcpSocket:
+              port: 50054
             initialDelaySeconds: 3
             periodSeconds: 5
             timeoutSeconds: 3
