@@ -23,7 +23,7 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
-        - name: wallet-service
+        - name: wallet-standby
           image: "{{ .Values.walletStandby.image.repository }}:{{ .Values.walletStandby.image.tag }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           ports:
@@ -39,6 +39,8 @@ spec:
                   key: STANDBY_REGION
             - name: IS_PRIMARY
               value: "false"
+            - name: PORT
+              value: "50053"
             - name: GRPC_PORT
               value: "50053"
             - name: METRICS_PORT

@@ -29,10 +29,24 @@ spec:
             - containerPort: 9095
               name: metrics
           env:
+            - name: AUTH_SERVICE_PORT
+              value: "50054"
+            - name: PORT
+              value: "50054"
             - name: GRPC_PORT
               value: "50054"
             - name: METRICS_PORT
               value: "9095"
+            - name: ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: wallet-secrets
+                  key: ADMIN_USERNAME
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: wallet-secrets
+                  key: ADMIN_PASSWORD
             - name: LOG_LEVEL
               valueFrom:
                 configMapKeyRef:

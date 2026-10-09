@@ -23,7 +23,7 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
-        - name: wallet-service
+        - name: wallet-primary
           image: "{{ .Values.walletPrimary.image.repository }}:{{ .Values.walletPrimary.image.tag }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           ports:
@@ -39,6 +39,8 @@ spec:
                   key: PRIMARY_REGION
             - name: IS_PRIMARY
               value: "true"
+            - name: PORT
+              value: "50051"
             - name: GRPC_PORT
               value: "50051"
             - name: METRICS_PORT

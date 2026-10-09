@@ -33,10 +33,16 @@ spec:
               value: "8080"
             - name: METRICS_PORT
               value: "8081"
+            - name: PRIMARY_WALLET_ADDR
+              value: "wallet-primary-service:50051"
+            - name: STANDBY_WALLET_ADDR
+              value: "wallet-standby-service:50053"
             - name: WALLET_PRIMARY_ADDR
               value: "wallet-primary-service:50051"
             - name: WALLET_STANDBY_ADDR
               value: "wallet-standby-service:50053"
+            - name: LEDGER_ADDR
+              value: "ledger-service:50052"
             - name: LEDGER_SERVICE_ADDR
               value: "ledger-service:50052"
             - name: LOGGING_SERVICE_ADDR

@@ -45,13 +45,18 @@ spec:
                   key: ENVIRONMENT
             - name: MONGO_URI
               valueFrom:
-                configMapKeyRef:
-                  name: wallet-config
+                secretKeyRef:
+                  name: wallet-secrets
                   key: MONGO_URI
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: wallet-secrets
+                  key: RABBITMQ_URL
             - name: RABBITMQ_URI
               valueFrom:
-                configMapKeyRef:
-                  name: wallet-config
+                secretKeyRef:
+                  name: wallet-secrets
                   key: RABBITMQ_URI
           resources:
             {{- toYaml .Values.loggingService.resources | nindent 12 }}
