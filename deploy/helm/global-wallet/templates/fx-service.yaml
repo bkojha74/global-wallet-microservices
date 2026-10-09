@@ -1,0 +1,106 @@
+{{- if .Values.fxService.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fx-service
+  namespace: {{ include "global-wallet.namespace" . }}
+  labels:
+    app: fx-service
+    {{- include "global-wallet.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.fxService.replicas }}
+  selector:
+    matchLabels:
+      app: fx-service
+  template:
+    metadata:
+      labels:
+        app: fx-service
+    spec:
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: fx-service
+          image: "{{ .Values.fxService.image.repository }}:{{ .Values.fxService.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - containerPort: 50055
+              name: grpc
+            - containerPort: 8086
+              name: http
+            - containerPort: 9096
+              name: metrics
+          env:
+            - name: GRPC_PORT
+              value: "50055"
+            - name: B2B_HTTP_PORT
+              value: "8086"
+            - name: METRICS_PORT
+              value: "9096"
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: LOG_LEVEL
+            - name: ENVIRONMENT
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: ENVIRONMENT
+            - name: MONGO_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: MONGO_URI
+            - name: DEFAULT_SPREAD_BPS
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: FX_DEFAULT_SPREAD_BPS
+            - name: SYNC_INTERVAL_MINUTES
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: FX_SYNC_INTERVAL_MINUTES
+          resources:
+            {{- toYaml .Values.fxService.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9096
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9096
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fx-service
+  namespace: {{ include "global-wallet.namespace" . }}
+  labels:
+    app: fx-service
+    {{- include "global-wallet.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.fxService.service.grpcPort }}
+      targetPort: 50055
+      name: grpc
+    - port: {{ .Values.fxService.service.httpPort }}
+      targetPort: 8086
+      name: http
+    - port: {{ .Values.fxService.service.metricsPort }}
+      targetPort: 9096
+      name: metrics
+  selector:
+    app: fx-service
+{{- end }}

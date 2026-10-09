@@ -1,0 +1,116 @@
+# Production Environment Overlay
+env:
+  environment: "production"
+  logLevel: "warn"
+
+ingress:
+  host: wallet.globalbank.com
+  tls:
+    enabled: true
+    secretName: global-wallet-prod-tls
+
+apiGateway:
+  replicas: 4
+  service:
+    type: ClusterIP
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1024Mi
+
+authService:
+  replicas: 3
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1024Mi
+
+fxService:
+  replicas: 3
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1024Mi
+
+walletPrimary:
+  replicas: 4
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 2000m
+      memory: 2048Mi
+
+walletStandby:
+  replicas: 2
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1024Mi
+
+ledgerService:
+  replicas: 4
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1024Mi
+
+loggingService:
+  replicas: 2
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1024Mi
+
+mongodb:
+  replicas: 3
+  persistence:
+    enabled: true
+    size: 50Gi
+  resources:
+    requests:
+      cpu: 1000m
+      memory: 2048Mi
+    limits:
+      cpu: 4000m
+      memory: 8192Mi
+
+rabbitmq:
+  replicas: 3
+  persistence:
+    enabled: true
+    size: 20Gi
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1024Mi
+    limits:
+      cpu: 2000m
+      memory: 4096Mi
+
+autoscaling:
+  minReplicas: 3
+  maxReplicas: 12
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  minAvailable: 2

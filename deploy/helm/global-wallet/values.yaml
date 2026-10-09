@@ -1,0 +1,249 @@
+# Global configuration
+global:
+  namespace: banking-system
+  imagePullPolicy: IfNotPresent
+  imageRegistry: wallet-system
+  tag: latest
+
+# Common pod security context
+podSecurityContext:
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  runAsNonRoot: true
+
+# Ingress Configuration
+ingress:
+  enabled: true
+  className: nginx
+  host: wallet.local
+  tls:
+    enabled: false
+    secretName: wallet-tls-cert
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+
+# RBAC Configuration
+rbac:
+  create: true
+  serviceAccountName: wallet-service-account
+
+# API Gateway
+apiGateway:
+  enabled: true
+  replicas: 2
+  image:
+    repository: wallet-system/api-gateway
+    tag: latest
+  service:
+    type: NodePort
+    httpPort: 8080
+    nodePort: 30080
+    metricsPort: 8081
+    metricsNodePort: 30397
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# Auth Service
+authService:
+  enabled: true
+  replicas: 2
+  image:
+    repository: wallet-system/auth-service
+    tag: latest
+  service:
+    grpcPort: 50054
+    metricsPort: 9095
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# FX Engine Service
+fxService:
+  enabled: true
+  replicas: 2
+  image:
+    repository: wallet-system/fx-service
+    tag: latest
+  service:
+    grpcPort: 50055
+    httpPort: 8086
+    metricsPort: 9096
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# Wallet Service (Active Primary)
+walletPrimary:
+  enabled: true
+  replicas: 2
+  image:
+    repository: wallet-system/wallet-service
+    tag: latest
+  service:
+    grpcPort: 50051
+    metricsPort: 9094
+  resources:
+    requests:
+      cpu: 150m
+      memory: 128Mi
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+
+# Wallet Service (Hot Standby DR)
+walletStandby:
+  enabled: true
+  replicas: 1
+  image:
+    repository: wallet-system/wallet-service
+    tag: latest
+  service:
+    grpcPort: 50053
+    metricsPort: 9093
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# Ledger Service
+ledgerService:
+  enabled: true
+  replicas: 2
+  image:
+    repository: wallet-system/ledger-service
+    tag: latest
+  service:
+    grpcPort: 50052
+    metricsPort: 9092
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# Centralized Logging Service
+loggingService:
+  enabled: true
+  replicas: 1
+  image:
+    repository: wallet-system/logging-service
+    tag: latest
+  service:
+    httpPort: 8090
+    metricsPort: 9090
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# Keycloak IAM
+keycloak:
+  enabled: true
+  replicas: 1
+  image:
+    repository: quay.io/keycloak/keycloak
+    tag: latest
+  service:
+    port: 8085
+    targetPort: 8080
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 1024Mi
+
+# MongoDB StatefulSet
+mongodb:
+  enabled: true
+  image:
+    repository: mongo
+    tag: "7.0"
+  replicas: 1
+  replicaSetName: rs0
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1024Mi
+  persistence:
+    enabled: false
+    size: 5Gi
+
+# RabbitMQ StatefulSet
+rabbitmq:
+  enabled: true
+  image:
+    repository: rabbitmq
+    tag: 3.13-management
+  replicas: 1
+  resources:
+    requests:
+      cpu: 150m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1024Mi
+  persistence:
+    enabled: false
+    size: 5Gi
+
+# Autoscaling (HPA)
+autoscaling:
+  enabled: true
+  targetCPUUtilizationPercentage: 75
+  minReplicas: 2
+  maxReplicas: 6
+
+# Pod Disruption Budget (PDB)
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Environment & Secret Parameters
+env:
+  logLevel: "info"
+  environment: "local"
+  primaryRegion: "us-east-1"
+  standbyRegion: "eu-west-1"
+  jwtIssuer: "global-wallet-platform"
+  jwtExpirationHours: "24"
+  fxDefaultSpreadBps: "50"
+  fxSyncIntervalMinutes: "60"
+  geminiModel: "gemini-3.1-flash-lite"
+  geminiTimeoutMs: "2500"
+  geminiFailOpen: "true"
+
+# Secrets (Default base64-decoded values for local development)
+secrets:
+  jwtSecret: "c3VwZXItc2VjcmV0LWtleS1mb3Itand0LXZlcmlmaWNhdGlvbi0xMjM0NQ=="
+  adminUsername: "admin"
+  adminPassword: "password123"
+  geminiApiKey: "AIzaSyDummyKeyForTestingPurposesOnly123456"

@@ -1,0 +1,37 @@
+{{- if .Values.rbac.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.rbac.serviceAccountName }}
+  namespace: {{ include "global-wallet.namespace" . }}
+  labels:
+    {{- include "global-wallet.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wallet-pod-reader
+  namespace: {{ include "global-wallet.namespace" . }}
+  labels:
+    {{- include "global-wallet.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "endpoints", "configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wallet-pod-reader-binding
+  namespace: {{ include "global-wallet.namespace" . }}
+  labels:
+    {{- include "global-wallet.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.rbac.serviceAccountName }}
+    namespace: {{ include "global-wallet.namespace" . }}
+roleRef:
+  kind: Role
+  name: wallet-pod-reader
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

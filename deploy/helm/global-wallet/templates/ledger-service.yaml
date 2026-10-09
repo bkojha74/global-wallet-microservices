@@ -1,0 +1,92 @@
+{{- if .Values.ledgerService.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ledger-service
+  namespace: {{ include "global-wallet.namespace" . }}
+  labels:
+    app: ledger-service
+    {{- include "global-wallet.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.ledgerService.replicas }}
+  selector:
+    matchLabels:
+      app: ledger-service
+  template:
+    metadata:
+      labels:
+        app: ledger-service
+    spec:
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: ledger-service
+          image: "{{ .Values.ledgerService.image.repository }}:{{ .Values.ledgerService.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - containerPort: 50052
+              name: grpc
+            - containerPort: 9092
+              name: metrics
+          env:
+            - name: GRPC_PORT
+              value: "50052"
+            - name: METRICS_PORT
+              value: "9092"
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: LOG_LEVEL
+            - name: ENVIRONMENT
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: ENVIRONMENT
+            - name: MONGO_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: MONGO_URI
+            - name: RABBITMQ_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: RABBITMQ_URI
+          resources:
+            {{- toYaml .Values.ledgerService.resources | nindent 12 }}
+          livenessProbe:
+            tcpSocket:
+              port: 50052
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 50052
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledger-service
+  namespace: {{ include "global-wallet.namespace" . }}
+  labels:
+    app: ledger-service
+    {{- include "global-wallet.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.ledgerService.service.grpcPort }}
+      targetPort: 50052
+      name: grpc
+    - port: {{ .Values.ledgerService.service.metricsPort }}
+      targetPort: 9092
+      name: metrics
+  selector:
+    app: ledger-service
+{{- end }}

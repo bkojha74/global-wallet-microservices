@@ -1,0 +1,122 @@
+{{- if .Values.authService.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  namespace: {{ include "global-wallet.namespace" . }}
+  labels:
+    app: auth-service
+    {{- include "global-wallet.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.authService.replicas }}
+  selector:
+    matchLabels:
+      app: auth-service
+  template:
+    metadata:
+      labels:
+        app: auth-service
+    spec:
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: auth-service
+          image: "{{ .Values.authService.image.repository }}:{{ .Values.authService.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - containerPort: 50054
+              name: grpc
+            - containerPort: 9095
+              name: metrics
+          env:
+            - name: GRPC_PORT
+              value: "50054"
+            - name: METRICS_PORT
+              value: "9095"
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: LOG_LEVEL
+            - name: ENVIRONMENT
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: ENVIRONMENT
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: wallet-secrets
+                  key: JWT_SECRET
+            - name: JWT_ISSUER
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: JWT_ISSUER
+            - name: JWT_EXPIRATION_HOURS
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: JWT_EXPIRATION_HOURS
+            - name: MONGO_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: MONGO_URI
+            - name: KEYCLOAK_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: KEYCLOAK_URL
+            - name: KEYCLOAK_REALM
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: KEYCLOAK_REALM
+            - name: KEYCLOAK_CLIENT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: KEYCLOAK_CLIENT_ID
+            - name: KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: wallet-secrets
+                  key: KEYCLOAK_CLIENT_SECRET
+          resources:
+            {{- toYaml .Values.authService.resources | nindent 12 }}
+          livenessProbe:
+            tcpSocket:
+              port: 50054
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 50054
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-service
+  namespace: {{ include "global-wallet.namespace" . }}
+  labels:
+    app: auth-service
+    {{- include "global-wallet.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.authService.service.grpcPort }}
+      targetPort: 50054
+      name: grpc
+    - port: {{ .Values.authService.service.metricsPort }}
+      targetPort: 9095
+      name: metrics
+  selector:
+    app: auth-service
+{{- end }}

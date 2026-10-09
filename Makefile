@@ -118,3 +118,18 @@ k8s-status:
 
 k8s-down:
 	kubectl delete -f k8s/ --ignore-not-found=true
+
+helm-lint:
+	helm lint deploy/helm/global-wallet
+	helm lint deploy/helm/global-wallet -f deploy/helm/global-wallet/values-staging.yaml
+	helm lint deploy/helm/global-wallet -f deploy/helm/global-wallet/values-prod.yaml
+
+helm-template:
+	helm template global-wallet deploy/helm/global-wallet
+
+helm-install:
+	helm upgrade --install global-wallet deploy/helm/global-wallet --namespace banking-system --create-namespace
+
+helm-uninstall:
+	helm uninstall global-wallet --namespace banking-system
+

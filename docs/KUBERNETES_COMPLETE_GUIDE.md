@@ -283,3 +283,78 @@ make k8s-down
 # OR
 kubectl delete namespace banking-system
 ```
+
+---
+
+## 8. Enterprise Helm Chart Packaging (`deploy/helm/global-wallet`)
+
+For GitOps, CI/CD automated release management, and multi-environment promotion (Local &rarr; Staging &rarr; Production), the entire platform is packaged as a standard Helm Chart.
+
+### 8.1 Chart Structure
+```text
+deploy/helm/global-wallet/
+├── Chart.yaml                  # Chart metadata and versioning
+├── values.yaml                 # Default local values and resource baselines
+├── values-staging.yaml         # Staging overlay (ingress hosts, moderate replicas)
+├── values-prod.yaml            # Production overlay (scaled replicas, HA data stores, TLS)
+├── .helmignore                 # Build artifact exclusions
+└── templates/
+    ├── _helpers.tpl            # Template name/label helper definitions
+    ├── rbac.yaml               # ServiceAccount & Pod Reader RBAC
+    ├── configmap-secrets.yaml  # Unified config and credentials
+    ├── mongodb.yaml            # MongoDB StatefulSet & rs0 init sidecar
+    ├── rabbitmq.yaml           # RabbitMQ broker StatefulSet
+    ├── keycloak.yaml           # Keycloak IAM & realm import
+    ├── auth-service.yaml       # Auth Service Deployment & Service
+    ├── fx-service.yaml         # FX Service Deployment & Service
+    ├── wallet-primary.yaml     # Primary Active Wallet Deployment & Service
+    ├── wallet-standby.yaml     # Hot Standby DR Wallet Deployment & Service
+    ├── ledger-service.yaml     # Ledger Service Deployment & Service
+    ├── logging-service.yaml    # Logging Service Deployment & Service
+    ├── api-gateway.yaml        # API Gateway Deployment & Service
+    ├── ingress.yaml            # NGINX Ingress rules
+    ├── hpa.yaml                # Autoscalers (2–6 replicas on CPU > 75%)
+    ├── pdb.yaml                # Pod Disruption Budgets (minAvailable: 1)
+    └── NOTES.txt               # Post-installation instructions
+```
+
+### 8.2 Common Helm Commands
+
+#### Linting & Validating
+```powershell
+# Lint default values
+helm lint deploy/helm/global-wallet
+
+# Lint staging overlay
+helm lint deploy/helm/global-wallet -f deploy/helm/global-wallet/values-staging.yaml
+
+# Lint production overlay
+helm lint deploy/helm/global-wallet -f deploy/helm/global-wallet/values-prod.yaml
+```
+
+#### Dry-Run & Template Inspection
+```powershell
+# Render all Kubernetes manifests locally to stdout
+helm template global-wallet deploy/helm/global-wallet
+
+# Render with production values
+helm template global-wallet deploy/helm/global-wallet -f deploy/helm/global-wallet/values-prod.yaml
+```
+
+#### Deploying with Helm
+```powershell
+# Install or upgrade in the banking-system namespace
+helm upgrade --install global-wallet deploy/helm/global-wallet --namespace banking-system --create-namespace
+
+# Deploy to staging with overlay values
+helm upgrade --install global-wallet deploy/helm/global-wallet -f deploy/helm/global-wallet/values-staging.yaml --namespace banking-system
+
+# Deploy to production with overlay values
+helm upgrade --install global-wallet deploy/helm/global-wallet -f deploy/helm/global-wallet/values-prod.yaml --namespace banking-system
+```
+
+#### Uninstalling Release
+```powershell
+helm uninstall global-wallet --namespace banking-system
+```
+

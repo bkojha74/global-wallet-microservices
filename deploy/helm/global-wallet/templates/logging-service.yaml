@@ -1,0 +1,94 @@
+{{- if .Values.loggingService.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logging-service
+  namespace: {{ include "global-wallet.namespace" . }}
+  labels:
+    app: logging-service
+    {{- include "global-wallet.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.loggingService.replicas }}
+  selector:
+    matchLabels:
+      app: logging-service
+  template:
+    metadata:
+      labels:
+        app: logging-service
+    spec:
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: logging-service
+          image: "{{ .Values.loggingService.image.repository }}:{{ .Values.loggingService.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - containerPort: 8090
+              name: http
+            - containerPort: 9090
+              name: metrics
+          env:
+            - name: HTTP_PORT
+              value: "8090"
+            - name: METRICS_PORT
+              value: "9090"
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: LOG_LEVEL
+            - name: ENVIRONMENT
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: ENVIRONMENT
+            - name: MONGO_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: MONGO_URI
+            - name: RABBITMQ_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: RABBITMQ_URI
+          resources:
+            {{- toYaml .Values.loggingService.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8090
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: logging-service
+  namespace: {{ include "global-wallet.namespace" . }}
+  labels:
+    app: logging-service
+    {{- include "global-wallet.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.loggingService.service.httpPort }}
+      targetPort: 8090
+      name: http
+    - port: {{ .Values.loggingService.service.metricsPort }}
+      targetPort: 9090
+      name: metrics
+  selector:
+    app: logging-service
+{{- end }}
