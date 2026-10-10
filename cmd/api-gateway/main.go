@@ -824,11 +824,12 @@ func initFailoverCoordinator(mongoURI string) (coordinator.FailoverCoordinator, 
 }
 
 func (gw *Gateway) handleWallets(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost {
+	switch r.Method {
+	case http.MethodPost:
 		gw.handleCreateWallet(w, r)
-	} else if r.Method == http.MethodGet {
+	case http.MethodGet:
 		gw.handleGetBalance(w, r)
-	} else {
+	default:
 		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
 	}
 }

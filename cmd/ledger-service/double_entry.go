@@ -241,9 +241,10 @@ func verifyDocIntegrity(doc LedgerDocument, expectedSeq int64, expectedPrevHash 
 
 func accumulateDocPostings(doc LedgerDocument, result *AuditVerificationResult) {
 	for _, p := range doc.Postings {
-		if p.Direction == PostingDebit {
+		switch p.Direction {
+		case PostingDebit:
 			result.TotalDebits[p.Currency] += p.Amount
-		} else if p.Direction == PostingCredit {
+		case PostingCredit:
 			result.TotalCredits[p.Currency] += p.Amount
 		}
 	}
