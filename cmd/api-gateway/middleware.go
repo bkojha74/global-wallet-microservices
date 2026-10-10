@@ -93,6 +93,7 @@ func (c *claimsCache) set(token string, claims *auth.Claims) {
 	c.entries[k] = claimsCacheEntry{claims: claims, expiresAt: time.Now().Add(ttl)}
 	c.mu.Unlock()
 }
+
 //nolint:unused // used in unit tests for cache eviction
 func (c *claimsCache) invalidate(token string) {
 	k := c.key(token)
