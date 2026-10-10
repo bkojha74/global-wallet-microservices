@@ -141,10 +141,10 @@ func parseCreateWalletRequest(r *http.Request, traceID string) (*walletv1.Create
 		return nil, err
 	}
 	if !db.IsValidCurrency(req.Currency) {
-		return nil, fmt.Errorf("Invalid or unsupported currency: %s", req.Currency)
+		return nil, fmt.Errorf("invalid or unsupported currency: %s", req.Currency)
 	}
 	if req.InitialBalance < 0 {
-		return nil, errors.New("Initial balance cannot be negative")
+		return nil, errors.New("initial balance cannot be negative")
 	}
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
 		if err := ValidateWalletOwnership(claims, req.WalletID); err != nil {

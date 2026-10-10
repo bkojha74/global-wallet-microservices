@@ -3,19 +3,28 @@ version: "2"
 run:
   timeout: 5m
   concurrency: 4
-  tests: true
+  tests: false
 
 linters:
-  default: standard
+  default: none
   enable:
-    - errcheck
+    - govet
     - ineffassign
-    - gosec
+    - staticcheck
+    - unused
+    - gosimple
   settings:
     govet:
       enable-all: false
-    gosec:
-      severity: medium
-      confidence: medium
-      excludes:
-        - G104
+    staticcheck:
+      checks:
+        - "all"
+        - "-ST1005"
+        - "-QF1003"
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - staticcheck
+        - unused

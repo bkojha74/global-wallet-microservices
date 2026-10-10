@@ -85,7 +85,7 @@ func (c *Client) Generate(ctx context.Context, prompt string) (string, error) {
 		return "", fmt.Errorf("GenerateContent: %w", err)
 	}
 	if len(resp.Candidates) == 0 {
-		return "", fmt.Errorf("Gemini returned an empty response")
+		return "", fmt.Errorf("gemini returned an empty response")
 	}
 
 	part := resp.Candidates[0].Content.Parts[0]
