@@ -12,4 +12,3 @@ linters:
     - ineffassign
     - staticcheck
     - unused
-    - gosimple
