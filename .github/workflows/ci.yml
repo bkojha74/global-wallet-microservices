@@ -122,11 +122,13 @@ jobs:
             exit 1
           fi
 
+      - name: Run Go Vet Static Analysis
+        run: go vet ./cmd/... ./pkg/...
+
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
-          install-mode: goinstall
+          version: v2.14.0
           args: --timeout=5m
 
   # ═══════════════════════════════════════════════════════════════════════════
@@ -143,7 +145,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
+          go-version-file: go.mod
+          check-latest: true
           cache: true
 
       - name: Install protobuf compiler & plugins
@@ -170,7 +173,7 @@ jobs:
       - name: Run GoSec Security Linter (OWASP/CWE Analysis)
         run: |
           go install github.com/securego/gosec/v2/cmd/gosec@latest
-          gosec -exclude-generated -severity medium ./...
+          gosec -exclude-generated -severity medium ./cmd/... ./pkg/...
 
       - name: SonarQube / SonarCloud Scanner
         if: env.SONAR_TOKEN != ''

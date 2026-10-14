@@ -554,7 +554,7 @@ func TestParseCreateWalletRequestErrors(t *testing.T) {
 	// 2. Invalid currency
 	reqBadCurr := httptest.NewRequest(http.MethodPost, "/api/v1/wallets", strings.NewReader(`{"wallet_id":"alice","currency":"NOTREAL","initial_balance":100}`))
 	_, err = parseCreateWalletRequest(reqBadCurr, "trace-2")
-	if err == nil || !strings.Contains(err.Error(), "Invalid or unsupported currency") {
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "unsupported currency") {
 		t.Fatalf("expected unsupported currency error, got %v", err)
 	}
 

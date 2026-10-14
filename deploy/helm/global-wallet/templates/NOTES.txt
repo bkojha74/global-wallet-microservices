@@ -1,0 +1,31 @@
+Thank you for deploying {{ .Chart.Name }}!
+
+Release Name: {{ .Release.Name }}
+Namespace:    {{ include "global-wallet.namespace" . }}
+Chart:        {{ .Chart.Name }}-{{ .Chart.Version }}
+
+1. Get the application status:
+   kubectl get pods -n {{ include "global-wallet.namespace" . }} -o wide
+
+2. Access the API Gateway:
+{{- if eq .Values.apiGateway.service.type "NodePort" }}
+   curl http://localhost:{{ .Values.apiGateway.service.nodePort }}/healthz
+{{- else }}
+   kubectl port-forward svc/api-gateway 8080:8080 -n {{ include "global-wallet.namespace" . }}
+   curl http://localhost:8080/healthz
+{{- end }}
+
+3. Access the Prometheus Metrics:
+{{- if eq .Values.apiGateway.service.type "NodePort" }}
+   curl http://localhost:{{ .Values.apiGateway.service.metricsNodePort }}/metrics
+{{- else }}
+   kubectl port-forward svc/api-gateway 8081:8081 -n {{ include "global-wallet.namespace" . }}
+   curl http://localhost:8081/metrics
+{{- end }}
+
+4. Verify Ingress:
+{{- if .Values.ingress.enabled }}
+   Host: {{ .Values.ingress.host }}
+   Add to /etc/hosts (or C:\Windows\System32\drivers\etc\hosts):
+   127.0.0.1  {{ .Values.ingress.host }}
+{{- end }}

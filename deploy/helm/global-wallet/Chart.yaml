@@ -1,0 +1,23 @@
+apiVersion: v2
+name: global-wallet
+description: Enterprise Global Multi-Currency Digital Wallet, Ledger & Core Banking Microservices Platform
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+icon: https://raw.githubusercontent.com/cncf/artwork/master/projects/kubernetes/icon/color/kubernetes-icon-color.svg
+keywords:
+  - banking
+  - fintech
+  - wallet
+  - ledger
+  - forex
+  - auth
+  - microservices
+  - grpc
+  - golang
+home: https://github.com/bkojha74/global-wallet-microservices
+sources:
+  - https://github.com/bkojha74/global-wallet-microservices
+maintainers:
+  - name: Global Wallet Engineering Team
+    email: devops@wallet.local

@@ -1,0 +1,86 @@
+{{- if .Values.mongodb.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-service
+  namespace: {{ include "global-wallet.namespace" . }}
+  labels:
+    app: mongodb
+    {{- include "global-wallet.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - port: 27017
+      name: mongodb
+  selector:
+    app: mongodb
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongodb
+  namespace: {{ include "global-wallet.namespace" . }}
+  labels:
+    app: mongodb
+    {{- include "global-wallet.labels" . | nindent 4 }}
+spec:
+  serviceName: "mongodb-service"
+  replicas: {{ .Values.mongodb.replicas }}
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      containers:
+        - name: mongodb
+          image: "{{ .Values.mongodb.image.repository }}:{{ .Values.mongodb.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          command:
+            - mongod
+            - "--replSet"
+            - {{ .Values.mongodb.replicaSetName | quote }}
+            - "--bind_ip_all"
+          ports:
+            - containerPort: 27017
+              name: mongodb
+          resources:
+            {{- toYaml .Values.mongodb.resources | nindent 12 }}
+          volumeMounts:
+            - name: mongodb-data
+              mountPath: /data/db
+        - name: mongo-init-replica
+          image: "{{ .Values.mongodb.image.repository }}:{{ .Values.mongodb.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          command:
+            - "bash"
+            - "-c"
+            - |
+              echo "Waiting for local mongod to be reachable on localhost:27017..."
+              until mongosh --host localhost:27017 --eval "db.adminCommand('ping')" --quiet > /dev/null 2>&1; do
+                sleep 2
+              done
+              echo "Checking replica set status..."
+              RS_STATUS=$$(mongosh --host localhost:27017 --eval "rs.status().ok" --quiet 2>/dev/null || echo "0")
+              if [ "$$RS_STATUS" != "1" ]; then
+                echo "Initiating replica set {{ .Values.mongodb.replicaSetName }}..."
+                mongosh --host localhost:27017 --eval 'rs.initiate({ _id: "{{ .Values.mongodb.replicaSetName }}", members: [{ _id: 0, host: "mongodb-0.mongodb-service.{{ include "global-wallet.namespace" . }}.svc.cluster.local:27017" }] })'
+              else
+                echo "Replica set {{ .Values.mongodb.replicaSetName }} already initialized."
+              fi
+              echo "MongoDB replica set initialization complete."
+              exec sleep infinity
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 512Mi
+      volumes:
+        - name: mongodb-data
+          emptyDir: {}
+{{- end }}

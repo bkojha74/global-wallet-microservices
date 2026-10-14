@@ -141,10 +141,10 @@ func parseCreateWalletRequest(r *http.Request, traceID string) (*walletv1.Create
 		return nil, err
 	}
 	if !db.IsValidCurrency(req.Currency) {
-		return nil, fmt.Errorf("Invalid or unsupported currency: %s", req.Currency)
+		return nil, fmt.Errorf("invalid or unsupported currency: %s", req.Currency)
 	}
 	if req.InitialBalance < 0 {
-		return nil, errors.New("Initial balance cannot be negative")
+		return nil, errors.New("initial balance cannot be negative")
 	}
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
 		if err := ValidateWalletOwnership(claims, req.WalletID); err != nil {
@@ -824,11 +824,12 @@ func initFailoverCoordinator(mongoURI string) (coordinator.FailoverCoordinator, 
 }
 
 func (gw *Gateway) handleWallets(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost {
+	switch r.Method {
+	case http.MethodPost:
 		gw.handleCreateWallet(w, r)
-	} else if r.Method == http.MethodGet {
+	case http.MethodGet:
 		gw.handleGetBalance(w, r)
-	} else {
+	default:
 		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
 	}
 }
