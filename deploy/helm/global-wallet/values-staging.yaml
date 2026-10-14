@@ -1,0 +1,49 @@
+# Staging Environment Overlay
+env:
+  environment: "staging"
+  logLevel: "debug"
+
+ingress:
+  host: staging-wallet.internal
+  tls:
+    enabled: true
+    secretName: staging-wallet-tls
+
+apiGateway:
+  replicas: 2
+  service:
+    type: ClusterIP
+
+authService:
+  replicas: 2
+
+fxService:
+  replicas: 2
+
+walletPrimary:
+  replicas: 2
+
+walletStandby:
+  replicas: 1
+
+ledgerService:
+  replicas: 2
+
+loggingService:
+  replicas: 1
+
+mongodb:
+  replicas: 1
+  persistence:
+    enabled: true
+    size: 10Gi
+
+rabbitmq:
+  replicas: 1
+  persistence:
+    enabled: true
+    size: 10Gi
+
+autoscaling:
+  minReplicas: 2
+  maxReplicas: 4

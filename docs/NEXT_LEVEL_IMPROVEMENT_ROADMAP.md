@@ -90,7 +90,12 @@ graph TD
   - [x] Implement deterministic dependency-ordered rollout with rolling restart and status checks.
   - [x] Create standalone deployment scripts: `scripts/deploy-k8s.bat` (Windows) and `scripts/deploy-k8s.sh` (Linux/macOS).
   - [x] Add `make k8s-deploy`, `make k8s-status`, and `make k8s-down` Makefile targets.
-  - [x] Configure dual smoke verification against Docker Compose (`:8080`) and Kubernetes NodePort (`:30080`).
+- [x] **K8S-08: Enterprise Helm Chart Packaging (`deploy/helm/global-wallet`)**
+  - [x] Create modular `Chart.yaml` and `values.yaml` with global settings and pod security contexts.
+  - [x] Create environment overlays: `values-staging.yaml` and `values-prod.yaml`.
+  - [x] Package templates for all 6 microservices, Keycloak IdP, MongoDB ReplicaSet, RabbitMQ broker, Ingress, HPAs, and PDBs.
+  - [x] Add Makefile targets `helm-lint`, `helm-template`, `helm-install`, and `helm-uninstall`.
+  - [x] Pass all `helm lint` and `helm template` verifications.
 
 ---
 

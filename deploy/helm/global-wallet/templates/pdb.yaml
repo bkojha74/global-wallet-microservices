@@ -1,0 +1,73 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-gateway-pdb
+  namespace: {{ include "global-wallet.namespace" . }}
+  labels:
+    app: api-gateway
+    {{- include "global-wallet.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app: api-gateway
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: wallet-primary-pdb
+  namespace: {{ include "global-wallet.namespace" . }}
+  labels:
+    app: wallet-service
+    tier: primary
+    {{- include "global-wallet.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app: wallet-service
+      tier: primary
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ledger-service-pdb
+  namespace: {{ include "global-wallet.namespace" . }}
+  labels:
+    app: ledger-service
+    {{- include "global-wallet.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app: ledger-service
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: auth-service-pdb
+  namespace: {{ include "global-wallet.namespace" . }}
+  labels:
+    app: auth-service
+    {{- include "global-wallet.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app: auth-service
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fx-service-pdb
+  namespace: {{ include "global-wallet.namespace" . }}
+  labels:
+    app: fx-service
+    {{- include "global-wallet.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app: fx-service
+{{- end }}

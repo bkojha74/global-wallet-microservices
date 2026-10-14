@@ -94,6 +94,7 @@ func (c *claimsCache) set(token string, claims *auth.Claims) {
 	c.mu.Unlock()
 }
 
+//nolint:unused // used in unit tests for cache eviction
 func (c *claimsCache) invalidate(token string) {
 	k := c.key(token)
 	c.mu.Lock()
