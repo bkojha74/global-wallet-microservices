@@ -475,6 +475,12 @@ jobs:
     if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/feature/'))) || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.deploy_target == 'all' || github.event.inputs.deploy_target == 'docker-compose' || github.event.inputs.deploy_target == ''))
     runs-on: [self-hosted, Windows]
     steps:
+      - name: Trust Git Working Directory
+        shell: cmd
+        run: |
+          git config --global --add safe.directory *
+          git config --global --add safe.directory "%GITHUB_WORKSPACE%" 2>nul || exit 0
+
       - name: Check out repository
         uses: actions/checkout@v4
 
@@ -555,6 +561,12 @@ jobs:
     if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/feature/'))) || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.deploy_target == 'all' || github.event.inputs.deploy_target == 'kubernetes' || github.event.inputs.deploy_target == ''))
     runs-on: [self-hosted, Windows]
     steps:
+      - name: Trust Git Working Directory
+        shell: cmd
+        run: |
+          git config --global --add safe.directory *
+          git config --global --add safe.directory "%GITHUB_WORKSPACE%" 2>nul || exit 0
+
       - name: Check out repository
         uses: actions/checkout@v4
 
