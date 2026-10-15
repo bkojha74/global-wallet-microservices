@@ -483,6 +483,8 @@ jobs:
 
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          clean: false
 
       - name: Check Docker Daemon Readiness
         id: docker_check
@@ -569,6 +571,8 @@ jobs:
 
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          clean: false
 
       - name: Check Kubernetes Cluster Readiness
         id: k8s_check
