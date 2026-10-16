@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -109,8 +110,157 @@ func (m *mongoLedgerTaskStore) MarkFailed(ctx context.Context, id primitive.Obje
 	return err
 }
 
+// LeaseManager defines the interface for distributed leader lease acquisition.
+type LeaseManager interface {
+	TryAcquireOrRenew(ctx context.Context) (bool, error)
+	Release(ctx context.Context) error
+	HolderID() string
+}
+
+const (
+	// DefaultRelayLeaseDocID is the singleton document ID in MongoDB for outbox relay leadership.
+	DefaultRelayLeaseDocID = "ledger_outbox_relay"
+	// DefaultLeaseTTL is the default validity duration for a leadership lease.
+	DefaultLeaseTTL = 10 * time.Second
+)
+
+// RelayLeaseDoc represents the MongoDB document used for distributed leader leasing.
+type RelayLeaseDoc struct {
+	ID         string    `bson:"_id"`
+	HolderID   string    `bson:"holder_id"`
+	AcquiredAt time.Time `bson:"acquired_at"`
+	ExpiresAt  time.Time `bson:"expires_at"`
+}
+
+// MongoRelayLeaseManager implements LeaseManager using atomic MongoDB FindOneAndUpdate operations.
+type MongoRelayLeaseManager struct {
+	col      *mongo.Collection
+	holderID string
+	ttl      time.Duration
+	leaseID  string
+	initOnce sync.Once
+}
+
+// NewMongoRelayLeaseManager creates a lease manager backed by MongoDB collection "ledger_relay_lease".
+func NewMongoRelayLeaseManager(db *mongo.Database, holderID string, ttl time.Duration) *MongoRelayLeaseManager {
+	if ttl <= 0 {
+		ttl = DefaultLeaseTTL
+	}
+	if holderID == "" {
+		holderID = observability.ResolveInstanceID()
+	}
+	var col *mongo.Collection
+	if db != nil {
+		col = db.Collection("ledger_relay_lease")
+	}
+	return &MongoRelayLeaseManager{
+		col:      col,
+		holderID: holderID,
+		ttl:      ttl,
+		leaseID:  DefaultRelayLeaseDocID,
+	}
+}
+
+// HolderID returns the instance identifier of this lease candidate.
+func (m *MongoRelayLeaseManager) HolderID() string {
+	return m.holderID
+}
+
+// ensureDocExists guarantees that the singleton lease document exists before running FindOneAndUpdate.
+func (m *MongoRelayLeaseManager) ensureDocExists(ctx context.Context) error {
+	if m.col == nil {
+		return nil
+	}
+	_, err := m.col.UpdateOne(ctx,
+		bson.M{"_id": m.leaseID},
+		bson.M{
+			"$setOnInsert": bson.M{
+				"holder_id":   "",
+				"acquired_at": time.Unix(0, 0).UTC(),
+				"expires_at":  time.Unix(0, 0).UTC(),
+			},
+		},
+		options.Update().SetUpsert(true),
+	)
+	return err
+}
+
+// TryAcquireOrRenew attempts to acquire leadership if unheld/expired, or renew it if currently held.
+func (m *MongoRelayLeaseManager) TryAcquireOrRenew(ctx context.Context) (bool, error) {
+	if m.col == nil {
+		return true, nil
+	}
+
+	m.initOnce.Do(func() {
+		initCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		_ = m.ensureDocExists(initCtx)
+	})
+
+	now := time.Now().UTC()
+	expiresAt := now.Add(m.ttl)
+
+	filter := bson.M{
+		"_id": m.leaseID,
+		"$or": []bson.M{
+			{"holder_id": m.holderID},
+			{"expires_at": bson.M{"$lt": now}},
+		},
+	}
+	update := bson.M{
+		"$set": bson.M{
+			"holder_id":   m.holderID,
+			"acquired_at": now,
+			"expires_at":  expiresAt,
+		},
+	}
+	opts := options.FindOneAndUpdate().SetReturnDocument(options.After)
+
+	var result RelayLeaseDoc
+	err := m.col.FindOneAndUpdate(ctx, filter, update, opts).Decode(&result)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			// Another active pod holds a valid unexpired lease
+			return false, nil
+		}
+		return false, fmt.Errorf("lease election query failed: %w", err)
+	}
+
+	return result.HolderID == m.holderID, nil
+}
+
+// Release voluntarily relinquishes leadership so standby pods can acquire the lease immediately.
+func (m *MongoRelayLeaseManager) Release(ctx context.Context) error {
+	if m.col == nil {
+		return nil
+	}
+	_, err := m.col.UpdateOne(ctx,
+		bson.M{
+			"_id":       m.leaseID,
+			"holder_id": m.holderID,
+		},
+		bson.M{
+			"$set": bson.M{
+				"holder_id":  "",
+				"expires_at": time.Unix(0, 0).UTC(),
+			},
+		},
+	)
+	return err
+}
+
+// RelayOption defines functional options for LedgerRelay.
+type RelayOption func(*LedgerRelay)
+
+// WithLeaseManager configures a distributed leadership lease manager for the relay worker.
+func WithLeaseManager(lm LeaseManager) RelayOption {
+	return func(r *LedgerRelay) {
+		r.leaseManager = lm
+	}
+}
+
 // LedgerRelay polls pending ledger tasks and guarantees reliable asynchronous delivery
-// to the Ledger Service.
+// to the Ledger Service. When running with a LeaseManager, only the elected leader pod processes outbox tasks.
 type LedgerRelay struct {
 	col          *mongo.Collection
 	store        LedgerTaskStore
@@ -119,9 +269,12 @@ type LedgerRelay struct {
 	batchSize    int64
 	logger       observability.Logger
 	cancel       context.CancelFunc
+	leaseManager LeaseManager
+	leaderMu     sync.RWMutex
+	isLeader     bool
 }
 
-func NewLedgerRelay(db *mongo.Database, client ledgerv1.LedgerServiceClient, pollInterval time.Duration, batchSize int64, logger observability.Logger) *LedgerRelay {
+func NewLedgerRelay(db *mongo.Database, client ledgerv1.LedgerServiceClient, pollInterval time.Duration, batchSize int64, logger observability.Logger, opts ...RelayOption) *LedgerRelay {
 	if pollInterval <= 0 {
 		pollInterval = 1 * time.Second
 	}
@@ -132,7 +285,7 @@ func NewLedgerRelay(db *mongo.Database, client ledgerv1.LedgerServiceClient, pol
 	if db != nil {
 		col = db.Collection("ledger_tasks")
 	}
-	return &LedgerRelay{
+	r := &LedgerRelay{
 		col:          col,
 		store:        &mongoLedgerTaskStore{col: col},
 		ledgerClient: client,
@@ -140,6 +293,28 @@ func NewLedgerRelay(db *mongo.Database, client ledgerv1.LedgerServiceClient, pol
 		batchSize:    batchSize,
 		logger:       logger,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(r)
+		}
+	}
+	return r
+}
+
+// IsLeader reports whether this relay instance currently holds the active leadership lease.
+func (r *LedgerRelay) IsLeader() bool {
+	if r.leaseManager == nil {
+		return true
+	}
+	r.leaderMu.RLock()
+	defer r.leaderMu.RUnlock()
+	return r.isLeader
+}
+
+func (r *LedgerRelay) setLeader(leader bool) {
+	r.leaderMu.Lock()
+	r.isLeader = leader
+	r.leaderMu.Unlock()
 }
 
 // DispatchImmediate attempts a synchronous RPC to ledger-service immediately after transaction commit.
@@ -183,6 +358,7 @@ func (r *LedgerRelay) Start(ctx context.Context) {
 	relayCtx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
 
+	// #nosec G118 -- intentional background worker goroutine for relay loop; shutdown uses detached context for lease release
 	go func() {
 		log.Printf("[LEDGER-RELAY] Background outbox relay started (interval: %v, batch: %d)", r.pollInterval, r.batchSize)
 		ticker := time.NewTicker(r.pollInterval)
@@ -191,6 +367,25 @@ func (r *LedgerRelay) Start(ctx context.Context) {
 		for {
 			select {
 			case <-ticker.C:
+				if r.leaseManager != nil {
+					hasLease, err := r.leaseManager.TryAcquireOrRenew(relayCtx)
+					if err != nil {
+						log.Printf("[LEDGER-RELAY] Warning: lease election check error: %v", err)
+						continue
+					}
+					if !hasLease {
+						if r.IsLeader() {
+							log.Printf("[LEDGER-RELAY] Lost leadership lease (stepped down to standby)")
+							r.setLeader(false)
+						}
+						continue
+					}
+					if !r.IsLeader() {
+						log.Printf("[LEDGER-RELAY] Acquired leadership lease as %s (active worker)", r.leaseManager.HolderID())
+						r.setLeader(true)
+					}
+				}
+
 				if count, err := r.ProcessBatch(relayCtx); err != nil {
 					log.Printf("[LEDGER-RELAY] Error processing batch: %v", err)
 				} else if count > 0 {
@@ -198,6 +393,12 @@ func (r *LedgerRelay) Start(ctx context.Context) {
 				}
 			case <-relayCtx.Done():
 				log.Println("[LEDGER-RELAY] Outbox relay shutting down...")
+				if r.leaseManager != nil && r.IsLeader() {
+					// #nosec G118 -- shutdown lease release requires detached context since relayCtx is already canceled
+					shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+					_ = r.leaseManager.Release(shutdownCtx)
+					shutdownCancel()
+				}
 				return
 			}
 		}

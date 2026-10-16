@@ -1278,7 +1278,16 @@ func runWalletServer(ctx context.Context) error {
 
 	var ledgerRelay *LedgerRelay
 	if client != nil {
-		ledgerRelay = NewLedgerRelay(client.Database("banking_db"), ledgerClient, 2*time.Second, 50, nil)
+		leaseTTL := 10 * time.Second
+		if val := os.Getenv("OUTBOX_LEASE_TTL_SECONDS"); val != "" {
+			if sec, err := strconv.Atoi(val); err == nil && sec > 0 {
+				leaseTTL = time.Duration(sec) * time.Second
+			}
+		}
+		db := client.Database("banking_db")
+		instanceID := observability.ResolveInstanceID()
+		leaseManager := NewMongoRelayLeaseManager(db, instanceID, leaseTTL)
+		ledgerRelay = NewLedgerRelay(db, ledgerClient, 2*time.Second, 50, nil, WithLeaseManager(leaseManager))
 		ledgerRelay.Start(subCtx)
 	}
 

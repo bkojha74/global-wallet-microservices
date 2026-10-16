@@ -7,6 +7,7 @@
 [![Zero-Trust Security](https://img.shields.io/badge/Security-Zero--Trust_mTLS_%26_JWT-success?logo=security&logoColor=white)](SECURITY.md)
 [![gRPC](https://img.shields.io/badge/gRPC-Protobuf_v3-244c5a?logo=grpc&logoColor=white)](https://grpc.io)
 [![Database](https://img.shields.io/badge/MongoDB-7.0_Replica_Set_ACID-47A248?logo=mongodb&logoColor=white)](https://www.mongodb.com)
+[![Cache](https://img.shields.io/badge/Redis-7.2_Hybrid_L1%2FL2-DC382D?logo=redis&logoColor=white)](https://redis.io)
 [![Message Broker](https://img.shields.io/badge/RabbitMQ-3.13_AMQP-FF6600?logo=rabbitmq&logoColor=white)](https://www.rabbitmq.com)
 [![Monitoring](https://img.shields.io/badge/Prometheus_%26_Grafana-Observability-F46800?logo=prometheus&logoColor=white)](https://prometheus.io)
 
@@ -55,6 +56,8 @@ The **Global Multi-Currency Digital Wallet & Ledger Service** is engineered to d
 * **Active-Standby Multi-Region Disaster Recovery**: Simulated multi-region architecture (`us-east-1` Primary Active, `eu-west-1` Standby Hot DR) featuring dynamic routing switchover at the API Gateway.
 * **Resilient Centralized Logging Ecosystem**: Non-blocking asynchronous event emission to RabbitMQ with automatic local JSONL disk spooling and backpressure-aware background replay workers.
 * **Intelligent AI Fraud Detection**: Real-time contextual transaction analysis leveraging Google's `gemini-3.1-flash-lite` to intercept and block anomalous financial activity, utilizing a resilient Fail-Open architecture to ensure high availability.
+* **Distributed Multi-Pod Caching**: Tiered L1 (in-memory) + L2 (Redis) caching layer synchronized in real time across horizontally-scaled pods via an AMQP broadcast invalidation bus (`wallet.cache.events`) with echo suppression to eliminate stale balance reads.
+* **Distributed Outbox Worker Lease**: Atomic leader election lease on MongoDB (`ledger_relay_lease`) via `FindOneAndUpdate` ensuring single-worker active outbox processing and immediate hot-standby failover without database lock contention.
 * **Operational Tracing & Observability**: Correlation IDs (`association_id`, `idempotency_key`, `transaction_id`) propagated across gRPC metadata and HTTP headers, with a dedicated Log Query API, Prometheus metrics, and preconfigured Grafana dashboards.
 
 ---
@@ -807,7 +810,8 @@ Both Postman and Bruno test runners validate:
 
 | Document | Description |
 |---|---|
-| [docs/KUBERNETES_COMPLETE_GUIDE.md](docs/KUBERNETES_COMPLETE_GUIDE.md) | Complete Kubernetes operations guide: 12-manifest reference, local Docker Desktop configuration, automated CI/CD autodeployment, and Web Dashboard navigation. |
+| [docs/KUBERNETES_COMPLETE_GUIDE.md](docs/KUBERNETES_COMPLETE_GUIDE.md) | Complete Kubernetes operations guide: 13-manifest reference, local Docker Desktop configuration, automated CI/CD autodeployment, and Web Dashboard navigation. |
+| [docs/DISTRIBUTED_CACHING_ARCHITECTURE.md](docs/DISTRIBUTED_CACHING_ARCHITECTURE.md) | Architectural specification and blueprint for multi-pod L1/L2 hybrid balance caching, AMQP invalidation bus, and atomic outbox relay worker leasing. |
 | [docs/NEXT_LEVEL_IMPROVEMENT_ROADMAP.md](docs/NEXT_LEVEL_IMPROVEMENT_ROADMAP.md) | Next-level architectural & operational improvement roadmap covering Kubernetes completeness, distributed caching, circuit breaking, and core banking expansion. |
 | [docs/PRODUCTION_READINESS_AUDIT.md](docs/PRODUCTION_READINESS_AUDIT.md) | Comprehensive 8-pillar production audit, gap catalog, risk analysis, and 4-phase remediation roadmap. |
 | [docs/PHASE1_IMPLEMENTATION.md](docs/PHASE1_IMPLEMENTATION.md) | Technical deep-dive on Phase 1: transactional outbox pattern, database indexing, TTL, and pagination. |

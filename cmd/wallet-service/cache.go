@@ -119,30 +119,41 @@ func NewBalanceCacheFromEnv(serviceName string) *BalanceCache {
 
 	var opts []BalanceCacheOption
 
-	// Check for Redis L2 configuration
-	if redisAddr := os.Getenv("REDIS_ADDR"); redisAddr != "" {
-		redisDB := 0
-		if dbVal := os.Getenv("REDIS_DB"); dbVal != "" {
-			if parsedDB, err := strconv.Atoi(dbVal); err == nil {
-				redisDB = parsedDB
+	backend := strings.ToLower(strings.TrimSpace(os.Getenv("WALLET_CACHE_BACKEND")))
+	if backend == "" {
+		backend = "hybrid"
+	}
+
+	// Check for Redis L2 configuration (only if backend is not purely memory)
+	if backend != "memory" {
+		if redisAddr := os.Getenv("REDIS_ADDR"); redisAddr != "" {
+			redisDB := 0
+			if dbVal := os.Getenv("REDIS_DB"); dbVal != "" {
+				if parsedDB, err := strconv.Atoi(dbVal); err == nil {
+					redisDB = parsedDB
+				}
 			}
-		}
-		redisCache, err := cache.NewRedisCacheFromConfig(context.Background(), cache.RedisCacheConfig{
-			Addr:       redisAddr,
-			Password:   os.Getenv("REDIS_PASSWORD"),
-			DB:         redisDB,
-			DefaultTTL: ttl,
-		})
-		if err == nil && redisCache != nil {
-			log.Printf("[WALLET-CACHE] L2 Redis cache connected at %s", redisAddr)
-			opts = append(opts, WithL2Cache(redisCache))
-		} else {
-			log.Printf("[WALLET-CACHE] Warning: failed to connect to Redis at %s (%v), operating in L1-only mode", redisAddr, err)
+			redisCache, err := cache.NewRedisCacheFromConfig(context.Background(), cache.RedisCacheConfig{
+				Addr:       redisAddr,
+				Password:   os.Getenv("REDIS_PASSWORD"),
+				DB:         redisDB,
+				DefaultTTL: ttl,
+			})
+			if err == nil && redisCache != nil {
+				log.Printf("[WALLET-CACHE] L2 Redis cache connected at %s (backend: %s)", redisAddr, backend)
+				opts = append(opts, WithL2Cache(redisCache))
+			} else {
+				log.Printf("[WALLET-CACHE] Warning: failed to connect to Redis at %s (%v), operating in L1-only mode", redisAddr, err)
+			}
 		}
 	}
 
-	// Check for AMQP Distributed Invalidation Bus configuration
-	if rabbitURL := os.Getenv("RABBITMQ_URL"); rabbitURL != "" {
+	// Check for AMQP Distributed Invalidation Bus configuration (fallback to LOGGING_RABBITMQ_URL)
+	rabbitURL := strings.TrimSpace(os.Getenv("RABBITMQ_URL"))
+	if rabbitURL == "" {
+		rabbitURL = strings.TrimSpace(os.Getenv("LOGGING_RABBITMQ_URL"))
+	}
+	if rabbitURL != "" {
 		exchange := os.Getenv("WALLET_CACHE_EXCHANGE")
 		if exchange == "" {
 			exchange = cache.DefaultCacheExchange

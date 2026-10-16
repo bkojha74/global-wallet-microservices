@@ -65,6 +65,26 @@ spec:
                 configMapKeyRef:
                   name: wallet-config
                   key: RABBITMQ_URI
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: wallet-secrets
+                  key: RABBITMQ_URL
+            - name: WALLET_CACHE_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: WALLET_CACHE_ENABLED
+            - name: WALLET_CACHE_BACKEND
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: WALLET_CACHE_BACKEND
+            - name: REDIS_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: REDIS_ADDR
             - name: LEDGER_SERVICE_ADDR
               value: "ledger-service:50052"
             - name: FX_SERVICE_ADDR

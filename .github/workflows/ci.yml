@@ -523,6 +523,7 @@ jobs:
         run: |
           docker compose -f docker-compose.mongodb.yml pull
           docker compose -f docker-compose.rabbitmq.yml pull
+          docker compose -f docker-compose.redis.yml pull
           docker compose -f docker-compose.auth.yml pull
           docker compose -f docker-compose.fx.yml pull
           docker compose -f docker-compose.logging.yml pull
@@ -540,8 +541,10 @@ jobs:
           docker volume inspect wallet_rabbitmq_data >nul 2>&1 || docker volume create wallet_rabbitmq_data
           docker volume inspect wallet_rabbitmq_data_2 >nul 2>&1 || docker volume create wallet_rabbitmq_data_2
           docker volume inspect wallet_rabbitmq_data_3 >nul 2>&1 || docker volume create wallet_rabbitmq_data_3
+          docker volume inspect wallet_redis_data >nul 2>&1 || docker volume create wallet_redis_data
           docker compose -f docker-compose.mongodb.yml up -d
           docker compose -f docker-compose.rabbitmq.yml up -d
+          docker compose -f docker-compose.redis.yml up -d
           docker compose -f docker-compose.auth.yml up -d
           docker compose -f docker-compose.fx.yml up -d
           docker compose -f docker-compose.logging.yml up -d
@@ -622,9 +625,10 @@ jobs:
           kubectl apply -f k8s/01-namespace.yaml
           kubectl apply -f k8s/09-configmap-secrets.yaml
 
-          echo Applying Infrastructure (MongoDB StatefulSet and RabbitMQ)...
+          echo Applying Infrastructure (MongoDB StatefulSet, RabbitMQ, and Redis)...
           kubectl apply -f k8s/02-mongodb.yaml
           kubectl apply -f k8s/06-rabbitmq.yaml
+          kubectl apply -f k8s/13-redis.yaml
 
           echo Applying Microservices (Ledger, Auth, FX, Wallet, Logging, Gateway)...
           kubectl apply -f k8s/03-ledger-service.yaml
