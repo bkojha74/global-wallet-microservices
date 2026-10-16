@@ -65,6 +65,17 @@ spec:
                 secretKeyRef:
                   name: wallet-secrets
                   key: RABBITMQ_URL
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: wallet-secrets
+                  key: RABBITMQ_URL
+            - name: WALLET_CACHE_ENABLED
+              value: "true"
+            - name: WALLET_CACHE_BACKEND
+              value: "hybrid"
+            - name: REDIS_ADDR
+              value: "redis-service:6379"
           resources:
             requests:
               cpu: 150m
@@ -175,6 +186,17 @@ spec:
                 secretKeyRef:
                   name: wallet-secrets
                   key: RABBITMQ_URL
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: wallet-secrets
+                  key: RABBITMQ_URL
+            - name: WALLET_CACHE_ENABLED
+              value: "true"
+            - name: WALLET_CACHE_BACKEND
+              value: "hybrid"
+            - name: REDIS_ADDR
+              value: "redis-service:6379"
           resources:
             requests:
               cpu: 100m

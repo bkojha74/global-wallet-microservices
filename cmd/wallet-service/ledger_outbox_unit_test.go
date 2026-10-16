@@ -156,3 +156,107 @@ func TestLedgerRelay_OfflineUnit(t *testing.T) {
 	cancel()
 	relayFast.Stop()
 }
+
+type mockLeaseManager struct {
+	holderID     string
+	hasLease     bool
+	acquireErr   error
+	releaseErr   error
+	acquireCalls int
+	releaseCalls int
+}
+
+func (m *mockLeaseManager) TryAcquireOrRenew(_ context.Context) (bool, error) {
+	m.acquireCalls++
+	return m.hasLease, m.acquireErr
+}
+
+func (m *mockLeaseManager) Release(_ context.Context) error {
+	m.releaseCalls++
+	m.hasLease = false
+	return m.releaseErr
+}
+
+func (m *mockLeaseManager) HolderID() string {
+	return m.holderID
+}
+
+func TestLedgerRelay_WithLeaseManager_LeaderElection(t *testing.T) {
+	mockSuccess := &mockLedgerClient{
+		recordResp: &ledgerv1.RecordTransactionResponse{Success: true},
+	}
+	mockStore := &mockLedgerTaskStore{
+		tasks: []LedgerTask{{
+			ID:             primitive.NewObjectID(),
+			TransactionID:  "tx-lease-1",
+			IdempotencyKey: "idemp-lease-1",
+		}},
+	}
+
+	lm := &mockLeaseManager{
+		holderID: "wallet-pod-test-1",
+		hasLease: false, // Initially standby
+	}
+
+	relay := NewLedgerRelay(nil, mockSuccess, 10*time.Millisecond, 10, nil, WithLeaseManager(lm))
+	relay.store = mockStore
+
+	if relay.IsLeader() {
+		t.Errorf("Expected relay to start as non-leader when lease is unheld")
+	}
+
+	// 1. Standby pod tick: should NOT process tasks
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	relay.Start(ctx)
+	time.Sleep(35 * time.Millisecond)
+
+	if len(mockStore.completedIDs) != 0 {
+		t.Errorf("Standby pod should NOT process tasks, completed: %d", len(mockStore.completedIDs))
+	}
+
+	// 2. Transition to Leader
+	lm.hasLease = true
+	time.Sleep(35 * time.Millisecond)
+
+	if !relay.IsLeader() {
+		t.Errorf("Expected relay to transition to leader")
+	}
+	if len(mockStore.completedIDs) == 0 {
+		t.Errorf("Elected leader should have processed tasks")
+	}
+
+	// 3. Graceful stop should release lease
+	relay.Stop()
+	time.Sleep(10 * time.Millisecond)
+
+	if lm.releaseCalls == 0 {
+		t.Errorf("Expected Release to be called on graceful shutdown")
+	}
+}
+
+func TestMongoRelayLeaseManager_NilColSafety(t *testing.T) {
+	mgr := NewMongoRelayLeaseManager(nil, "test-instance", 5*time.Second)
+	if mgr.HolderID() != "test-instance" {
+		t.Errorf("Expected holder ID test-instance, got %s", mgr.HolderID())
+	}
+
+	hasLease, err := mgr.TryAcquireOrRenew(context.Background())
+	if err != nil || !hasLease {
+		t.Errorf("Expected (true, nil) for nil col graceful fallback, got (%v, %v)", hasLease, err)
+	}
+
+	if err := mgr.Release(context.Background()); err != nil {
+		t.Errorf("Expected nil error on Release with nil col, got %v", err)
+	}
+
+	// Test default ttl and instance ID resolution
+	defaultMgr := NewMongoRelayLeaseManager(nil, "", 0)
+	if defaultMgr.ttl != DefaultLeaseTTL {
+		t.Errorf("Expected default ttl %v, got %v", DefaultLeaseTTL, defaultMgr.ttl)
+	}
+	if defaultMgr.HolderID() == "" {
+		t.Errorf("Expected non-empty resolved instance ID")
+	}
+}
