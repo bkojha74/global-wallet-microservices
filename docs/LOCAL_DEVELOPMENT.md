@@ -144,7 +144,7 @@ Use `mongodb://mongodb:27017/?replicaSet=rs0&directConnection=true` from contain
 
 Use this workflow when only MongoDB should run in Docker. Do not start the application Compose file; it would also start Docker versions of the ledger, wallet, and gateway services.
 
-### 1. Start MongoDB and RabbitMQ
+### 1. Start MongoDB, RabbitMQ, and Redis
 
 From the repository root:
 
@@ -156,11 +156,13 @@ docker volume inspect global-wallet-microservices_mongo_data *> $null
 if ($LASTEXITCODE -ne 0) { docker volume create global-wallet-microservices_mongo_data }
 docker compose -f docker-compose.mongodb.yml up -d
 docker compose -f docker-compose.rabbitmq.yml up -d
+docker compose -f docker-compose.redis.yml up -d
 docker compose -f docker-compose.mongodb.yml ps
 docker compose -f docker-compose.rabbitmq.yml ps
+docker compose -f docker-compose.redis.yml ps
 ```
 
-Wait until both `wallet_mongodb` and `wallet_rabbitmq` show `healthy`. Verify the replica set:
+Wait until `wallet_mongodb`, `wallet_rabbitmq`, and `wallet_redis` show `healthy` or running. Verify the replica set:
 
 ```powershell
 mongosh.exe --host 127.0.0.1:27017 --quiet --eval "rs.status().members.map(m => ({name: m.name, stateStr: m.stateStr, health: m.health}))"
@@ -203,6 +205,9 @@ $env:REGION_NAME = "us-east-1-primary"
 $env:IS_ACTIVE = "true"
 $env:COORDINATOR_ROLE = "PRIMARY"
 $env:LOGGING_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
+$env:RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
+$env:REDIS_ADDR = "127.0.0.1:6379"
+$env:WALLET_CACHE_BACKEND = "hybrid"
 go run .\cmd\wallet-service
 ```
 
@@ -227,6 +232,9 @@ $env:REGION_NAME = "eu-west-1-standby"
 $env:IS_ACTIVE = "false"
 $env:COORDINATOR_ROLE = "STANDBY"
 $env:LOGGING_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
+$env:RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
+$env:REDIS_ADDR = "127.0.0.1:6379"
+$env:WALLET_CACHE_BACKEND = "hybrid"
 go run .\cmd\wallet-service
 ```
 

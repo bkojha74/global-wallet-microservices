@@ -44,9 +44,10 @@ kubectl apply -f k8s/01-namespace.yaml
 kubectl apply -f k8s/09-configmap-secrets.yaml
 
 echo.
-echo [*] Applying Infrastructure (MongoDB Replica Set ^& RabbitMQ Broker)...
+echo [*] Applying Infrastructure (MongoDB Replica Set ^& RabbitMQ Broker ^& Redis Cache)...
 kubectl apply -f k8s/02-mongodb.yaml
 kubectl apply -f k8s/06-rabbitmq.yaml
+kubectl apply -f k8s/13-redis.yaml
 
 echo.
 echo [*] Applying Microservices (Ledger, Auth, FX, Wallet, Logging, Gateway)...
