@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 )
 
 type mockLedgerTaskStore struct {
+	mu            sync.RWMutex
 	tasks         []LedgerTask
 	completedIDs  []primitive.ObjectID
 	failedIDs     []primitive.ObjectID
@@ -20,6 +22,8 @@ type mockLedgerTaskStore struct {
 }
 
 func (m *mockLedgerTaskStore) FindPending(_ context.Context, limit int64) ([]LedgerTask, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if m.findErr != nil {
 		return nil, m.findErr
 	}
@@ -30,6 +34,8 @@ func (m *mockLedgerTaskStore) FindPending(_ context.Context, limit int64) ([]Led
 }
 
 func (m *mockLedgerTaskStore) MarkCompleted(_ context.Context, id primitive.ObjectID, _ time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.markCompErr != nil {
 		return m.markCompErr
 	}
@@ -38,11 +44,25 @@ func (m *mockLedgerTaskStore) MarkCompleted(_ context.Context, id primitive.Obje
 }
 
 func (m *mockLedgerTaskStore) MarkFailed(_ context.Context, id primitive.ObjectID, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.markFailedErr != nil {
 		return m.markFailedErr
 	}
 	m.failedIDs = append(m.failedIDs, id)
 	return nil
+}
+
+func (m *mockLedgerTaskStore) CompletedCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.completedIDs)
+}
+
+func (m *mockLedgerTaskStore) FailedCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.failedIDs)
 }
 
 func TestLedgerRelay_OfflineUnit(t *testing.T) {
@@ -158,6 +178,7 @@ func TestLedgerRelay_OfflineUnit(t *testing.T) {
 }
 
 type mockLeaseManager struct {
+	mu           sync.Mutex
 	holderID     string
 	hasLease     bool
 	acquireErr   error
@@ -167,18 +188,36 @@ type mockLeaseManager struct {
 }
 
 func (m *mockLeaseManager) TryAcquireOrRenew(_ context.Context) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.acquireCalls++
 	return m.hasLease, m.acquireErr
 }
 
 func (m *mockLeaseManager) Release(_ context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.releaseCalls++
 	m.hasLease = false
 	return m.releaseErr
 }
 
 func (m *mockLeaseManager) HolderID() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.holderID
+}
+
+func (m *mockLeaseManager) SetHasLease(val bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.hasLease = val
+}
+
+func (m *mockLeaseManager) ReleaseCalls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.releaseCalls
 }
 
 func TestLedgerRelay_WithLeaseManager_LeaderElection(t *testing.T) {
@@ -212,18 +251,18 @@ func TestLedgerRelay_WithLeaseManager_LeaderElection(t *testing.T) {
 	relay.Start(ctx)
 	time.Sleep(35 * time.Millisecond)
 
-	if len(mockStore.completedIDs) != 0 {
-		t.Errorf("Standby pod should NOT process tasks, completed: %d", len(mockStore.completedIDs))
+	if count := mockStore.CompletedCount(); count != 0 {
+		t.Errorf("Standby pod should NOT process tasks, completed: %d", count)
 	}
 
 	// 2. Transition to Leader
-	lm.hasLease = true
+	lm.SetHasLease(true)
 	time.Sleep(35 * time.Millisecond)
 
 	if !relay.IsLeader() {
 		t.Errorf("Expected relay to transition to leader")
 	}
-	if len(mockStore.completedIDs) == 0 {
+	if count := mockStore.CompletedCount(); count == 0 {
 		t.Errorf("Elected leader should have processed tasks")
 	}
 
@@ -231,7 +270,7 @@ func TestLedgerRelay_WithLeaseManager_LeaderElection(t *testing.T) {
 	relay.Stop()
 	time.Sleep(10 * time.Millisecond)
 
-	if lm.releaseCalls == 0 {
+	if lm.ReleaseCalls() == 0 {
 		t.Errorf("Expected Release to be called on graceful shutdown")
 	}
 }

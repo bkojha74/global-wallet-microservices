@@ -270,6 +270,7 @@ type LedgerRelay struct {
 	logger       observability.Logger
 	cancel       context.CancelFunc
 	leaseManager LeaseManager
+	leaderMu     sync.RWMutex
 	isLeader     bool
 }
 
@@ -302,7 +303,18 @@ func NewLedgerRelay(db *mongo.Database, client ledgerv1.LedgerServiceClient, pol
 
 // IsLeader reports whether this relay instance currently holds the active leadership lease.
 func (r *LedgerRelay) IsLeader() bool {
-	return r.isLeader || r.leaseManager == nil
+	if r.leaseManager == nil {
+		return true
+	}
+	r.leaderMu.RLock()
+	defer r.leaderMu.RUnlock()
+	return r.isLeader
+}
+
+func (r *LedgerRelay) setLeader(leader bool) {
+	r.leaderMu.Lock()
+	r.isLeader = leader
+	r.leaderMu.Unlock()
 }
 
 // DispatchImmediate attempts a synchronous RPC to ledger-service immediately after transaction commit.
@@ -362,15 +374,15 @@ func (r *LedgerRelay) Start(ctx context.Context) {
 						continue
 					}
 					if !hasLease {
-						if r.isLeader {
+						if r.IsLeader() {
 							log.Printf("[LEDGER-RELAY] Lost leadership lease (stepped down to standby)")
-							r.isLeader = false
+							r.setLeader(false)
 						}
 						continue
 					}
-					if !r.isLeader {
+					if !r.IsLeader() {
 						log.Printf("[LEDGER-RELAY] Acquired leadership lease as %s (active worker)", r.leaseManager.HolderID())
-						r.isLeader = true
+						r.setLeader(true)
 					}
 				}
 
@@ -381,7 +393,7 @@ func (r *LedgerRelay) Start(ctx context.Context) {
 				}
 			case <-relayCtx.Done():
 				log.Println("[LEDGER-RELAY] Outbox relay shutting down...")
-				if r.leaseManager != nil && r.isLeader {
+				if r.leaseManager != nil && r.IsLeader() {
 					// #nosec G118 -- shutdown lease release requires detached context since relayCtx is already canceled
 					shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 					_ = r.leaseManager.Release(shutdownCtx)
