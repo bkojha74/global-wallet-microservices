@@ -192,7 +192,7 @@ func (m *MongoRelayLeaseManager) TryAcquireOrRenew(ctx context.Context) (bool, e
 	}
 
 	m.initOnce.Do(func() {
-		initCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		initCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
 		_ = m.ensureDocExists(initCtx)
 	})
@@ -346,6 +346,7 @@ func (r *LedgerRelay) Start(ctx context.Context) {
 	relayCtx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
 
+	// #nosec G118 -- intentional background worker goroutine for relay loop; shutdown uses detached context for lease release
 	go func() {
 		log.Printf("[LEDGER-RELAY] Background outbox relay started (interval: %v, batch: %d)", r.pollInterval, r.batchSize)
 		ticker := time.NewTicker(r.pollInterval)
@@ -381,7 +382,8 @@ func (r *LedgerRelay) Start(ctx context.Context) {
 			case <-relayCtx.Done():
 				log.Println("[LEDGER-RELAY] Outbox relay shutting down...")
 				if r.leaseManager != nil && r.isLeader {
-					shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+					// #nosec G118 -- shutdown lease release requires detached context since relayCtx is already canceled
+					shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 					_ = r.leaseManager.Release(shutdownCtx)
 					shutdownCancel()
 				}
