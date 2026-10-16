@@ -102,15 +102,20 @@ graph TD
 ### Pillar 2: Distributed Caching & Event Bus
 *Focus: Scale `wallet-service` to N horizontal pods with zero stale read hazards.*
 
-- [ ] **DIST-01: AMQP Distributed Cache Invalidation Bus**
-  - [ ] Declare RabbitMQ fanout exchange `wallet.cache.events`.
-  - [ ] Implement publisher in `wallet-service` emitting `balance.invalidated` on balance mutating operations.
-  - [ ] Implement subscriber in `wallet-service` invalidating local `BalanceCache` across all replica pods.
-- [ ] **DIST-02: Pluggable L2 Redis / Dragonfly Cache Backend**
-  - [ ] Implement `DistributedCache` interface supporting either in-memory or Redis backends.
-  - [ ] Add TTL and cache tag invalidation.
-- [ ] **DIST-03: Distributed Outbox Relay Worker Lease**
-  - [ ] Add advisory lock / lease mechanism for `LedgerRelay` to prevent multi-pod polling race conditions on high-scale shards.
+- [x] **DIST-01: AMQP Distributed Cache Invalidation Bus**
+  - [x] Declare RabbitMQ fanout exchange `wallet.cache.events`.
+  - [x] Implement publisher in `wallet-service` emitting `balance.invalidated` on balance mutating operations.
+  - [x] Implement subscriber in `wallet-service` invalidating local `BalanceCache` across all replica pods.
+  - [x] Implement echo suppression via `origin_instance_id`.
+- [x] **DIST-02: Pluggable L2 Redis / Dragonfly Cache Backend**
+  - [x] Implement `DistributedCache` interface supporting in-memory, Redis, or hybrid tiered backends (`pkg/cache/cache.go`, `redis.go`, `tiered.go`).
+  - [x] Add TTL and cache key invalidation with binary protobuf serialization.
+  - [x] Add Docker Compose (`docker-compose.redis.yml`) and Kubernetes manifests (`k8s/13-redis.yaml`).
+- [x] **DIST-03: Distributed Outbox Relay Worker Lease**
+  - [x] Add advisory lock / lease mechanism (`RelayLeaseManager`) in MongoDB (`ledger_relay_lease` collection).
+  - [x] Implement atomic acquisition via `FindOneAndUpdate` with criteria `holder_id = myID OR expires_at < Now()`.
+  - [x] Support graceful shutdown lease release with detached context and thread-safe leader tracking.
+  - [x] Unit and race-condition test suite coverage in `cmd/wallet-service/ledger_outbox_unit_test.go`.
 
 ---
 
@@ -172,3 +177,19 @@ graph TD
 | Autoscaling & Disruption Budgets | `k8s/10-hpa-pdb.yaml` | ✅ Complete |
 | Auth Service Metrics Server | `cmd/auth-service/main.go` | ✅ Complete |
 | Prometheus Scrape Targets | `monitoring/prometheus.yml` | ✅ Complete |
+
+---
+
+## 5. Current Execution Status: Track 2 (Distributed Caching & Invalidation)
+
+| Component / Subsystem | File Path | Status |
+|---|---|:---:|
+| AMQP Invalidation Bus | `pkg/cache/invalidation_bus.go` | ✅ Complete |
+| Pluggable Cache Interface & L1 Memory | `pkg/cache/cache.go`, `pkg/cache/memory.go` | ✅ Complete |
+| L2 Redis Cache Driver | `pkg/cache/redis.go` | ✅ Complete |
+| Tiered L1+L2 Hybrid Orchestrator | `pkg/cache/tiered.go`, `cmd/wallet-service/cache.go` | ✅ Complete |
+| Distributed Outbox Relay Worker Lease | `cmd/wallet-service/ledger_outbox.go` | ✅ Complete |
+| Unit & Data Race Test Suite | `cmd/wallet-service/ledger_outbox_unit_test.go` | ✅ Complete |
+| Redis Local Docker Infrastructure | `docker-compose.redis.yml` | ✅ Complete |
+| Redis Kubernetes Deployment & Service | `k8s/13-redis.yaml` | ✅ Complete |
+| Architectural Documentation | `docs/DISTRIBUTED_CACHING_ARCHITECTURE.md` | ✅ Complete |

@@ -215,6 +215,23 @@ rabbitmq:
     enabled: false
     size: 5Gi
 
+# Distributed L2 Redis Cache
+redis:
+  enabled: true
+  replicas: 1
+  image:
+    repository: redis
+    tag: 7.2-alpine
+  service:
+    port: 6379
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
 # Autoscaling (HPA)
 autoscaling:
   enabled: true
@@ -233,6 +250,8 @@ env:
   environment: "local"
   primaryRegion: "us-east-1"
   standbyRegion: "eu-west-1"
+  walletCacheEnabled: "true"
+  walletCacheBackend: "hybrid"
   jwtIssuer: "global-wallet-platform"
   jwtExpirationHours: "24"
   fxDefaultSpreadBps: "50"

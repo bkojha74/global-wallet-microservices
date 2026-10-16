@@ -25,6 +25,7 @@ graph TD
         
         WPrim -->|AMQP 5672| Rabbit[(RabbitMQ StatefulSet<br/>rabbitmq-0)]
         WPrim -->|TCP 27017| Mongo[(MongoDB rs0<br/>mongodb-0)]
+        WPrim -->|TCP 6379| Redis[(Redis L2 Cache<br/>redis-service)]
         
         Ledger -->|AMQP 5672| Rabbit
         Ledger -->|TCP 27017| Mongo
@@ -49,7 +50,7 @@ graph TD
 
 ## 2. Manifest Inventory (`k8s/`)
 
-The repository contains 12 declarative manifests engineered for production resilience:
+The repository contains 13 declarative manifests engineered for production resilience:
 
 | Manifest | Kind | Components & Responsibilities |
 |---|---|---|
@@ -66,6 +67,7 @@ The repository contains 12 declarative manifests engineered for production resil
 | [k8s/10-hpa-pdb.yaml](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/k8s/10-hpa-pdb.yaml) | `HorizontalPodAutoscaler`, `PodDisruptionBudget` | Auto-scaling (CPU > 75%) and disruption protection during node maintenance. |
 | [k8s/11-auth-service.yaml](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/k8s/11-auth-service.yaml) | `ConfigMap`, `Deployment`, `Service` | Keycloak IAM with realm import + Go `auth-service` (OAuth2/OIDC). |
 | [k8s/12-fx-service.yaml](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/k8s/12-fx-service.yaml) | `Deployment`, `Service` | Multi-currency FX engine with rate caching and circuit breakers. |
+| [k8s/13-redis.yaml](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/k8s/13-redis.yaml) | `Deployment`, `Service` | Distributed L2 in-memory cache for multi-pod balance caching and tiering. |
 
 ---
 
@@ -131,6 +133,7 @@ kubectl apply -f k8s/09-configmap-secrets.yaml
 # 3. Deploy Stateful Infrastructure
 kubectl apply -f k8s/02-mongodb.yaml
 kubectl apply -f k8s/03-rabbitmq.yaml
+kubectl apply -f k8s/13-redis.yaml
 
 # 4. Deploy Keycloak & Auth Service
 kubectl apply -f k8s/11-auth-service.yaml
