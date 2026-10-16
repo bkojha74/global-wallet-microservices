@@ -206,3 +206,127 @@ func TestServer_TransferSuccess_InvalidatesCache(t *testing.T) {
 		t.Errorf("expected 2 invalidations, got %d", invalids)
 	}
 }
+
+type fakeBusForTest struct {
+	subscribers []func(walletIDs []string)
+}
+
+func (f *fakeBusForTest) PublishInvalidation(_ context.Context, walletIDs ...string) error {
+	for _, sub := range f.subscribers {
+		sub(walletIDs)
+	}
+	return nil
+}
+
+func (f *fakeBusForTest) Subscribe(_ context.Context, onInvalidate func(walletIDs []string)) error {
+	f.subscribers = append(f.subscribers, onInvalidate)
+	return nil
+}
+
+func (f *fakeBusForTest) Close() error {
+	return nil
+}
+
+func TestBalanceCache_MultiPodInvalidationBus(t *testing.T) {
+	sharedBus := &fakeBusForTest{}
+
+	// Pod A and Pod B join the same invalidation bus
+	podA := NewBalanceCache(10*time.Second, 100, "pod-a", WithInvalidationBus(sharedBus))
+	defer podA.Close()
+
+	podB := NewBalanceCache(10*time.Second, 100, "pod-b", WithInvalidationBus(sharedBus))
+	defer podB.Close()
+
+	// Both pods cache balance for "user_shared"
+	resp := &walletv1.GetBalanceResponse{
+		WalletId: "user_shared",
+		Balances: []*walletv1.Money{{Currency: "USD", Units: 5000}},
+		Status:   "ACTIVE",
+	}
+	podA.Set("user_shared", resp)
+	podB.Set("user_shared", resp)
+
+	if _, hit := podA.Get("user_shared"); !hit {
+		t.Fatal("expected podA to hit cache")
+	}
+	if _, hit := podB.Get("user_shared"); !hit {
+		t.Fatal("expected podB to hit cache")
+	}
+
+	// Mutation occurs on Pod A -> Pod A invalidates
+	podA.Invalidate("user_shared")
+
+	// Pod A is evicted
+	if _, hit := podA.Get("user_shared"); hit {
+		t.Fatal("expected podA to be evicted")
+	}
+
+	// Pod B must also be evicted automatically via the bus broadcast!
+	if _, hit := podB.Get("user_shared"); hit {
+		t.Fatal("expected podB to be evicted via distributed invalidation bus broadcast")
+	}
+}
+
+type fakeL2ForTest struct {
+	mu    sync.RWMutex
+	items map[string]*walletv1.GetBalanceResponse
+}
+
+func (f *fakeL2ForTest) Get(_ context.Context, walletID string) (*walletv1.GetBalanceResponse, bool, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	item, ok := f.items[walletID]
+	return item, ok, nil
+}
+
+func (f *fakeL2ForTest) Set(_ context.Context, walletID string, resp *walletv1.GetBalanceResponse, _ time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.items[walletID] = resp
+	return nil
+}
+
+func (f *fakeL2ForTest) Invalidate(_ context.Context, walletIDs ...string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, id := range walletIDs {
+		delete(f.items, id)
+	}
+	return nil
+}
+
+func (f *fakeL2ForTest) Close() error {
+	return nil
+}
+
+func TestBalanceCache_L2FallbackAndBackfill(t *testing.T) {
+	l2 := &fakeL2ForTest{items: make(map[string]*walletv1.GetBalanceResponse)}
+	l2.items["l2_wallet"] = &walletv1.GetBalanceResponse{
+		WalletId: "l2_wallet",
+		Balances: []*walletv1.Money{{Currency: "EUR", Units: 3300}},
+		Status:   "ACTIVE",
+	}
+
+	c := NewBalanceCache(10*time.Second, 100, "test-l2", WithL2Cache(l2))
+	defer c.Close()
+
+	// Initial query misses L1, hits L2, and backfills L1
+	resp, hit := c.Get("l2_wallet")
+	if !hit || resp == nil || resp.Balances[0].Units != 3300 {
+		t.Fatalf("expected hit from L2 fallback, got hit=%v resp=%v", hit, resp)
+	}
+
+	// Delete from L2 directly to prove subsequent query hits L1 local backfill
+	delete(l2.items, "l2_wallet")
+
+	respL1, hitL1 := c.Get("l2_wallet")
+	if !hitL1 || respL1 == nil || respL1.Balances[0].Units != 3300 {
+		t.Fatal("expected L1 backfill hit even after L2 key deletion")
+	}
+
+	// Calling Invalidate clears both L1 and L2
+	c.Invalidate("l2_wallet")
+	if _, hit := c.Get("l2_wallet"); hit {
+		t.Fatal("expected miss after Invalidate")
+	}
+}
