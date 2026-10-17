@@ -332,4 +332,3 @@ func TestLedgerRelay_CalculateBackoff(t *testing.T) {
 		t.Errorf("Expected pollInterval when maxBackoff <= pollInterval, got %v", b)
 	}
 }
-
