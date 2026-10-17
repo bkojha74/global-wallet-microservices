@@ -54,13 +54,12 @@ The repository contains 13 declarative manifests engineered for production resil
 
 | Manifest | Kind | Components & Responsibilities |
 |---|---|---|
-| [k8s/00-namespace.yaml](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/k8s/00-namespace.yaml) | `Namespace` | Creates the isolated `banking-system` namespace. |
-| [k8s/01-rbac.yaml](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/k8s/01-rbac.yaml) | `ServiceAccount`, `Role`, `RoleBinding` | Least-privilege RBAC for pod management and gateway routing. |
+| [k8s/01-namespace.yaml](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/k8s/01-namespace.yaml) | `Namespace` | Creates the isolated `banking-system` namespace. |
 | [k8s/02-mongodb.yaml](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/k8s/02-mongodb.yaml) | `StatefulSet`, `Service` | Headless MongoDB cluster with automated `rs0` replica-set initiation sidecar. |
-| [k8s/03-rabbitmq.yaml](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/k8s/03-rabbitmq.yaml) | `StatefulSet`, `Service` | RabbitMQ event broker with management interface on port `15672`. |
+| [k8s/03-ledger-service.yaml](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/k8s/03-ledger-service.yaml) | `Deployment`, `Service` | Immutable transaction ledger with gRPC port `50052`. |
 | [k8s/04-wallet-services.yaml](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/k8s/04-wallet-services.yaml) | `Deployment`, `Service` | `wallet-primary` (Active) & `wallet-standby` (Hot Standby) deployments. |
 | [k8s/05-api-gateway.yaml](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/k8s/05-api-gateway.yaml) | `Deployment`, `Service` | Dual-replica HTTP API Gateway exposed via NodePort `30080`. |
-| [k8s/06-ledger-service.yaml](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/k8s/06-ledger-service.yaml) | `Deployment`, `Service` | Immutable transaction ledger with gRPC port `50052`. |
+| [k8s/06-rabbitmq.yaml](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/k8s/06-rabbitmq.yaml) | `StatefulSet`, `Service` | RabbitMQ event broker with management interface on port `15672`. |
 | [k8s/07-logging-service.yaml](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/k8s/07-logging-service.yaml) | `Deployment`, `Service` | Central audit logging engine with REST port `8090`. |
 | [k8s/08-ingress.yaml](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/k8s/08-ingress.yaml) | `Ingress` | NGINX routing rules for `/api/v1`, `/auth`, `/realms`, and `/api/v1/fx`. |
 | [k8s/09-configmap-secrets.yaml](file:///c:/workarea/personal/After-equifax/global-wallet-microservices/k8s/09-configmap-secrets.yaml) | `ConfigMap`, `Secret` | Injects JWT keys, DB URIs, and service discovery environment variables. |
@@ -123,24 +122,23 @@ make k8s-status
 
 ### Method C: Manual Step-by-Step Deployment
 ```powershell
-# 1. Create Namespace & RBAC
-kubectl apply -f k8s/00-namespace.yaml
-kubectl apply -f k8s/01-rbac.yaml
+# 1. Create Namespace
+kubectl apply -f k8s/01-namespace.yaml
 
 # 2. Apply ConfigMaps and Secrets
 kubectl apply -f k8s/09-configmap-secrets.yaml
 
 # 3. Deploy Stateful Infrastructure
 kubectl apply -f k8s/02-mongodb.yaml
-kubectl apply -f k8s/03-rabbitmq.yaml
+kubectl apply -f k8s/06-rabbitmq.yaml
 kubectl apply -f k8s/13-redis.yaml
 
 # 4. Deploy Keycloak & Auth Service
 kubectl apply -f k8s/11-auth-service.yaml
 
 # 5. Deploy Core Microservices
+kubectl apply -f k8s/03-ledger-service.yaml
 kubectl apply -f k8s/04-wallet-services.yaml
-kubectl apply -f k8s/06-ledger-service.yaml
 kubectl apply -f k8s/07-logging-service.yaml
 kubectl apply -f k8s/12-fx-service.yaml
 
