@@ -2,10 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"log"
 	"math"
-	"math/rand/v2"
+	"math/big"
 	"sync"
 	"time"
 
@@ -341,8 +342,13 @@ func (r *LedgerRelay) CalculateBackoff(consecutiveErrors int) time.Duration {
 	if jitterRange <= 0 {
 		return r.pollInterval
 	}
-	jitter := rand.Float64() * jitterRange
-	return r.pollInterval + time.Duration(jitter)
+	// Use cryptographically secure random number generator (CWE-338 compliant)
+	maxBig := big.NewInt(int64(jitterRange))
+	n, err := rand.Int(rand.Reader, maxBig)
+	if err != nil {
+		return r.pollInterval
+	}
+	return r.pollInterval + time.Duration(n.Int64())
 }
 
 // IsLeader reports whether this relay instance currently holds the active leadership lease.
