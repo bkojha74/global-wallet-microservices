@@ -272,3 +272,67 @@ func TestFXScaleAwareQuoteCreation(t *testing.T) {
 		t.Fatalf("expected 3760 BHD fils for 1000 USD cents at 0.376 rate, got %d", quoteBHD.TargetAmount)
 	}
 }
+
+func TestCompositeRateProvider_StaleFallback(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Mock failing provider
+	failingSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusGatewayTimeout)
+	}))
+	defer failingSrv.Close()
+
+	comp := &CompositeRateProvider{
+		Providers: []RateProvider{
+			NewFrankfurterProvider(failingSrv.URL, 500*time.Millisecond),
+		},
+		Fallback: &BaselineProvider{},
+	}
+
+	// Case A: No previous live snapshot: returns baseline marked as StaleQuote
+	snapA, err := comp.FetchRates(ctx, "USD")
+	if err != nil {
+		t.Fatalf("expected fallback to succeed, got %v", err)
+	}
+	if !snapA.StaleQuote {
+		t.Fatalf("expected StaleQuote: true on fallback")
+	}
+	if snapA.ProviderName != "institutional-baseline" {
+		t.Fatalf("expected institutional-baseline, got %s", snapA.ProviderName)
+	}
+
+	// Case B: Previous live snapshot was cached: returns last-known good snapshot marked as StaleQuote
+	prevObserved := time.Now().Add(-10 * time.Minute)
+	comp.SetLastGoodSnapshot(&RateSnapshot{
+		BaseCurrency: "USD",
+		Rates: map[string]float64{
+			"USD": 1.0,
+			"EUR": 0.955, // distinct rate
+			"GBP": 0.812,
+		},
+		ProviderName: "frankfurter-ecb",
+		FetchedAt:    prevObserved,
+	})
+
+	snapB, err := comp.FetchRates(ctx, "USD")
+	if err != nil {
+		t.Fatalf("expected fallback to cached snapshot, got %v", err)
+	}
+	if !snapB.StaleQuote {
+		t.Fatalf("expected StaleQuote: true when falling back to cached snapshot")
+	}
+	if !strings.HasPrefix(snapB.ProviderName, "stale-fallback:") {
+		t.Fatalf("expected provider to be prefixed with stale-fallback:, got %s", snapB.ProviderName)
+	}
+	if snapB.Rates["EUR"] != 0.955 {
+		t.Fatalf("expected cached EUR rate 0.955, got %f", snapB.Rates["EUR"])
+	}
+
+	// Verify Prometheus handler exposes fx_provider_degraded_total
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	observability.DefaultMetrics.Handler().ServeHTTP(rec, req)
+	if !strings.Contains(rec.Body.String(), "fx_provider_degraded_total") {
+		t.Fatalf("expected /metrics to include fx_provider_degraded_total")
+	}
+}

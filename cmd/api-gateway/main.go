@@ -28,6 +28,7 @@ import (
 	"wallet-system/pkg/coordinator"
 	"wallet-system/pkg/db"
 	"wallet-system/pkg/observability"
+	"wallet-system/pkg/resilience"
 	"wallet-system/pkg/tlsutil"
 	authv1 "wallet-system/proto/auth"
 	fxv1 "wallet-system/proto/fx"
@@ -1160,36 +1161,43 @@ func runGatewayServer(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize gRPC dial credentials: %w", err)
 	}
-	dialOpts := []grpc.DialOption{
-		dialOpt,
-		grpc.WithUnaryInterceptor(observability.UnaryClientTraceInterceptor(apiGatewayServiceName)),
+
+	makeDialOpts := func(serviceName string) []grpc.DialOption {
+		cb := resilience.NewClientCircuitBreaker(resilience.DefaultCircuitBreakerConfig(serviceName))
+		return []grpc.DialOption{
+			dialOpt,
+			grpc.WithChainUnaryInterceptor(
+				observability.UnaryClientTraceInterceptor(apiGatewayServiceName),
+				resilience.UnaryClientCircuitBreakerInterceptor(cb),
+			),
+		}
 	}
 
-	aConn, err := grpc.NewClient(authAddr, dialOpts...)
+	aConn, err := grpc.NewClient(authAddr, makeDialOpts("auth-service")...)
 	if err != nil {
 		return fmt.Errorf("failed to dial auth-service: %w", err)
 	}
 	defer aConn.Close()
 
-	pConn, err := grpc.NewClient(primaryAddr, dialOpts...)
+	pConn, err := grpc.NewClient(primaryAddr, makeDialOpts("wallet-primary")...)
 	if err != nil {
 		return fmt.Errorf("failed to dial primary wallet: %w", err)
 	}
 	defer pConn.Close()
 
-	sConn, err := grpc.NewClient(standbyAddr, dialOpts...)
+	sConn, err := grpc.NewClient(standbyAddr, makeDialOpts("wallet-standby")...)
 	if err != nil {
 		return fmt.Errorf("failed to dial standby wallet: %w", err)
 	}
 	defer sConn.Close()
 
-	lConn, err := grpc.NewClient(ledgerAddr, dialOpts...)
+	lConn, err := grpc.NewClient(ledgerAddr, makeDialOpts("ledger-service")...)
 	if err != nil {
 		return fmt.Errorf("failed to dial ledger: %w", err)
 	}
 	defer lConn.Close()
 
-	fxConn, fxErr := grpc.NewClient(fxAddr, dialOpts...)
+	fxConn, fxErr := grpc.NewClient(fxAddr, makeDialOpts("fx-service")...)
 	var fxClient fxv1.FXServiceClient
 	if fxErr == nil {
 		defer fxConn.Close()
