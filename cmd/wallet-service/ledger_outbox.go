@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -259,13 +261,24 @@ func WithLeaseManager(lm LeaseManager) RelayOption {
 	}
 }
 
+// WithMaxBackoff configures the maximum exponential backoff limit when errors occur.
+func WithMaxBackoff(d time.Duration) RelayOption {
+	return func(r *LedgerRelay) {
+		if d > 0 {
+			r.maxBackoff = d
+		}
+	}
+}
+
 // LedgerRelay polls pending ledger tasks and guarantees reliable asynchronous delivery
 // to the Ledger Service. When running with a LeaseManager, only the elected leader pod processes outbox tasks.
+// If downstream errors occur, it backs off exponentially with full randomized jitter.
 type LedgerRelay struct {
 	col          *mongo.Collection
 	store        LedgerTaskStore
 	ledgerClient ledgerv1.LedgerServiceClient
 	pollInterval time.Duration
+	maxBackoff   time.Duration
 	batchSize    int64
 	logger       observability.Logger
 	cancel       context.CancelFunc
@@ -290,6 +303,7 @@ func NewLedgerRelay(db *mongo.Database, client ledgerv1.LedgerServiceClient, pol
 		store:        &mongoLedgerTaskStore{col: col},
 		ledgerClient: client,
 		pollInterval: pollInterval,
+		maxBackoff:   30 * time.Second,
 		batchSize:    batchSize,
 		logger:       logger,
 	}
@@ -299,6 +313,36 @@ func NewLedgerRelay(db *mongo.Database, client ledgerv1.LedgerServiceClient, pol
 		}
 	}
 	return r
+}
+
+// CalculateBackoff computes the next polling interval using full-jitter exponential backoff:
+// interval = pollInterval + rand(0, min(maxBackoff, pollInterval * 2^(consecutiveErrors-1)) - pollInterval)
+func (r *LedgerRelay) CalculateBackoff(consecutiveErrors int) time.Duration {
+	if consecutiveErrors <= 0 {
+		return r.pollInterval
+	}
+	maxBackoff := r.maxBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = 30 * time.Second
+	}
+	if maxBackoff <= r.pollInterval {
+		return r.pollInterval
+	}
+
+	// Calculate exponential cap: pollInterval * 2^(consecutiveErrors-1)
+	multiplier := math.Pow(2, float64(consecutiveErrors-1))
+	capInterval := float64(r.pollInterval) * multiplier
+	if capInterval > float64(maxBackoff) {
+		capInterval = float64(maxBackoff)
+	}
+
+	// Full jitter: uniformly random delay in range [pollInterval, capInterval]
+	jitterRange := capInterval - float64(r.pollInterval)
+	if jitterRange <= 0 {
+		return r.pollInterval
+	}
+	jitter := rand.Float64() * jitterRange
+	return r.pollInterval + time.Duration(jitter)
 }
 
 // IsLeader reports whether this relay instance currently holds the active leadership lease.
@@ -360,37 +404,57 @@ func (r *LedgerRelay) Start(ctx context.Context) {
 
 	// #nosec G118 -- intentional background worker goroutine for relay loop; shutdown uses detached context for lease release
 	go func() {
-		log.Printf("[LEDGER-RELAY] Background outbox relay started (interval: %v, batch: %d)", r.pollInterval, r.batchSize)
-		ticker := time.NewTicker(r.pollInterval)
-		defer ticker.Stop()
+		log.Printf("[LEDGER-RELAY] Background outbox relay started (interval: %v, maxBackoff: %v, batch: %d)", r.pollInterval, r.maxBackoff, r.batchSize)
+		timer := time.NewTimer(r.pollInterval)
+		defer timer.Stop()
+
+		consecutiveFailures := 0
 
 		for {
 			select {
-			case <-ticker.C:
+			case <-timer.C:
+				hadError := false
+
 				if r.leaseManager != nil {
 					hasLease, err := r.leaseManager.TryAcquireOrRenew(relayCtx)
 					if err != nil {
 						log.Printf("[LEDGER-RELAY] Warning: lease election check error: %v", err)
-						continue
-					}
-					if !hasLease {
+						hadError = true
+					} else if !hasLease {
 						if r.IsLeader() {
 							log.Printf("[LEDGER-RELAY] Lost leadership lease (stepped down to standby)")
 							r.setLeader(false)
 						}
-						continue
-					}
-					if !r.IsLeader() {
-						log.Printf("[LEDGER-RELAY] Acquired leadership lease as %s (active worker)", r.leaseManager.HolderID())
-						r.setLeader(true)
+					} else {
+						if !r.IsLeader() {
+							log.Printf("[LEDGER-RELAY] Acquired leadership lease as %s (active worker)", r.leaseManager.HolderID())
+							r.setLeader(true)
+						}
 					}
 				}
 
-				if count, err := r.ProcessBatch(relayCtx); err != nil {
-					log.Printf("[LEDGER-RELAY] Error processing batch: %v", err)
-				} else if count > 0 {
-					log.Printf("[LEDGER-RELAY] Relayed %d pending ledger entries successfully", count)
+				if !hadError && r.IsLeader() {
+					count, err := r.ProcessBatch(relayCtx)
+					if err != nil {
+						log.Printf("[LEDGER-RELAY] Error processing batch: %v", err)
+						hadError = true
+					} else if count > 0 {
+						log.Printf("[LEDGER-RELAY] Relayed %d pending ledger entries successfully", count)
+					}
 				}
+
+				var nextInterval time.Duration
+				if hadError {
+					consecutiveFailures++
+					nextInterval = r.CalculateBackoff(consecutiveFailures)
+					log.Printf("[LEDGER-RELAY] Backing off outbox polling for %v (consecutive failures: %d)", nextInterval, consecutiveFailures)
+				} else {
+					consecutiveFailures = 0
+					nextInterval = r.pollInterval
+				}
+
+				timer.Reset(nextInterval)
+
 			case <-relayCtx.Done():
 				log.Println("[LEDGER-RELAY] Outbox relay shutting down...")
 				if r.leaseManager != nil && r.IsLeader() {
@@ -424,6 +488,8 @@ func (r *LedgerRelay) ProcessBatch(ctx context.Context) (int, error) {
 	}
 
 	processedCount := 0
+	failedCount := 0
+	var lastErr string
 	for _, task := range tasks {
 		callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		resp, err := r.ledgerClient.RecordTransaction(callCtx, &ledgerv1.RecordTransactionRequest{
@@ -449,6 +515,8 @@ func (r *LedgerRelay) ProcessBatch(ctx context.Context) (int, error) {
 			} else if resp != nil {
 				errMsg = resp.ErrorMessage
 			}
+			lastErr = errMsg
+			failedCount++
 			log.Printf("[LEDGER-RELAY] Failed to dispatch task %s (idemp: %s): %s", task.ID.Hex(), task.IdempotencyKey, errMsg)
 
 			_ = r.store.MarkFailed(ctx, task.ID, errMsg)
@@ -459,6 +527,10 @@ func (r *LedgerRelay) ProcessBatch(ctx context.Context) (int, error) {
 		if updateErr == nil {
 			processedCount++
 		}
+	}
+
+	if failedCount > 0 {
+		return processedCount, fmt.Errorf("failed to dispatch %d ledger tasks (last error: %s)", failedCount, lastErr)
 	}
 
 	return processedCount, nil

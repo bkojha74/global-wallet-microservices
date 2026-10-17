@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"wallet-system/pkg/db"
+	"wallet-system/pkg/observability"
 )
 
 // RateSnapshot represents a point-in-time set of mid-market exchange rates anchored to BaseCurrency.
@@ -20,6 +22,7 @@ type RateSnapshot struct {
 	Rates        map[string]float64 `json:"rates"`
 	ProviderName string             `json:"provider_name"`
 	FetchedAt    time.Time          `json:"fetched_at"`
+	StaleQuote   bool               `json:"stale_quote,omitempty"`
 }
 
 // RateProvider defines the contract for upstream 3rd-party Foreign Exchange rate feeds.
@@ -257,9 +260,13 @@ func (b *BaselineProvider) FetchRates(_ context.Context, baseCurrency string) (*
 
 // CompositeRateProvider chains multiple 3rd-party FX providers in priority order,
 // merging live market rates with institutional baseline coverage for pegged currencies.
+// If all live providers fail or time out, it returns the last-known good rate snapshot
+// marked with StaleQuote: true and emits Prometheus metric fx_provider_degraded_total.
 type CompositeRateProvider struct {
-	Providers []RateProvider
-	Fallback  *BaselineProvider
+	mu           sync.RWMutex
+	Providers    []RateProvider
+	Fallback     *BaselineProvider
+	lastGoodSnap *RateSnapshot
 }
 
 func NewCompositeRateProviderFromEnv() *CompositeRateProvider {
@@ -297,6 +304,13 @@ func (c *CompositeRateProvider) Name() string {
 	return "composite-3rd-party-fx"
 }
 
+// SetLastGoodSnapshot sets the last-known good snapshot (used by tests and cache backfills).
+func (c *CompositeRateProvider) SetLastGoodSnapshot(snap *RateSnapshot) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastGoodSnap = snap
+}
+
 func (c *CompositeRateProvider) FetchRates(ctx context.Context, baseCurrency string) (*RateSnapshot, error) {
 	baseSnap, _ := c.Fallback.FetchRates(ctx, baseCurrency)
 	merged := make(map[string]float64, len(baseSnap.Rates))
@@ -306,33 +320,76 @@ func (c *CompositeRateProvider) FetchRates(ctx context.Context, baseCurrency str
 
 	var activeProvider string
 	var fetchedAt time.Time
+	var lastErr error
 
 	for _, p := range c.Providers {
 		snap, err := p.FetchRates(ctx, baseCurrency)
 		if err != nil {
 			log.Printf("[FX-PROVIDER] Provider %s failed: %v (trying next fallback)", p.Name(), err)
+			lastErr = err
 			continue
 		}
-		for curr, rate := range snap.Rates {
-			if db.IsValidCurrency(curr) && rate > 0 {
-				merged[curr] = rate
+		if snap != nil && len(snap.Rates) > 0 {
+			for curr, rate := range snap.Rates {
+				if db.IsValidCurrency(curr) && rate > 0 {
+					merged[curr] = rate
+				}
 			}
+			activeProvider = snap.ProviderName
+			fetchedAt = snap.FetchedAt
+			log.Printf("[FX-PROVIDER] Successfully synced live FX rates from 3rd-party provider: %s (%d currencies)", activeProvider, len(snap.Rates))
+			break
 		}
-		activeProvider = snap.ProviderName
-		fetchedAt = snap.FetchedAt
-		log.Printf("[FX-PROVIDER] Successfully synced live FX rates from 3rd-party provider: %s (%d currencies)", activeProvider, len(snap.Rates))
-		break
 	}
 
-	if activeProvider == "" {
-		activeProvider = baseSnap.ProviderName
-		fetchedAt = baseSnap.FetchedAt
+	if activeProvider != "" {
+		clonedRates := make(map[string]float64, len(merged))
+		for k, v := range merged {
+			clonedRates[k] = v
+		}
+		res := &RateSnapshot{
+			BaseCurrency: baseSnap.BaseCurrency,
+			Rates:        clonedRates,
+			ProviderName: activeProvider,
+			FetchedAt:    fetchedAt,
+			StaleQuote:   false,
+		}
+		c.mu.Lock()
+		c.lastGoodSnap = res
+		c.mu.Unlock()
+		return res, nil
 	}
 
+	// All live providers failed or timed out: check for last-known good rate snapshot fallback
+	c.mu.RLock()
+	lastGood := c.lastGoodSnap
+	c.mu.RUnlock()
+
+	observability.DefaultMetrics.IncFXProviderDegraded("composite-3rd-party-fx", "upstream_error")
+
+	if lastGood != nil {
+		log.Printf("[FX-PROVIDER] Warning: All live 3rd-party rate providers failed (%v); returning last-known good rates (stale_quote: true, observed at: %s)",
+			lastErr, lastGood.FetchedAt.Format(time.RFC3339))
+		staleMerged := make(map[string]float64, len(lastGood.Rates))
+		for k, v := range lastGood.Rates {
+			staleMerged[k] = v
+		}
+		return &RateSnapshot{
+			BaseCurrency: lastGood.BaseCurrency,
+			Rates:        staleMerged,
+			ProviderName: fmt.Sprintf("stale-fallback:%s", lastGood.ProviderName),
+			FetchedAt:    lastGood.FetchedAt,
+			StaleQuote:   true,
+		}, nil
+	}
+
+	// No previous live snapshot available; fallback to institutional baseline
+	log.Printf("[FX-PROVIDER] Warning: No previous live snapshot available; falling back to institutional baseline rates (%v)", lastErr)
 	return &RateSnapshot{
 		BaseCurrency: baseSnap.BaseCurrency,
 		Rates:        merged,
-		ProviderName: activeProvider,
-		FetchedAt:    fetchedAt,
+		ProviderName: baseSnap.ProviderName,
+		FetchedAt:    baseSnap.FetchedAt,
+		StaleQuote:   true,
 	}, nil
 }

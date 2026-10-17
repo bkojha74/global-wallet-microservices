@@ -122,14 +122,14 @@ graph TD
 ### Pillar 3: Resilience, Circuit Breaking & Graceful Fallback
 *Focus: Prevent cascade failures across network boundaries.*
 
-- [ ] **RES-01: Circuit Breaker Interceptors (`sony/gobreaker`)**
-  - [ ] Add client-side circuit breaking to API Gateway dials for Wallet, FX, and Auth.
-  - [ ] Add circuit breaking to `wallet-service` for `ledger-service` and `fx-service` calls.
-- [ ] **RES-02: Resilient FX Rate Stale Fallback**
-  - [ ] If upstream rate providers (Frankfurter/ECB) fail or timeout, return last-known good rate marked with `stale_quote: true`.
-  - [ ] Log warning and emit Prometheus metric `fx_provider_degraded_total`.
-- [ ] **RES-03: Outbox Relay Exponential Backoff with Jitter**
-  - [ ] Enhance outbox retry loop with full-jitter exponential backoff on consecutive ledger gRPC errors.
+- [x] **RES-01: Circuit Breaker Interceptors (`sony/gobreaker`)**
+  - [x] Add client-side circuit breaking to API Gateway dials for Wallet (Primary & Standby), FX, Ledger, and Auth.
+  - [x] Add circuit breaking to `wallet-service` for `ledger-service` and `fx-service` calls.
+- [x] **RES-02: Resilient FX Rate Stale Fallback**
+  - [x] If upstream rate providers (Frankfurter/ECB) fail or timeout, return last-known good rate marked with `stale_quote: true`.
+  - [x] Log warning and emit Prometheus metric `fx_provider_degraded_total`.
+- [x] **RES-03: Outbox Relay Exponential Backoff with Jitter**
+  - [x] Enhance outbox retry loop with full-jitter exponential backoff on consecutive ledger gRPC errors.
 
 ---
 
@@ -193,3 +193,20 @@ graph TD
 | Redis Local Docker Infrastructure | `docker-compose.redis.yml` | ✅ Complete |
 | Redis Kubernetes Deployment & Service | `k8s/13-redis.yaml` | ✅ Complete |
 | Architectural Documentation | `docs/DISTRIBUTED_CACHING_ARCHITECTURE.md` | ✅ Complete |
+
+---
+
+## 6. Current Execution Status: Track 3 (Resilience, Circuit Breaking & Graceful Fallback)
+
+| Component / Subsystem | File Path | Status |
+|---|---|:---:|
+| GoBreaker Circuit Breaker Interceptor | `pkg/resilience/circuit_breaker.go` | ✅ Complete |
+| Circuit Breaker Unit & Race Suite | `pkg/resilience/circuit_breaker_test.go` | ✅ Complete |
+| API Gateway Dials Circuit Breaker (Auth, Wallet, FX, Ledger) | `cmd/api-gateway/main.go` | ✅ Complete |
+| Wallet Service Downstream Breakers (Ledger, FX) | `cmd/wallet-service/main.go` | ✅ Complete |
+| Resilient FX Stale Fallback Engine & StaleQuote Flag | `cmd/fx-service/provider.go` | ✅ Complete |
+| Prometheus Metric (`fx_provider_degraded_total`) | `pkg/observability/metrics.go` | ✅ Complete |
+| FX Stale Fallback Unit & Race Suite | `cmd/fx-service/main_test.go` | ✅ Complete |
+| Outbox Relay Full-Jitter Exponential Backoff | `cmd/wallet-service/ledger_outbox.go` | ✅ Complete |
+| Outbox Backoff Unit & Race Test Suite | `cmd/wallet-service/ledger_outbox_unit_test.go` | ✅ Complete |
+
