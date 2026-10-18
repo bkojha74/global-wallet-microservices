@@ -533,8 +533,10 @@ func (s *server) validateTransferRequest(ctx context.Context, req *walletv1.Tran
 					"reason":     decision.Reason,
 				})
 			if s.webhookDispatcher != nil {
+				bgCtx := context.WithoutCancel(ctx)
+				// #nosec G118 -- asynchronous webhook dispatch must decouple from request context cancellation
 				go func() {
-					_ = s.webhookDispatcher.Dispatch(context.Background(), webhook.EventFraudFlagged, map[string]any{
+					_ = s.webhookDispatcher.Dispatch(bgCtx, webhook.EventFraudFlagged, map[string]any{
 						"idempotency_key":       req.IdempotencyKey,
 						"source_wallet_id":      req.SourceWalletId,
 						"destination_wallet_id": req.DestinationWalletId,

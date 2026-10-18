@@ -401,8 +401,10 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 
 	if isSuccess {
 		if d := g.getWebhookDispatcher(); d != nil {
+			bgCtx := context.WithoutCancel(r.Context())
+			// #nosec G118 -- asynchronous webhook dispatch must decouple from HTTP request context cancellation
 			go func() {
-				_ = d.Dispatch(context.Background(), webhook.EventTransferCompleted, map[string]interface{}{
+				_ = d.Dispatch(bgCtx, webhook.EventTransferCompleted, map[string]interface{}{
 					"transaction_id":        resp.TransactionId,
 					"source_wallet_id":      protoReq.SourceWalletId,
 					"destination_wallet_id": protoReq.DestinationWalletId,
@@ -872,8 +874,10 @@ func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWal
 	})
 
 	if d := g.getWebhookDispatcher(); d != nil {
+		bgCtx := context.WithoutCancel(r.Context())
+		// #nosec G118 -- asynchronous webhook dispatch must decouple from HTTP request context cancellation
 		go func() {
-			_ = d.Dispatch(context.Background(), webhook.EventDepositCompleted, map[string]interface{}{
+			_ = d.Dispatch(bgCtx, webhook.EventDepositCompleted, map[string]interface{}{
 				"transaction_id":     resp.TransactionId,
 				"wallet_id":          walletID,
 				"amount":             resp.GetCreditedAmount().GetUnits(),
@@ -1041,8 +1045,10 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 	})
 
 	if d := g.getWebhookDispatcher(); d != nil {
+		bgCtx := context.WithoutCancel(r.Context())
+		// #nosec G118 -- asynchronous webhook dispatch must decouple from HTTP request context cancellation
 		go func() {
-			_ = d.Dispatch(context.Background(), webhook.EventWithdrawalCompleted, map[string]interface{}{
+			_ = d.Dispatch(bgCtx, webhook.EventWithdrawalCompleted, map[string]interface{}{
 				"transaction_id":      resp.TransactionId,
 				"wallet_id":           walletID,
 				"amount":              resp.GetDebitedAmount().GetUnits(),
