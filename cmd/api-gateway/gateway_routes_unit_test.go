@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"wallet-system/pkg/coordinator"
+	"wallet-system/pkg/webhook"
 	walletv1 "wallet-system/proto/wallet"
 )
 
@@ -529,5 +530,120 @@ func TestHandleWithdrawFunds_Routes(t *testing.T) {
 	gw.handleWalletSubroutes(wSubroute, reqSubroute)
 	if wSubroute.Code != http.StatusOK {
 		t.Fatalf("expected 200 for subroute withdraw, got %d (%s)", wSubroute.Code, wSubroute.Body.String())
+	}
+}
+
+func TestHandleWebhookSubscriptions(t *testing.T) {
+	dispatcher := webhook.NewDispatcher(nil, nil)
+	gw := &Gateway{
+		webhookDispatcher: dispatcher,
+	}
+
+	// 1. Method Not Allowed (PUT)
+	reqPut := httptest.NewRequest(http.MethodPut, "/api/v1/webhooks/subscriptions", nil)
+	wPut := httptest.NewRecorder()
+	gw.handleWebhookSubscriptions(wPut, reqPut)
+	if wPut.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for PUT, got %d", wPut.Code)
+	}
+
+	// 2. POST with invalid json
+	reqBadJSON := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/subscriptions", bytes.NewBufferString(`{invalid`))
+	wBadJSON := httptest.NewRecorder()
+	gw.handleWebhookSubscriptions(wBadJSON, reqBadJSON)
+	if wBadJSON.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for bad JSON, got %d", wBadJSON.Code)
+	}
+
+	// 3. POST with invalid url
+	reqBadURL := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/subscriptions", bytes.NewBufferString(`{"target_url":"not-a-valid-url"}`))
+	wBadURL := httptest.NewRecorder()
+	gw.handleWebhookSubscriptions(wBadURL, reqBadURL)
+	if wBadURL.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for bad URL, got %d", wBadURL.Code)
+	}
+
+	// 4. POST successful subscription creation
+	reqCreate := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/subscriptions", bytes.NewBufferString(`{"target_url":"https://partner.example.com/webhook","events":["transfer.completed","fraud.flagged"]}`))
+	wCreate := httptest.NewRecorder()
+	gw.handleWebhookSubscriptions(wCreate, reqCreate)
+	if wCreate.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for subscription creation, got %d (%s)", wCreate.Code, wCreate.Body.String())
+	}
+
+	// 5. GET subscriptions list
+	reqGet := httptest.NewRequest(http.MethodGet, "/api/v1/webhooks/subscriptions", nil)
+	wGet := httptest.NewRecorder()
+	gw.handleWebhookSubscriptions(wGet, reqGet)
+	if wGet.Code != http.StatusOK {
+		t.Fatalf("expected 200 for GET subscriptions, got %d", wGet.Code)
+	}
+
+	// 6. DELETE missing ID
+	reqDelMissing := httptest.NewRequest(http.MethodDelete, "/api/v1/webhooks/subscriptions", nil)
+	wDelMissing := httptest.NewRecorder()
+	gw.handleWebhookSubscriptions(wDelMissing, reqDelMissing)
+	if wDelMissing.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for DELETE without id, got %d", wDelMissing.Code)
+	}
+
+	// 7. DELETE with valid ID
+	subs, err := dispatcher.ListSubscriptions(context.Background(), "")
+	if err != nil || len(subs) == 0 {
+		t.Fatalf("expected at least 1 subscription, err: %v", err)
+	}
+	subID := subs[0].ID.Hex()
+	reqDel := httptest.NewRequest(http.MethodDelete, "/api/v1/webhooks/subscriptions?id="+subID, nil)
+	wDel := httptest.NewRecorder()
+	gw.handleWebhookSubscriptions(wDel, reqDel)
+	if wDel.Code != http.StatusOK {
+		t.Fatalf("expected 200 for DELETE with id, got %d (%s)", wDel.Code, wDel.Body.String())
+	}
+}
+
+func TestHandleWebhookTest(t *testing.T) {
+	dispatcher := webhook.NewDispatcher(nil, nil)
+	gw := &Gateway{
+		webhookDispatcher: dispatcher,
+	}
+
+	// Mock partner receiver
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"received":true}`))
+	}))
+	defer mockServer.Close()
+
+	// 1. Method Not Allowed (GET)
+	reqGet := httptest.NewRequest(http.MethodGet, "/api/v1/webhooks/test", nil)
+	wGet := httptest.NewRecorder()
+	gw.handleWebhookTest(wGet, reqGet)
+	if wGet.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for GET test, got %d", wGet.Code)
+	}
+
+	// 2. Bad JSON
+	reqBadJSON := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/test", bytes.NewBufferString(`bad`))
+	wBadJSON := httptest.NewRecorder()
+	gw.handleWebhookTest(wBadJSON, reqBadJSON)
+	if wBadJSON.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for bad JSON, got %d", wBadJSON.Code)
+	}
+
+	// 3. Invalid target URL
+	reqBadURL := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/test", bytes.NewBufferString(`{"target_url":"not-a-url"}`))
+	wBadURL := httptest.NewRecorder()
+	gw.handleWebhookTest(wBadURL, reqBadURL)
+	if wBadURL.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid url, got %d", wBadURL.Code)
+	}
+
+	// 4. Ping test endpoint success
+	bodyPing := bytes.NewBufferString(`{"target_url":"` + mockServer.URL + `","secret":"sec_test123"}`)
+	reqPing := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/test", bodyPing)
+	wPing := httptest.NewRecorder()
+	gw.handleWebhookTest(wPing, reqPing)
+	if wPing.Code != http.StatusOK {
+		t.Fatalf("expected 200 for ping, got %d (%s)", wPing.Code, wPing.Body.String())
 	}
 }

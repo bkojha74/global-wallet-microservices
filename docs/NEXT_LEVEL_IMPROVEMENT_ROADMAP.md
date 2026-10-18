@@ -146,9 +146,11 @@ graph TD
   - [x] Add `POST /api/v1/wallets/{id}/deposit` (Card/ACH/SEPA/WIRE inbound simulation).
   - [x] Add `POST /api/v1/wallets/{id}/withdraw` (External bank payout simulation).
   - [x] Record corresponding 2-leg external settlement journal entries in `ledger-service`.
-- [ ] **FIN-04: Outbound Partner Webhook Dispatcher**
-  - [ ] Support merchant/partner webhook registration (`transfer.completed`, `fraud.flagged`).
-  - [ ] Sign payloads with HMAC-SHA256 (`X-Wallet-Signature`) with retry worker.
+- [x] **FIN-04: Outbound Partner Webhook Dispatcher**
+  - [x] Support merchant/partner webhook registration (`transfer.completed`, `fraud.flagged`, `deposit.completed`, `withdrawal.completed`).
+  - [x] Sign payloads with HMAC-SHA256 (`X-Wallet-Signature`, `X-Wallet-Timestamp`) with replay attack tolerance.
+  - [x] Exponential backoff retry engine with full jitter and MongoDB delivery state tracking.
+  - [x] RESTful webhook subscription and live endpoint ping test APIs in API Gateway.
 
 ---
 
@@ -257,6 +259,24 @@ graph TD
 | Mock Implementations & Integration | `cmd/api-gateway/main_test.go` | ✅ Complete |
 | Full Concurrency & Race Detector Suite (`-race`) | All Services | ✅ Complete (0 data races) |
 | GoSec Static Security Analysis | All Services (48 files, 15,990 lines) | ✅ Complete (0 issues) |
+
+---
+
+## 10. Current Execution Status: Track 4 (Core Banking Expansion - FIN-04)
+
+| Component / Subsystem | File Path | Status |
+|---|---|:---:|
+| Webhook Domain Models & Event Enums (`transfer.completed`, `fraud.flagged`, etc.) | `pkg/webhook/models.go` | ✅ Complete |
+| HMAC-SHA256 Signature Engine & Anti-Replay Verification | `pkg/webhook/signature.go` | ✅ Complete |
+| Outbound Dispatcher & Jittered Exponential Backoff Retry Engine | `pkg/webhook/dispatcher.go` | ✅ Complete |
+| MongoDB Webhook Subscriptions & Deliveries TTL Indexing | `pkg/db/indexes.go` | ✅ Complete |
+| Wallet Service Fraud Detection Webhook Dispatch | `cmd/wallet-service/main.go` | ✅ Complete |
+| API Gateway Webhook Subscription & Ping Test Routes | `cmd/api-gateway/main.go` | ✅ Complete |
+| API Gateway Async Fanout on Transfer/Deposit/Withdrawal Events | `cmd/api-gateway/main.go` | ✅ Complete |
+| Dedicated Webhook Package Test Suite (`-race`) | `pkg/webhook/webhook_test.go` | ✅ Complete (0 data races) |
+| API Gateway Webhook Endpoints Unit Tests | `cmd/api-gateway/gateway_routes_unit_test.go` | ✅ Complete |
+| Staticcheck & GoSec Code Quality Gates | All Services | ✅ Complete (0 issues) |
+
 
 
 
