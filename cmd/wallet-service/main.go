@@ -36,6 +36,7 @@ import (
 	"wallet-system/pkg/observability"
 	"wallet-system/pkg/resilience"
 	"wallet-system/pkg/tlsutil"
+	"wallet-system/pkg/webhook"
 	fxv1 "wallet-system/proto/fx"
 	ledgerv1 "wallet-system/proto/ledger"
 	walletv1 "wallet-system/proto/wallet"
@@ -60,7 +61,8 @@ type server struct {
 	aiClient      *ai.Client
 	fraudDetector *ai.FraudDetector
 	// In-memory read-through balance cache with immediate write invalidation
-	balanceCache *BalanceCache
+	balanceCache      *BalanceCache
+	webhookDispatcher *webhook.Dispatcher
 }
 
 func (s *server) cache() *BalanceCache {
@@ -530,6 +532,23 @@ func (s *server) validateTransferRequest(ctx context.Context, req *walletv1.Tran
 					"risk_score": decision.RiskScore,
 					"reason":     decision.Reason,
 				})
+			if s.webhookDispatcher != nil {
+				bgCtx := context.WithoutCancel(ctx)
+				// #nosec G118 -- asynchronous webhook dispatch must decouple from request context cancellation
+				go func() {
+					_ = s.webhookDispatcher.Dispatch(bgCtx, webhook.EventFraudFlagged, map[string]any{
+						"idempotency_key":       req.IdempotencyKey,
+						"source_wallet_id":      req.SourceWalletId,
+						"destination_wallet_id": req.DestinationWalletId,
+						"amount":                req.Amount.Units,
+						"currency":              req.Amount.Currency,
+						"risk_score":            decision.RiskScore,
+						"reason":                decision.Reason,
+						"region":                s.region,
+						"timestamp":             time.Now().UTC().Format(time.RFC3339),
+					})
+				}()
+			}
 			return &walletv1.TransferFundsResponse{
 				Status:          walletv1.TransferFundsResponse_INTERNAL_ERROR,
 				ErrorMessage:    "Transfer blocked: " + decision.Reason,
@@ -2128,20 +2147,26 @@ func runWalletServer(ctx context.Context) error {
 		log.Printf("[WALLET-SERVICE] Wallet balance in-memory cache ENABLED (ttl=%v maxEntries=%d)", balanceCache.ttl, balanceCache.maxEntries)
 	}
 
+	var whDispatcher *webhook.Dispatcher
+	if client != nil {
+		whDispatcher = webhook.NewDispatcher(client.Database("banking_db"), nil)
+	}
+
 	srv := &server{
-		mongoClient:   client,
-		ledgerClient:  ledgerClient,
-		fxClient:      fxClient,
-		region:        region,
-		isActive:      isActive,
-		targetRole:    resolveWalletRole(isActive),
-		coordinator:   coord,
-		logger:        observability.LoggerFromEnvironment(walletServiceName, environment, region, os.Stdout),
-		outbox:        walletOutbox,
-		ledgerRelay:   ledgerRelay,
-		aiClient:      aiClient,
-		fraudDetector: ai.NewFraudDetector(aiClient),
-		balanceCache:  balanceCache,
+		mongoClient:       client,
+		ledgerClient:      ledgerClient,
+		fxClient:          fxClient,
+		region:            region,
+		isActive:          isActive,
+		targetRole:        resolveWalletRole(isActive),
+		coordinator:       coord,
+		logger:            observability.LoggerFromEnvironment(walletServiceName, environment, region, os.Stdout),
+		outbox:            walletOutbox,
+		ledgerRelay:       ledgerRelay,
+		aiClient:          aiClient,
+		fraudDetector:     ai.NewFraudDetector(aiClient),
+		balanceCache:      balanceCache,
+		webhookDispatcher: whDispatcher,
 	}
 	walletv1.RegisterWalletServiceServer(grpcServer, srv)
 

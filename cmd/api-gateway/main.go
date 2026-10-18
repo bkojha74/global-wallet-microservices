@@ -24,12 +24,16 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+
 	"wallet-system/pkg/auth"
 	"wallet-system/pkg/coordinator"
 	"wallet-system/pkg/db"
 	"wallet-system/pkg/observability"
 	"wallet-system/pkg/resilience"
 	"wallet-system/pkg/tlsutil"
+	"wallet-system/pkg/webhook"
 	authv1 "wallet-system/proto/auth"
 	fxv1 "wallet-system/proto/fx"
 	ledgerv1 "wallet-system/proto/ledger"
@@ -40,17 +44,18 @@ const defaultJWTSecret = "development-wallet-insecure-secret-key-change-in-prod"
 
 // Gateway routes incoming HTTP requests to the appropriate gRPC backend service.
 type Gateway struct {
-	mu             sync.RWMutex
-	activeTarget   string // "PRIMARY" or "STANDBY" (cached fallback)
-	coordinator    coordinator.FailoverCoordinator
-	primaryClient  walletv1.WalletServiceClient
-	standbyClient  walletv1.WalletServiceClient
-	ledgerClient   ledgerv1.LedgerServiceClient
-	authClient     authv1.AuthServiceClient // auth-service gRPC client
-	fxClient       fxv1.FXServiceClient     // fx-service gRPC client
-	primaryAddress string
-	standbyAddress string
-	logger         observability.Logger
+	mu                sync.RWMutex
+	activeTarget      string // "PRIMARY" or "STANDBY" (cached fallback)
+	coordinator       coordinator.FailoverCoordinator
+	primaryClient     walletv1.WalletServiceClient
+	standbyClient     walletv1.WalletServiceClient
+	ledgerClient      ledgerv1.LedgerServiceClient
+	authClient        authv1.AuthServiceClient // auth-service gRPC client
+	fxClient          fxv1.FXServiceClient     // fx-service gRPC client
+	primaryAddress    string
+	standbyAddress    string
+	logger            observability.Logger
+	webhookDispatcher *webhook.Dispatcher
 }
 
 func (g *Gateway) emit(ctx context.Context, eventType, level, message string, attributes map[string]any) {
@@ -393,6 +398,24 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		"status":         resp.Status.String(),
 		"transaction_id": resp.TransactionId,
 	})
+
+	if isSuccess {
+		if d := g.getWebhookDispatcher(); d != nil {
+			bgCtx := context.WithoutCancel(r.Context())
+			// #nosec G118 -- asynchronous webhook dispatch must decouple from HTTP request context cancellation
+			go func() {
+				_ = d.Dispatch(bgCtx, webhook.EventTransferCompleted, map[string]interface{}{
+					"transaction_id":        resp.TransactionId,
+					"source_wallet_id":      protoReq.SourceWalletId,
+					"destination_wallet_id": protoReq.DestinationWalletId,
+					"amount":                protoReq.Amount.Units,
+					"currency":              protoReq.Amount.Currency,
+					"fx_quote_id":           resp.FxQuoteId,
+					"handled_region":        resp.HandledByRegion,
+				})
+			}()
+		}
+	}
 
 	respMap := map[string]interface{}{
 		"transaction_id": resp.TransactionId,
@@ -850,6 +873,22 @@ func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWal
 		"payment_rail":   req.PaymentRail,
 	})
 
+	if d := g.getWebhookDispatcher(); d != nil {
+		bgCtx := context.WithoutCancel(r.Context())
+		// #nosec G118 -- asynchronous webhook dispatch must decouple from HTTP request context cancellation
+		go func() {
+			_ = d.Dispatch(bgCtx, webhook.EventDepositCompleted, map[string]interface{}{
+				"transaction_id":     resp.TransactionId,
+				"wallet_id":          walletID,
+				"amount":             resp.GetCreditedAmount().GetUnits(),
+				"currency":           resp.GetCreditedAmount().GetCurrency(),
+				"payment_rail":       resp.PaymentRail.String(),
+				"external_reference": resp.ExternalReference,
+				"handled_region":     resp.HandledByRegion,
+			})
+		}()
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":             resp.Status.String(),
 		"transaction_id":     resp.TransactionId,
@@ -1005,6 +1044,23 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 		"payment_rail":   req.PaymentRail,
 	})
 
+	if d := g.getWebhookDispatcher(); d != nil {
+		bgCtx := context.WithoutCancel(r.Context())
+		// #nosec G118 -- asynchronous webhook dispatch must decouple from HTTP request context cancellation
+		go func() {
+			_ = d.Dispatch(bgCtx, webhook.EventWithdrawalCompleted, map[string]interface{}{
+				"transaction_id":      resp.TransactionId,
+				"wallet_id":           walletID,
+				"amount":              resp.GetDebitedAmount().GetUnits(),
+				"currency":            resp.GetDebitedAmount().GetCurrency(),
+				"payment_rail":        resp.PaymentRail.String(),
+				"external_reference":  resp.ExternalReference,
+				"beneficiary_details": req.BeneficiaryDetails,
+				"handled_region":      resp.HandledByRegion,
+			})
+		}()
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":             resp.Status.String(),
 		"transaction_id":     resp.TransactionId,
@@ -1015,6 +1071,195 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 		"external_reference": resp.ExternalReference,
 		"routed_gateway":     target,
 		"handled_region":     resp.HandledByRegion,
+	})
+}
+
+func (g *Gateway) getWebhookDispatcher() *webhook.Dispatcher {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.webhookDispatcher
+}
+
+func (g *Gateway) handleWebhookSubscriptions(w http.ResponseWriter, r *http.Request) {
+	d := g.getWebhookDispatcher()
+	if d == nil {
+		http.Error(w, "Webhook subsystem unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPost:
+		var req struct {
+			URL       string   `json:"url"`
+			TargetURL string   `json:"target_url"`
+			Events    []string `json:"events"`
+			Secret    string   `json:"secret"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		targetURL := req.URL
+		if targetURL == "" {
+			targetURL = req.TargetURL
+		}
+		if targetURL == "" {
+			http.Error(w, "url is required", http.StatusBadRequest)
+			return
+		}
+		if len(req.Events) == 0 {
+			req.Events = []string{"*"}
+		}
+
+		ownerID := ""
+		if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+			ownerID = claims.Subject
+		}
+
+		sub := &webhook.WebhookSubscription{
+			URL:     targetURL,
+			Events:  req.Events,
+			Secret:  req.Secret,
+			OwnerID: ownerID,
+		}
+
+		if err := d.RegisterSubscription(r.Context(), sub); err != nil {
+			http.Error(w, fmt.Sprintf("failed to register webhook: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		writeJSON(w, http.StatusCreated, map[string]interface{}{
+			"id":         sub.ID.Hex(),
+			"url":        sub.URL,
+			"events":     sub.Events,
+			"secret":     sub.Secret,
+			"is_active":  sub.IsActive,
+			"created_at": sub.CreatedAt.Format(time.RFC3339),
+		})
+
+	case http.MethodGet:
+		ownerID := ""
+		if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+			if !claims.HasRole(auth.RoleAdmin) {
+				ownerID = claims.Subject
+			}
+		}
+
+		subs, err := d.ListSubscriptions(r.Context(), ownerID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to list webhooks: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		type subView struct {
+			ID         string    `json:"id"`
+			URL        string    `json:"url"`
+			Events     []string  `json:"events"`
+			SecretMask string    `json:"secret_mask"`
+			IsActive   bool      `json:"is_active"`
+			CreatedAt  time.Time `json:"created_at"`
+		}
+
+		views := make([]subView, 0, len(subs))
+		for _, s := range subs {
+			masked := "whsec_****"
+			if len(s.Secret) > 10 {
+				masked = s.Secret[:6] + "..." + s.Secret[len(s.Secret)-4:]
+			}
+			views = append(views, subView{
+				ID:         s.ID.Hex(),
+				URL:        s.URL,
+				Events:     s.Events,
+				SecretMask: masked,
+				IsActive:   s.IsActive,
+				CreatedAt:  s.CreatedAt,
+			})
+		}
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"count":         len(views),
+			"subscriptions": views,
+		})
+
+	case http.MethodDelete:
+		idStr := strings.TrimSpace(r.URL.Query().Get("id"))
+		if idStr == "" {
+			http.Error(w, "missing 'id' query parameter", http.StatusBadRequest)
+			return
+		}
+		oid, err := primitive.ObjectIDFromHex(idStr)
+		if err != nil {
+			http.Error(w, "invalid subscription id", http.StatusBadRequest)
+			return
+		}
+		if err := d.DeleteSubscription(r.Context(), oid); err != nil {
+			if err == mongo.ErrNoDocuments {
+				http.Error(w, "subscription not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, fmt.Sprintf("failed to delete subscription: %v", err), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"message": "subscription deactivated successfully"})
+
+	default:
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+	}
+}
+
+func (g *Gateway) handleWebhookTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	d := g.getWebhookDispatcher()
+	if d == nil {
+		http.Error(w, "Webhook subsystem unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req struct {
+		URL       string `json:"url"`
+		TargetURL string `json:"target_url"`
+		Secret    string `json:"secret"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	targetURL := req.URL
+	if targetURL == "" {
+		targetURL = req.TargetURL
+	}
+	if targetURL == "" {
+		http.Error(w, "url is required", http.StatusBadRequest)
+		return
+	}
+	if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
+		http.Error(w, "valid webhook url (http/https) is required", http.StatusBadRequest)
+		return
+	}
+	if req.Secret == "" {
+		req.Secret = "whsec_test_secret_for_ping"
+	}
+
+	code, latency, err := d.TestEndpoint(r.Context(), targetURL, req.Secret)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]interface{}{
+			"success":    false,
+			"url":        targetURL,
+			"error":      err.Error(),
+			"latency_ms": latency.Milliseconds(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success":     code >= 200 && code < 300,
+		"url":         targetURL,
+		"status_code": code,
+		"latency_ms":  latency.Milliseconds(),
 	})
 }
 
@@ -1697,6 +1942,8 @@ func registerGatewayRoutes(mux *http.ServeMux, gw *Gateway) {
 	mux.HandleFunc("/api/v1/wallets/exchange", gw.handleWalletExchange)
 	mux.HandleFunc("/api/v1/wallets/kyc", gw.handleUpdateWalletKYC)
 	mux.HandleFunc("/api/v1/wallets/limits", gw.handleGetWalletLimits)
+	mux.HandleFunc("/api/v1/webhooks/subscriptions", gw.handleWebhookSubscriptions)
+	mux.HandleFunc("/api/v1/webhooks/test", gw.handleWebhookTest)
 	mux.HandleFunc("/api/v1/transfers", gw.handleTransfer)
 	mux.HandleFunc("/api/v1/ledger", gw.handleLedger)
 	mux.HandleFunc("/api/v1/fx/currencies", gw.handleFXCurrencies)
@@ -1821,20 +2068,37 @@ func runGatewayServer(ctx context.Context) error {
 		fxClient = fxv1.NewFXServiceClient(fxConn)
 	}
 
-	coord, cleanupCoord := initFailoverCoordinator(os.Getenv("MONGO_URI"))
+	mongoURI := os.Getenv("MONGO_URI")
+	coord, cleanupCoord := initFailoverCoordinator(mongoURI)
 	defer cleanupCoord()
 
+	var whDispatcher *webhook.Dispatcher
+	if mongoURI != "" {
+		mCtx, mCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if mClient, err := db.ConnectWithRetry(mCtx, mongoURI, 3); err == nil {
+			database := mClient.Database("banking_db")
+			_ = db.EnsureWebhookIndexes(context.Background(), database)
+			whDispatcher = webhook.NewDispatcher(database, nil)
+			go whDispatcher.StartRetryWorker(subCtx, 5*time.Second)
+		}
+		mCancel()
+	}
+	if whDispatcher == nil {
+		whDispatcher = webhook.NewDispatcher(nil, nil)
+	}
+
 	gw := &Gateway{
-		activeTarget:   "PRIMARY",
-		coordinator:    coord,
-		primaryClient:  walletv1.NewWalletServiceClient(pConn),
-		standbyClient:  walletv1.NewWalletServiceClient(sConn),
-		ledgerClient:   ledgerv1.NewLedgerServiceClient(lConn),
-		authClient:     authv1.NewAuthServiceClient(aConn),
-		fxClient:       fxClient,
-		primaryAddress: primaryAddr,
-		standbyAddress: standbyAddr,
-		logger:         logger,
+		activeTarget:      "PRIMARY",
+		coordinator:       coord,
+		primaryClient:     walletv1.NewWalletServiceClient(pConn),
+		standbyClient:     walletv1.NewWalletServiceClient(sConn),
+		ledgerClient:      ledgerv1.NewLedgerServiceClient(lConn),
+		authClient:        authv1.NewAuthServiceClient(aConn),
+		fxClient:          fxClient,
+		primaryAddress:    primaryAddr,
+		standbyAddress:    standbyAddr,
+		logger:            logger,
+		webhookDispatcher: whDispatcher,
 	}
 
 	if initTarget, err := coord.GetActiveTarget(subCtx); err == nil {
