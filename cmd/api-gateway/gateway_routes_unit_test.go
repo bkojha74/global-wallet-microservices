@@ -40,6 +40,33 @@ func (m *mockWalletClient) ExchangeCurrency(ctx context.Context, in *walletv1.Ex
 	}, nil
 }
 
+func (m *mockWalletClient) UpdateWalletKYC(ctx context.Context, in *walletv1.UpdateWalletKYCRequest, opts ...grpc.CallOption) (*walletv1.UpdateWalletKYCResponse, error) {
+	if in.KycTier == "INVALID" {
+		return &walletv1.UpdateWalletKYCResponse{Success: false, Message: "invalid kyc_tier"}, nil
+	}
+	return &walletv1.UpdateWalletKYCResponse{
+		Success:      true,
+		WalletId:     in.WalletId,
+		PreviousTier: "TIER_1",
+		CurrentTier:  in.KycTier,
+		Message:      "KYC tier updated successfully",
+	}, nil
+}
+
+func (m *mockWalletClient) GetWalletLimits(ctx context.Context, in *walletv1.GetWalletLimitsRequest, opts ...grpc.CallOption) (*walletv1.GetWalletLimitsResponse, error) {
+	return &walletv1.GetWalletLimitsResponse{
+		WalletId:               in.WalletId,
+		KycTier:                "TIER_1",
+		SingleTransactionLimit: 100000,
+		DailyRollingLimit:      500000,
+		DailyRollingSpent:      50000,
+		DailyRollingRemaining:  450000,
+		HourlyRateLimit:        10,
+		HourlyRateSpent:        1,
+		HourlyRateRemaining:    9,
+	}, nil
+}
+
 func TestGatewayEmitAndWriteJSON(t *testing.T) {
 	_ = walletv1.CreateWalletRequest{}
 	gw := &Gateway{}
@@ -296,5 +323,71 @@ func TestGatewayWalletExchangeHandler(t *testing.T) {
 	gw.handleWalletExchange(wSuccess, reqSuccess)
 	if wSuccess.Code != http.StatusOK {
 		t.Fatalf("expected 200 for successful exchange, got %d (%s)", wSuccess.Code, wSuccess.Body.String())
+	}
+}
+
+func TestHandleUpdateWalletKYC_Routes(t *testing.T) {
+	gw := &Gateway{
+		primaryClient: &mockWalletClient{},
+		standbyClient: &mockWalletClient{},
+		activeTarget:  coordinator.TargetPrimary,
+	}
+
+	// 1. GET not allowed (405)
+	reqGet := httptest.NewRequest(http.MethodGet, "/api/v1/wallets/kyc", nil)
+	wGet := httptest.NewRecorder()
+	gw.handleUpdateWalletKYC(wGet, reqGet)
+	if wGet.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for GET kyc, got %d", wGet.Code)
+	}
+
+	// 2. Missing wallet_id (400)
+	bodyNoWallet := bytes.NewBufferString(`{"kyc_tier":"TIER_2"}`)
+	reqNoWallet := httptest.NewRequest(http.MethodPut, "/api/v1/wallets/kyc", bodyNoWallet)
+	wNoWallet := httptest.NewRecorder()
+	gw.handleUpdateWalletKYC(wNoWallet, reqNoWallet)
+	if wNoWallet.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing wallet_id, got %d", wNoWallet.Code)
+	}
+
+	// 3. Success (200)
+	bodySuccess := bytes.NewBufferString(`{"wallet_id":"alice","kyc_tier":"TIER_2"}`)
+	reqSuccess := httptest.NewRequest(http.MethodPut, "/api/v1/wallets/kyc", bodySuccess)
+	wSuccess := httptest.NewRecorder()
+	gw.handleUpdateWalletKYC(wSuccess, reqSuccess)
+	if wSuccess.Code != http.StatusOK {
+		t.Fatalf("expected 200 for successful KYC update, got %d (%s)", wSuccess.Code, wSuccess.Body.String())
+	}
+}
+
+func TestHandleGetWalletLimits_Routes(t *testing.T) {
+	gw := &Gateway{
+		primaryClient: &mockWalletClient{},
+		standbyClient: &mockWalletClient{},
+		activeTarget:  coordinator.TargetPrimary,
+	}
+
+	// 1. POST not allowed (405)
+	reqPost := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/limits", nil)
+	wPost := httptest.NewRecorder()
+	gw.handleGetWalletLimits(wPost, reqPost)
+	if wPost.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for POST limits, got %d", wPost.Code)
+	}
+
+	// 2. Missing 'id' parameter (400)
+	reqNoID := httptest.NewRequest(http.MethodGet, "/api/v1/wallets/limits", nil)
+	wNoID := httptest.NewRecorder()
+	gw.handleGetWalletLimits(wNoID, reqNoID)
+	if wNoID.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing id query param, got %d", wNoID.Code)
+	}
+
+	// 3. Success (200)
+	reqSuccess := httptest.NewRequest(http.MethodGet, "/api/v1/wallets/limits?id=alice", nil)
+	wSuccess := httptest.NewRecorder()
+	gw.handleGetWalletLimits(wSuccess, reqSuccess)
+	if wSuccess.Code != http.StatusOK {
+		t.Fatalf("expected 200 for limits query, got %d (%s)", wSuccess.Code, wSuccess.Body.String())
 	}
 }

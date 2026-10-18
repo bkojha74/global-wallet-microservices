@@ -126,6 +126,7 @@ type WalletModel struct {
 	Balance   int64            `bson:"balance,omitempty" json:"balance,omitempty"`
 	Balances  map[string]int64 `bson:"balances,omitempty" json:"balances,omitempty"`
 	Status    string           `bson:"status" json:"status"`
+	KYCTier   string           `bson:"kyc_tier,omitempty" json:"kyc_tier,omitempty"`
 	UpdatedAt string           `bson:"updated_at" json:"updated_at"`
 }
 
@@ -134,6 +135,13 @@ func (w *WalletModel) EffectiveStatus() string {
 		return WalletStatusActive
 	}
 	return w.Status
+}
+
+func (w *WalletModel) EffectiveKYCTier() string {
+	if w.KYCTier == "" {
+		return KYCTier1
+	}
+	return w.KYCTier
 }
 
 func (w *WalletModel) GetAllBalances() []*walletv1.Money {
@@ -242,12 +250,21 @@ func (s *server) CreateWallet(ctx context.Context, req *walletv1.CreateWalletReq
 		curr = "USD"
 	}
 
+	kycTier := strings.TrimSpace(req.KycTier)
+	if kycTier == "" {
+		kycTier = KYCTier1
+	}
+	if _, ok := TierConfigs[kycTier]; !ok {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid kyc_tier: %s (must be TIER_1, TIER_2, or TIER_3)", kycTier)
+	}
+
 	model := WalletModel{
 		ID:        req.WalletId,
 		Currency:  curr,
 		Balance:   req.InitialBalance,
 		Balances:  map[string]int64{curr: req.InitialBalance},
 		Status:    WalletStatusActive,
+		KYCTier:   kycTier,
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 
@@ -572,6 +589,14 @@ func (s *server) validateWalletsOperational(sessCtx mongo.SessionContext, wallet
 		return err
 	}
 
+	if err := s.CheckVelocityLimits(sessCtx, srcWallet, req.Amount.Units, req.Amount.Currency); err != nil {
+		state.txnStatus = walletv1.TransferFundsResponse_FAILED_VELOCITY_LIMIT_EXCEEDED
+		state.txnErrMsg = err.Error()
+		log.Printf("[COMPLIANCE-TX] trace_id=%s step=velocity_limit_exceeded wallet_id=%s reason=%v",
+			req.IdempotencyKey, req.SourceWalletId, err)
+		return err
+	}
+
 	var dstWallet WalletModel
 	if err := walletsCol.FindOne(sessCtx, bson.M{"_id": req.DestinationWalletId}).Decode(&dstWallet); err != nil {
 		if err == mongo.ErrNoDocuments {
@@ -706,6 +731,12 @@ func (s *server) executeDebitAndCredit(sessCtx mongo.SessionContext, ctx context
 			return fmt.Errorf("outbox append (destination_credited) failed: %w", err)
 		}
 	}
+
+	// Record velocity usage for compliance tracking
+	if recErr := s.RecordVelocityUsage(sessCtx, req.SourceWalletId, req.Amount.Units, req.Amount.Currency, "TRANSFER"); recErr != nil {
+		log.Printf("[COMPLIANCE-TX] Warning: failed to record velocity usage for wallet %s: %v", req.SourceWalletId, recErr)
+	}
+
 	return nil
 }
 
@@ -1022,6 +1053,16 @@ func (s *server) ExchangeCurrency(ctx context.Context, req *walletv1.ExchangeCur
 		}, nil
 	}
 
+	if err := s.CheckVelocityLimits(ctx, wallet, fromAmount, fromCurr); err != nil {
+		log.Printf("[COMPLIANCE-FX] trace_id=%s step=velocity_limit_exceeded wallet_id=%s reason=%v",
+			idempKey, walletID, err)
+		return &walletv1.ExchangeCurrencyResponse{
+			Status:          walletv1.ExchangeCurrencyResponse_FAILED_VELOCITY_LIMIT_EXCEEDED,
+			ErrorMessage:    err.Error(),
+			HandledByRegion: s.region,
+		}, nil
+	}
+
 	// Resolve FX conversion via fx-service or fallback
 	quoteID := strings.TrimSpace(req.FxQuoteId)
 	targetUnits := int64(0)
@@ -1136,12 +1177,19 @@ func (s *server) ExchangeCurrency(ctx context.Context, req *walletv1.ExchangeCur
 		}
 
 		// 4. Record idempotency record
-		_, err := idempCol.InsertOne(sessCtx, IdempotencyRecord{
+		if _, err := idempCol.InsertOne(sessCtx, IdempotencyRecord{
 			ID:            idempKey,
 			TransactionID: finalTxnID,
 			CreatedAt:     time.Now().UTC(),
-		})
-		return nil, err
+		}); err != nil {
+			return nil, err
+		}
+
+		// 5. Record velocity usage for compliance tracking
+		if recErr := s.RecordVelocityUsage(sessCtx, walletID, fromAmount, fromCurr, "EXCHANGE"); recErr != nil {
+			log.Printf("[COMPLIANCE-FX] Warning: failed to record velocity usage for wallet %s: %v", walletID, recErr)
+		}
+		return nil, nil
 	}, txnOpts)
 
 	durationMS := time.Since(startTime).Milliseconds()

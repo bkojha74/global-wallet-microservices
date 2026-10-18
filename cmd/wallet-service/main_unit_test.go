@@ -481,3 +481,109 @@ func TestExchangeCurrency_Validation(t *testing.T) {
 		t.Errorf("expected standby rejection response, got resp=%+v, err=%v", respStandby, errStandby)
 	}
 }
+
+func TestKYCTier_ConfigsAndDefaults(t *testing.T) {
+	// Test default tier config
+	cfgDefault := GetTierConfig("UNKNOWN_TIER")
+	if cfgDefault.Tier != KYCTier1 {
+		t.Errorf("expected default tier TIER_1, got %s", cfgDefault.Tier)
+	}
+	if cfgDefault.SingleTxnLimitUnits != 100000 {
+		t.Errorf("expected 100000 single txn limit for TIER_1, got %d", cfgDefault.SingleTxnLimitUnits)
+	}
+
+	// Test TIER_2 config
+	cfgTier2 := GetTierConfig(KYCTier2)
+	if cfgTier2.SingleTxnLimitUnits != 1000000 || cfgTier2.DailyRollingLimitUnits != 5000000 || cfgTier2.HourlyRateLimitCount != 50 {
+		t.Errorf("unexpected TIER_2 parameters: %+v", cfgTier2)
+	}
+
+	// Test TIER_3 config
+	cfgTier3 := GetTierConfig(KYCTier3)
+	if cfgTier3.SingleTxnLimitUnits != 10000000 || cfgTier3.DailyRollingLimitUnits != 50000000 || cfgTier3.HourlyRateLimitCount != 200 {
+		t.Errorf("unexpected TIER_3 parameters: %+v", cfgTier3)
+	}
+
+	// Test EffectiveKYCTier on WalletModel
+	wEmpty := &WalletModel{ID: "w_empty"}
+	if wEmpty.EffectiveKYCTier() != KYCTier1 {
+		t.Errorf("expected default TIER_1, got %s", wEmpty.EffectiveKYCTier())
+	}
+
+	wExplicit := &WalletModel{ID: "w_exp", KYCTier: KYCTier2}
+	if wExplicit.EffectiveKYCTier() != KYCTier2 {
+		t.Errorf("expected TIER_2, got %s", wExplicit.EffectiveKYCTier())
+	}
+}
+
+func TestNormalizeToUSDUnits(t *testing.T) {
+	// USD 1:1
+	if u := normalizeToUSDUnits(1000, "USD"); u != 1000 {
+		t.Errorf("expected 1000, got %d", u)
+	}
+	// EUR (1.0870)
+	eurUnits := normalizeToUSDUnits(10000, "EUR")
+	if eurUnits <= 0 {
+		t.Errorf("expected positive EUR conversion, got %d", eurUnits)
+	}
+	// GBP (1.2820)
+	gbpUnits := normalizeToUSDUnits(10000, "GBP")
+	if gbpUnits <= 0 {
+		t.Errorf("expected positive GBP conversion, got %d", gbpUnits)
+	}
+	// JPY
+	jpyUnits := normalizeToUSDUnits(100000, "JPY")
+	if jpyUnits <= 0 {
+		t.Errorf("expected positive JPY conversion, got %d", jpyUnits)
+	}
+}
+
+func TestCheckVelocityLimits_SingleTxnCap(t *testing.T) {
+	srv := &server{}
+	ctx := context.Background()
+
+	// 1. TIER_1 wallet: Single limit is 100,000 USD cents ($1,000)
+	wTier1 := WalletModel{ID: "w_t1", KYCTier: KYCTier1}
+	// 50,000 cents ($500) -> Allowed
+	if err := srv.CheckVelocityLimits(ctx, wTier1, 50000, "USD"); err != nil {
+		t.Errorf("expected 50,000 units to be allowed, got: %v", err)
+	}
+	// 150,000 cents ($1,500) -> Exceeds single txn cap
+	if err := srv.CheckVelocityLimits(ctx, wTier1, 150000, "USD"); err == nil {
+		t.Errorf("expected 150,000 units to be rejected for TIER_1 single txn limit")
+	}
+
+	// 2. TIER_2 wallet: Single limit is 1,000,000 USD cents ($10,000)
+	wTier2 := WalletModel{ID: "w_t2", KYCTier: KYCTier2}
+	// 500,000 cents ($5,000) -> Allowed for TIER_2
+	if err := srv.CheckVelocityLimits(ctx, wTier2, 500000, "USD"); err != nil {
+		t.Errorf("expected 500,000 units to be allowed for TIER_2, got: %v", err)
+	}
+	// 1,500,000 cents ($15,000) -> Exceeds single txn cap for TIER_2
+	if err := srv.CheckVelocityLimits(ctx, wTier2, 1500000, "USD"); err == nil {
+		t.Errorf("expected 1,500,000 units to be rejected for TIER_2 single txn limit")
+	}
+}
+
+func TestUpdateWalletKYC_Validation(t *testing.T) {
+	srv := &server{}
+	ctx := context.Background()
+
+	// 1. Nil request
+	resp, _ := srv.UpdateWalletKYC(ctx, nil)
+	if resp == nil || resp.Success {
+		t.Errorf("expected failure for nil request")
+	}
+
+	// 2. Missing wallet_id
+	resp, _ = srv.UpdateWalletKYC(ctx, &walletv1.UpdateWalletKYCRequest{KycTier: KYCTier2})
+	if resp == nil || resp.Success {
+		t.Errorf("expected failure for missing wallet_id")
+	}
+
+	// 3. Invalid tier
+	resp, _ = srv.UpdateWalletKYC(ctx, &walletv1.UpdateWalletKYCRequest{WalletId: "w1", KycTier: "TIER_999"})
+	if resp == nil || resp.Success {
+		t.Errorf("expected failure for invalid tier")
+	}
+}

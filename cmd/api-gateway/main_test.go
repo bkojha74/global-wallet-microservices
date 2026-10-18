@@ -64,6 +64,14 @@ func (f *fakeWalletClient) ExchangeCurrency(context.Context, *walletv1.ExchangeC
 	return nil, errors.New("ExchangeCurrency not implemented in fake")
 }
 
+func (f *fakeWalletClient) UpdateWalletKYC(context.Context, *walletv1.UpdateWalletKYCRequest, ...grpc.CallOption) (*walletv1.UpdateWalletKYCResponse, error) {
+	return nil, errors.New("UpdateWalletKYC not implemented in fake")
+}
+
+func (f *fakeWalletClient) GetWalletLimits(context.Context, *walletv1.GetWalletLimitsRequest, ...grpc.CallOption) (*walletv1.GetWalletLimitsResponse, error) {
+	return nil, errors.New("GetWalletLimits not implemented in fake")
+}
+
 type fakeLedgerClient struct {
 	getLedgerRequest  *ledgerv1.GetLedgerRequest
 	getLedgerResponse *ledgerv1.GetLedgerResponse
