@@ -136,6 +136,7 @@ func parseCreateWalletRequest(r *http.Request, traceID string) (*walletv1.Create
 		WalletID       string `json:"wallet_id"`
 		Currency       string `json:"currency"`
 		InitialBalance int64  `json:"initial_balance"`
+		KYCTier        string `json:"kyc_tier"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		log.Printf("[TRACE] trace_id=%s step=http_json_decode_failed error=%v", traceID, err)
@@ -153,8 +154,13 @@ func parseCreateWalletRequest(r *http.Request, traceID string) (*walletv1.Create
 			return nil, fmt.Errorf("forbidden: %w", err)
 		}
 	}
-	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=create_wallet wallet_id=%s", traceID, req.WalletID)
-	return &walletv1.CreateWalletRequest{WalletId: req.WalletID, Currency: req.Currency, InitialBalance: req.InitialBalance}, nil
+	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=create_wallet wallet_id=%s kyc_tier=%s", traceID, req.WalletID, req.KYCTier)
+	return &walletv1.CreateWalletRequest{
+		WalletId:       req.WalletID,
+		Currency:       req.Currency,
+		InitialBalance: req.InitialBalance,
+		KycTier:        req.KYCTier,
+	}, nil
 }
 
 func handleWalletGRPCError(w http.ResponseWriter, err error, action string) {
@@ -544,6 +550,126 @@ func (g *Gateway) handleWalletExchange(w http.ResponseWriter, r *http.Request) {
 		"fx_quote_id":     resp.FxQuoteId,
 		"routed_gateway":  target,
 		"handled_region":  resp.HandledByRegion,
+	})
+}
+
+func (g *Gateway) handleUpdateWalletKYC(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut && r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	correlation := observability.FromHTTPRequest(r)
+	traceID := correlation.AssociationID
+	body, err := readClientJSON(traceID, r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		WalletID string `json:"wallet_id"`
+		KYCTier  string `json:"kyc_tier"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	walletID := strings.TrimSpace(req.WalletID)
+	if walletID == "" {
+		http.Error(w, "wallet_id is required", http.StatusBadRequest)
+		return
+	}
+	tier := strings.ToUpper(strings.TrimSpace(req.KYCTier))
+	if tier == "" {
+		http.Error(w, "kyc_tier is required (TIER_1, TIER_2, TIER_3)", http.StatusBadRequest)
+		return
+	}
+
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		if err := ValidateWalletOwnership(claims, walletID); err != nil && !claims.HasRole(auth.RoleAdmin) {
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
+			return
+		}
+	}
+
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	client, target := g.getActiveWalletClient(ctx)
+	callCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+
+	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	resp, err := client.UpdateWalletKYC(callCtx, &walletv1.UpdateWalletKYCRequest{
+		WalletId: walletID,
+		KycTier:  tier,
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to update wallet KYC: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if !resp.Success {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"message": resp.Message,
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success":        resp.Success,
+		"wallet_id":      resp.WalletId,
+		"previous_tier":  resp.PreviousTier,
+		"current_tier":   resp.CurrentTier,
+		"message":        resp.Message,
+		"routed_gateway": target,
+	})
+}
+
+func (g *Gateway) handleGetWalletLimits(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	walletID := strings.TrimSpace(r.URL.Query().Get("id"))
+	if walletID == "" {
+		http.Error(w, "Missing 'id' query parameter", http.StatusBadRequest)
+		return
+	}
+
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		if err := ValidateWalletOwnership(claims, walletID); err != nil && !claims.HasRole(auth.RoleAdmin) {
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
+			return
+		}
+	}
+
+	correlation := observability.FromHTTPRequest(r)
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	client, target := g.getActiveWalletClient(ctx)
+	callCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+
+	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	resp, err := client.GetWalletLimits(callCtx, &walletv1.GetWalletLimitsRequest{
+		WalletId: walletID,
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get wallet limits: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"wallet_id":                resp.WalletId,
+		"kyc_tier":                 resp.KycTier,
+		"single_transaction_limit": resp.SingleTransactionLimit,
+		"daily_rolling_limit":      resp.DailyRollingLimit,
+		"daily_rolling_spent":      resp.DailyRollingSpent,
+		"daily_rolling_remaining":  resp.DailyRollingRemaining,
+		"hourly_rate_limit":        resp.HourlyRateLimit,
+		"hourly_rate_spent":        resp.HourlyRateSpent,
+		"hourly_rate_remaining":    resp.HourlyRateRemaining,
+		"routed_gateway":           target,
 	})
 }
 
@@ -1221,6 +1347,8 @@ func (gw *Gateway) handleFXRatesRefresh(w http.ResponseWriter, r *http.Request) 
 func registerGatewayRoutes(mux *http.ServeMux, gw *Gateway) {
 	mux.HandleFunc("/api/v1/wallets", gw.handleWallets)
 	mux.HandleFunc("/api/v1/wallets/exchange", gw.handleWalletExchange)
+	mux.HandleFunc("/api/v1/wallets/kyc", gw.handleUpdateWalletKYC)
+	mux.HandleFunc("/api/v1/wallets/limits", gw.handleGetWalletLimits)
 	mux.HandleFunc("/api/v1/transfers", gw.handleTransfer)
 	mux.HandleFunc("/api/v1/ledger", gw.handleLedger)
 	mux.HandleFunc("/api/v1/fx/currencies", gw.handleFXCurrencies)

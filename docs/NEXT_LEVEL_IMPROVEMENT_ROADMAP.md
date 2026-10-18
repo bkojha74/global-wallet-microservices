@@ -139,9 +139,9 @@ graph TD
 - [x] **FIN-01: Multi-Currency Pots per Wallet**
   - [x] Extend `WalletModel` to support balances map `map[string]int64` (e.g. `USD: 10000`, `EUR: 5000`).
   - [x] Enable atomic intra-wallet currency exchanges.
-- [ ] **FIN-02: Velocity Limits & Compliance Engine**
-  - [ ] Add configurable 24-hour rolling volume limits and transaction rate caps per user.
-  - [ ] Support KYC tier enforcement (`TIER_1`, `TIER_2`, `TIER_3`).
+- [x] **FIN-02: Velocity Limits & Compliance Engine**
+  - [x] Add configurable 24-hour rolling volume limits and transaction rate caps per user.
+  - [x] Support KYC tier enforcement (`TIER_1`, `TIER_2`, `TIER_3`).
 - [ ] **FIN-03: External Deposit & Withdrawal Rails Simulator**
   - [ ] Add `POST /api/v1/wallets/{id}/deposit` (Card/ACH/SEPA inbound simulation).
   - [ ] Add `POST /api/v1/wallets/{id}/withdraw` (External bank payout simulation).
@@ -223,5 +223,21 @@ graph TD
 | API Gateway REST Route (`POST /api/v1/wallets/exchange`) | `cmd/api-gateway/main.go` | ✅ Complete |
 | Wallet Service Multi-Currency & Exchange Unit Tests | `cmd/wallet-service/main_unit_test.go` | ✅ Complete |
 | API Gateway Exchange Endpoint Unit Tests | `cmd/api-gateway/gateway_routes_unit_test.go` | ✅ Complete |
+
+---
+
+## 8. Current Execution Status: Track 4 (Core Banking Expansion - FIN-02)
+
+| Component / Subsystem | File Path | Status |
+|---|---|:---:|
+| Protobuf Contracts (`UpdateWalletKYC`, `GetWalletLimits`) | `proto/wallet/wallet.proto` | ✅ Complete |
+| Compliance & Velocity Engine (`TierConfigs`, `CheckVelocityLimits`) | `cmd/wallet-service/compliance.go` | ✅ Complete |
+| Dynamic 24h Rolling Volume & 1h Rate Verification | `cmd/wallet-service/compliance.go` | ✅ Complete |
+| KYC Tier Persistence & Transfer Pipeline Enforcement | `cmd/wallet-service/main.go` | ✅ Complete |
+| Exchange Pipeline Compliance Guard & Velocity Logging | `cmd/wallet-service/main.go` | ✅ Complete |
+| MongoDB Velocity Logs TTL & Indexing | `pkg/db/indexes.go` | ✅ Complete |
+| REST Endpoints (`PUT /api/v1/wallets/kyc`, `GET /api/v1/wallets/limits`) | `cmd/api-gateway/main.go` | ✅ Complete |
+| Unit & Concurrency Test Suites | `cmd/wallet-service/main_unit_test.go`, `cmd/api-gateway/gateway_routes_unit_test.go` | ✅ Complete |
+
 
 
