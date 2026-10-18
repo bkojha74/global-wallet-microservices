@@ -33,6 +33,7 @@ import (
 	"wallet-system/pkg/coordinator"
 	"wallet-system/pkg/db"
 	"wallet-system/pkg/observability"
+	"wallet-system/pkg/resilience"
 	"wallet-system/pkg/tlsutil"
 	fxv1 "wallet-system/proto/fx"
 	ledgerv1 "wallet-system/proto/ledger"
@@ -1031,9 +1032,13 @@ func dialLedgerClient(ledgerAddr string) (*grpc.ClientConn, ledgerv1.LedgerServi
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to initialize outbound mTLS dial credentials: %w", err)
 	}
+	cb := resilience.NewClientCircuitBreaker(resilience.DefaultCircuitBreakerConfig("ledger-service"))
 	ledgerDialOpts := []grpc.DialOption{
 		dialOpt,
-		grpc.WithUnaryInterceptor(observability.UnaryClientTraceInterceptor(walletServiceName)),
+		grpc.WithChainUnaryInterceptor(
+			observability.UnaryClientTraceInterceptor(walletServiceName),
+			resilience.UnaryClientCircuitBreakerInterceptor(cb),
+		),
 	}
 	conn, err := grpc.NewClient(ledgerAddr, ledgerDialOpts...)
 	if err != nil {
@@ -1138,9 +1143,13 @@ func dialFXClient(fxAddr string) (*grpc.ClientConn, fxv1.FXServiceClient, error)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to initialize outbound mTLS dial credentials: %w", err)
 	}
+	cb := resilience.NewClientCircuitBreaker(resilience.DefaultCircuitBreakerConfig("fx-service"))
 	fxDialOpts := []grpc.DialOption{
 		dialOpt,
-		grpc.WithUnaryInterceptor(observability.UnaryClientTraceInterceptor(walletServiceName)),
+		grpc.WithChainUnaryInterceptor(
+			observability.UnaryClientTraceInterceptor(walletServiceName),
+			resilience.UnaryClientCircuitBreakerInterceptor(cb),
+		),
 	}
 	conn, err := grpc.NewClient(fxAddr, fxDialOpts...)
 	if err != nil {

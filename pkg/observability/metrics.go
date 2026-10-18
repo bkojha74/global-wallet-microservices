@@ -39,6 +39,9 @@ type MetricsRegistry struct {
 	cacheHits          map[string]int64 // cache_hits_total{service,cache}
 	cacheMisses        map[string]int64 // cache_misses_total{service,cache}
 	cacheInvalidations map[string]int64 // cache_invalidations_total{service,cache}
+
+	// FX provider resilience metrics
+	fxProviderDegraded map[string]int64 // fx_provider_degraded_total{provider,reason}
 }
 
 // DefaultMetrics is the process-wide singleton registry used by all AsyncLogger instances.
@@ -60,6 +63,7 @@ func NewMetricsRegistry() *MetricsRegistry {
 		cacheHits:           make(map[string]int64),
 		cacheMisses:         make(map[string]int64),
 		cacheInvalidations:  make(map[string]int64),
+		fxProviderDegraded:  make(map[string]int64),
 	}
 }
 
@@ -113,6 +117,13 @@ func (m *MetricsRegistry) IncCacheInvalidations(service, cache string) {
 	key := fmt.Sprintf("service=%q,cache=%q", service, cache)
 	m.mu.Lock()
 	m.cacheInvalidations[key]++
+	m.mu.Unlock()
+}
+
+func (m *MetricsRegistry) IncFXProviderDegraded(provider, reason string) {
+	key := fmt.Sprintf("provider=%q,reason=%q", provider, reason)
+	m.mu.Lock()
+	m.fxProviderDegraded[key]++
 	m.mu.Unlock()
 }
 
@@ -203,6 +214,7 @@ func (m *MetricsRegistry) Handler() http.Handler {
 		writeMetricInts(&b, "cache_hits_total", "Total cache hits by service and cache name.", "counter", m.cacheHits)
 		writeMetricInts(&b, "cache_misses_total", "Total cache misses by service and cache name.", "counter", m.cacheMisses)
 		writeMetricInts(&b, "cache_invalidations_total", "Total cache invalidations by service and cache name.", "counter", m.cacheInvalidations)
+		writeMetricInts(&b, "fx_provider_degraded_total", "Total count of upstream FX provider failures falling back to cached rates.", "counter", m.fxProviderDegraded)
 
 		_, _ = w.Write([]byte(b.String()))
 	})
