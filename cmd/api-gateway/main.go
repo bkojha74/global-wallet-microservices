@@ -980,9 +980,10 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 
 	if resp.Status != walletv1.WithdrawFundsResponse_SUCCESS {
 		statusHTTP := http.StatusBadRequest
-		if resp.Status == walletv1.WithdrawFundsResponse_FAILED_INSUFFICIENT_FUNDS {
+		switch resp.Status {
+		case walletv1.WithdrawFundsResponse_FAILED_INSUFFICIENT_FUNDS:
 			statusHTTP = http.StatusUnprocessableEntity
-		} else if resp.Status == walletv1.WithdrawFundsResponse_FAILED_VELOCITY_LIMIT_EXCEEDED {
+		case walletv1.WithdrawFundsResponse_FAILED_VELOCITY_LIMIT_EXCEEDED:
 			statusHTTP = http.StatusTooManyRequests
 		}
 		writeJSON(w, statusHTTP, map[string]interface{}{
