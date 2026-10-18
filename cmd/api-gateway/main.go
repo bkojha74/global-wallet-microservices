@@ -407,6 +407,146 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, respMap)
 }
 
+func (g *Gateway) handleWalletExchange(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	correlation := observability.FromHTTPRequest(r)
+	traceID := correlation.AssociationID
+	body, err := readClientJSON(traceID, r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		IdempotencyKey string `json:"idempotency_key"`
+		WalletID       string `json:"wallet_id"`
+		FromCurrency   string `json:"from_currency"`
+		ToCurrency     string `json:"to_currency"`
+		FromAmount     int64  `json:"from_amount"`
+		Amount         int64  `json:"amount"`
+		FXQuoteID      string `json:"fx_quote_id"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		log.Printf("[TRACE] trace_id=%s step=http_json_decode_failed error=%v", traceID, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	walletID := strings.TrimSpace(req.WalletID)
+	if walletID == "" {
+		http.Error(w, "wallet_id is required", http.StatusBadRequest)
+		return
+	}
+	fromAmount := req.FromAmount
+	if fromAmount <= 0 {
+		fromAmount = req.Amount
+	}
+	fromCurr := db.NormalizeCurrency(req.FromCurrency)
+	toCurr := db.NormalizeCurrency(req.ToCurrency)
+	if fromCurr == "" || toCurr == "" {
+		http.Error(w, "from_currency and to_currency are required", http.StatusBadRequest)
+		return
+	}
+	if fromCurr == toCurr {
+		http.Error(w, "from_currency and to_currency must be different", http.StatusBadRequest)
+		return
+	}
+	if err := db.ValidateAmount(fromAmount, fromCurr); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	idempKey := strings.TrimSpace(req.IdempotencyKey)
+	if idempKey == "" {
+		idempKey = r.Header.Get("Idempotency-Key")
+	}
+	if idempKey == "" {
+		idempKey = "idemp_exch_" + traceID
+	}
+	correlation.IdempotencyKey = idempKey
+
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		if err := ValidateWalletOwnership(claims, walletID); err != nil {
+			log.Printf("[SECURITY] IDOR blocked: subject %s tried to exchange currency in wallet %s", claims.Subject, walletID)
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
+			return
+		}
+	}
+
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	g.emit(ctx, eventAPIRequestReceived, observability.LevelInfo, "HTTP intra-wallet exchange request received", map[string]any{
+		"operation":     "exchange_currency",
+		"wallet_id":     walletID,
+		"from_currency": fromCurr,
+		"to_currency":   toCurr,
+		"from_amount":   fromAmount,
+		"fx_quote_id":   req.FXQuoteID,
+	})
+
+	protoReq := &walletv1.ExchangeCurrencyRequest{
+		IdempotencyKey: idempKey,
+		WalletId:       walletID,
+		FromCurrency:   fromCurr,
+		ToCurrency:     toCurr,
+		FromAmount:     fromAmount,
+		FxQuoteId:      strings.TrimSpace(req.FXQuoteID),
+	}
+
+	client, target := g.getActiveWalletClient(ctx)
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	resp, err := client.ExchangeCurrency(callCtx, protoReq)
+	if err != nil {
+		log.Printf(traceWalletGRPCRespFmt, traceID, err)
+		handleWalletGRPCError(w, err, "exchanging currency")
+		return
+	}
+
+	if resp.Status != walletv1.ExchangeCurrencyResponse_SUCCESS {
+		statusHTTP := http.StatusBadRequest
+		if resp.Status == walletv1.ExchangeCurrencyResponse_FAILED_INSUFFICIENT_FUNDS {
+			statusHTTP = http.StatusUnprocessableEntity
+		}
+		writeJSON(w, statusHTTP, map[string]interface{}{
+			"status":         resp.Status.String(),
+			"error_message":  resp.ErrorMessage,
+			"transaction_id": resp.TransactionId,
+			"routed_gateway": target,
+			"handled_region": resp.HandledByRegion,
+		})
+		return
+	}
+
+	g.emit(ctx, eventAPIResponseSent, observability.LevelInfo, "Intra-wallet currency exchange response sent", map[string]any{
+		"operation":      "exchange_currency",
+		"transaction_id": resp.TransactionId,
+		"wallet_id":      walletID,
+		"from_currency":  fromCurr,
+		"from_amount":    fromAmount,
+		"to_currency":    toCurr,
+		"exchange_rate":  resp.ExchangeRate,
+	})
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":          resp.Status.String(),
+		"transaction_id":  resp.TransactionId,
+		"wallet_id":       walletID,
+		"from_currency":   fromCurr,
+		"debited_amount":  resp.GetDebitedAmount().GetUnits(),
+		"to_currency":     toCurr,
+		"credited_amount": resp.GetCreditedAmount().GetUnits(),
+		"exchange_rate":   resp.ExchangeRate,
+		"fx_quote_id":     resp.FxQuoteId,
+		"routed_gateway":  target,
+		"handled_region":  resp.HandledByRegion,
+	})
+}
+
 func (g *Gateway) handleLedger(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
@@ -1080,6 +1220,7 @@ func (gw *Gateway) handleFXRatesRefresh(w http.ResponseWriter, r *http.Request) 
 
 func registerGatewayRoutes(mux *http.ServeMux, gw *Gateway) {
 	mux.HandleFunc("/api/v1/wallets", gw.handleWallets)
+	mux.HandleFunc("/api/v1/wallets/exchange", gw.handleWalletExchange)
 	mux.HandleFunc("/api/v1/transfers", gw.handleTransfer)
 	mux.HandleFunc("/api/v1/ledger", gw.handleLedger)
 	mux.HandleFunc("/api/v1/fx/currencies", gw.handleFXCurrencies)

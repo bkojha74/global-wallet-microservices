@@ -7,6 +7,7 @@ service WalletService {
   rpc CreateWallet (CreateWalletRequest) returns (CreateWalletResponse);
   rpc GetBalance (GetBalanceRequest) returns (GetBalanceResponse);
   rpc TransferFunds (TransferFundsRequest) returns (TransferFundsResponse);
+  rpc ExchangeCurrency (ExchangeCurrencyRequest) returns (ExchangeCurrencyResponse);
   rpc HealthCheck (HealthRequest) returns (HealthResponse);
 }
 
@@ -62,6 +63,35 @@ message TransferFundsResponse {
   string fx_quote_id = 5;
   double exchange_rate = 6;
   Money converted_amount = 7;
+}
+
+message ExchangeCurrencyRequest {
+  string idempotency_key = 1;
+  string wallet_id = 2;
+  string from_currency = 3;
+  string to_currency = 4;
+  int64 from_amount = 5;
+  // Optional: Locked FX Quote ID from fx-service (e.g., fxq_...)
+  string fx_quote_id = 6;
+}
+
+message ExchangeCurrencyResponse {
+  string transaction_id = 1;
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    SUCCESS = 1;
+    FAILED_INSUFFICIENT_FUNDS = 2;
+    REJECTED_DUPLICATE = 3;
+    INVALID_ARGUMENT = 4;
+    INTERNAL_ERROR = 5;
+  }
+  Status status = 2;
+  string error_message = 3;
+  string handled_by_region = 4;
+  string fx_quote_id = 5;
+  double exchange_rate = 6;
+  Money debited_amount = 7;
+  Money credited_amount = 8;
 }
 
 message HealthRequest {}

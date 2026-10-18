@@ -360,3 +360,124 @@ func TestWalletServer_ValidationAndStatusChecks(t *testing.T) {
 		t.Fatalf("expected no error for ACTIVE status")
 	}
 }
+
+func TestMultiCurrencyPots_Balances(t *testing.T) {
+	// 1. Multi-currency pots
+	w := WalletModel{
+		ID: "wallet-multi-1",
+		Balances: map[string]int64{
+			"USD": 15000,
+			"EUR": 8000,
+			"GBP": 2500,
+		},
+		Status: WalletStatusActive,
+	}
+
+	if w.GetBalance("USD") != 15000 {
+		t.Errorf("expected 15000 USD, got %d", w.GetBalance("USD"))
+	}
+	if w.GetBalance("EUR") != 8000 {
+		t.Errorf("expected 8000 EUR, got %d", w.GetBalance("EUR"))
+	}
+	if w.GetBalance("JPY") != 0 {
+		t.Errorf("expected 0 JPY, got %d", w.GetBalance("JPY"))
+	}
+
+	if !w.HasSufficientBalance("USD", 10000) {
+		t.Errorf("expected sufficient balance for 10000 USD")
+	}
+	if w.HasSufficientBalance("USD", 20000) {
+		t.Errorf("expected insufficient balance for 20000 USD")
+	}
+
+	allBalances := w.GetAllBalances()
+	if len(allBalances) != 3 {
+		t.Fatalf("expected 3 currency pots, got %d", len(allBalances))
+	}
+	// Deterministic sort: EUR, GBP, USD
+	if allBalances[0].Currency != "EUR" || allBalances[1].Currency != "GBP" || allBalances[2].Currency != "USD" {
+		t.Errorf("unexpected sort order for balances: %+v", allBalances)
+	}
+
+	// 2. Legacy single-currency fallback
+	legacyWallet := WalletModel{
+		ID:       "wallet-legacy-1",
+		Currency: "USD",
+		Balance:  5000,
+	}
+	if legacyWallet.GetBalance("USD") != 5000 {
+		t.Errorf("expected 5000 USD for legacy wallet, got %d", legacyWallet.GetBalance("USD"))
+	}
+	if legacyWallet.GetBalance("EUR") != 0 {
+		t.Errorf("expected 0 EUR for legacy wallet, got %d", legacyWallet.GetBalance("EUR"))
+	}
+	legacyBalances := legacyWallet.GetAllBalances()
+	if len(legacyBalances) != 1 || legacyBalances[0].Currency != "USD" || legacyBalances[0].Units != 5000 {
+		t.Errorf("expected single USD balance for legacy wallet, got %+v", legacyBalances)
+	}
+}
+
+func TestExchangeCurrency_Validation(t *testing.T) {
+	ctx := context.Background()
+	srv := &server{isActive: true, region: "us-east-1"}
+
+	// 1. Nil request
+	if _, err := srv.ExchangeCurrency(ctx, nil); err == nil {
+		t.Errorf("expected error for nil request")
+	}
+
+	// 2. Missing idempotency key
+	if _, err := srv.ExchangeCurrency(ctx, &walletv1.ExchangeCurrencyRequest{
+		WalletId:     "w1",
+		FromCurrency: "USD",
+		ToCurrency:   "EUR",
+		FromAmount:   100,
+	}); err == nil {
+		t.Errorf("expected error for missing idempotency key")
+	}
+
+	// 3. Missing wallet_id
+	if _, err := srv.ExchangeCurrency(ctx, &walletv1.ExchangeCurrencyRequest{
+		IdempotencyKey: "k1",
+		FromCurrency:   "USD",
+		ToCurrency:     "EUR",
+		FromAmount:     100,
+	}); err == nil {
+		t.Errorf("expected error for missing wallet_id")
+	}
+
+	// 4. Identical currencies
+	if _, err := srv.ExchangeCurrency(ctx, &walletv1.ExchangeCurrencyRequest{
+		IdempotencyKey: "k1",
+		WalletId:       "w1",
+		FromCurrency:   "USD",
+		ToCurrency:     "USD",
+		FromAmount:     100,
+	}); err == nil {
+		t.Errorf("expected error for identical currencies")
+	}
+
+	// 5. Non-positive amount
+	if _, err := srv.ExchangeCurrency(ctx, &walletv1.ExchangeCurrencyRequest{
+		IdempotencyKey: "k1",
+		WalletId:       "w1",
+		FromCurrency:   "USD",
+		ToCurrency:     "EUR",
+		FromAmount:     -50,
+	}); err == nil {
+		t.Errorf("expected error for negative amount")
+	}
+
+	// 6. Standby write rejection
+	standbySrv := &server{isActive: false, region: "eu-west-1"}
+	respStandby, errStandby := standbySrv.ExchangeCurrency(ctx, &walletv1.ExchangeCurrencyRequest{
+		IdempotencyKey: "k1",
+		WalletId:       "w1",
+		FromCurrency:   "USD",
+		ToCurrency:     "EUR",
+		FromAmount:     100,
+	})
+	if errStandby != nil || respStandby == nil || respStandby.Status != walletv1.ExchangeCurrencyResponse_INVALID_ARGUMENT {
+		t.Errorf("expected standby rejection response, got resp=%+v, err=%v", respStandby, errStandby)
+	}
+}

@@ -136,9 +136,9 @@ graph TD
 ### Pillar 4: Core Banking & Financial Product Expansion
 *Focus: Support multi-currency wallets, payment rails, and velocity limits.*
 
-- [ ] **FIN-01: Multi-Currency Pots per Wallet**
-  - [ ] Extend `WalletModel` to support balances map `map[string]int64` (e.g. `USD: 10000`, `EUR: 5000`).
-  - [ ] Enable atomic intra-wallet currency exchanges.
+- [x] **FIN-01: Multi-Currency Pots per Wallet**
+  - [x] Extend `WalletModel` to support balances map `map[string]int64` (e.g. `USD: 10000`, `EUR: 5000`).
+  - [x] Enable atomic intra-wallet currency exchanges.
 - [ ] **FIN-02: Velocity Limits & Compliance Engine**
   - [ ] Add configurable 24-hour rolling volume limits and transaction rate caps per user.
   - [ ] Support KYC tier enforcement (`TIER_1`, `TIER_2`, `TIER_3`).
@@ -209,4 +209,19 @@ graph TD
 | FX Stale Fallback Unit & Race Suite | `cmd/fx-service/main_test.go` | ✅ Complete |
 | Outbox Relay Full-Jitter Exponential Backoff | `cmd/wallet-service/ledger_outbox.go` | ✅ Complete |
 | Outbox Backoff Unit & Race Test Suite | `cmd/wallet-service/ledger_outbox_unit_test.go` | ✅ Complete |
+
+---
+
+## 7. Current Execution Status: Track 4 (Core Banking Expansion - FIN-01)
+
+| Component / Subsystem | File Path | Status |
+|---|---|:---:|
+| Multi-Currency Protobuf Definition (`ExchangeCurrency`) | `proto/wallet/wallet.proto` | ✅ Complete |
+| Wallet Multi-Currency Pots Model (`Balances map[string]int64`) | `cmd/wallet-service/main.go` | ✅ Complete |
+| Atomic Intra-Wallet FX Exchange Handler & ACID Flow | `cmd/wallet-service/main.go` | ✅ Complete |
+| Double-Entry Intra-Wallet Ledger Outbox Integration | `cmd/wallet-service/main.go` | ✅ Complete |
+| API Gateway REST Route (`POST /api/v1/wallets/exchange`) | `cmd/api-gateway/main.go` | ✅ Complete |
+| Wallet Service Multi-Currency & Exchange Unit Tests | `cmd/wallet-service/main_unit_test.go` | ✅ Complete |
+| API Gateway Exchange Endpoint Unit Tests | `cmd/api-gateway/gateway_routes_unit_test.go` | ✅ Complete |
+
 
