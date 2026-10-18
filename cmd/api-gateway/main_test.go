@@ -60,6 +60,10 @@ func (f *fakeWalletClient) HealthCheck(context.Context, *walletv1.HealthRequest,
 	return nil, errors.New("HealthCheck not implemented in fake")
 }
 
+func (f *fakeWalletClient) ExchangeCurrency(context.Context, *walletv1.ExchangeCurrencyRequest, ...grpc.CallOption) (*walletv1.ExchangeCurrencyResponse, error) {
+	return nil, errors.New("ExchangeCurrency not implemented in fake")
+}
+
 type fakeLedgerClient struct {
 	getLedgerRequest  *ledgerv1.GetLedgerRequest
 	getLedgerResponse *ledgerv1.GetLedgerResponse

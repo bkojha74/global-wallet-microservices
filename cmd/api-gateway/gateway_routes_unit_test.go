@@ -26,6 +26,20 @@ func (m *mockWalletClient) HealthCheck(ctx context.Context, in *walletv1.HealthR
 	return &walletv1.HealthResponse{Status: "SERVING"}, nil
 }
 
+func (m *mockWalletClient) ExchangeCurrency(ctx context.Context, in *walletv1.ExchangeCurrencyRequest, opts ...grpc.CallOption) (*walletv1.ExchangeCurrencyResponse, error) {
+	if in.FromAmount <= 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "amount must be positive")
+	}
+	return &walletv1.ExchangeCurrencyResponse{
+		TransactionId:   "tx-mock-exch-1",
+		Status:          walletv1.ExchangeCurrencyResponse_SUCCESS,
+		HandledByRegion: "us-test-1",
+		ExchangeRate:    0.92,
+		DebitedAmount:   &walletv1.Money{Currency: in.FromCurrency, Units: in.FromAmount},
+		CreditedAmount:  &walletv1.Money{Currency: in.ToCurrency, Units: int64(float64(in.FromAmount) * 0.92)},
+	}, nil
+}
+
 func TestGatewayEmitAndWriteJSON(t *testing.T) {
 	_ = walletv1.CreateWalletRequest{}
 	gw := &Gateway{}
@@ -240,4 +254,47 @@ func TestRunGatewayServer_CancelledContext(t *testing.T) {
 
 	err := runGatewayServer(ctx)
 	t.Logf("runGatewayServer returned: %v", err)
+}
+
+func TestGatewayWalletExchangeHandler(t *testing.T) {
+	mockClient := &mockWalletClient{}
+	gw := &Gateway{
+		primaryClient: mockClient,
+		activeTarget:  coordinator.TargetPrimary,
+	}
+
+	// 1. GET not allowed (405)
+	reqGet := httptest.NewRequest(http.MethodGet, "/api/v1/wallets/exchange", nil)
+	wGet := httptest.NewRecorder()
+	gw.handleWalletExchange(wGet, reqGet)
+	if wGet.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for GET exchange, got %d", wGet.Code)
+	}
+
+	// 2. Missing wallet_id (400)
+	bodyNoWallet := bytes.NewBufferString(`{"from_currency":"USD","to_currency":"EUR","amount":100}`)
+	reqNoWallet := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/exchange", bodyNoWallet)
+	wNoWallet := httptest.NewRecorder()
+	gw.handleWalletExchange(wNoWallet, reqNoWallet)
+	if wNoWallet.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing wallet_id, got %d", wNoWallet.Code)
+	}
+
+	// 3. Same currencies (400)
+	bodySameCurr := bytes.NewBufferString(`{"wallet_id":"alice","from_currency":"USD","to_currency":"USD","amount":100}`)
+	reqSameCurr := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/exchange", bodySameCurr)
+	wSameCurr := httptest.NewRecorder()
+	gw.handleWalletExchange(wSameCurr, reqSameCurr)
+	if wSameCurr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for identical currencies, got %d", wSameCurr.Code)
+	}
+
+	// 4. Successful exchange (200)
+	bodySuccess := bytes.NewBufferString(`{"wallet_id":"alice","from_currency":"USD","to_currency":"EUR","from_amount":1000}`)
+	reqSuccess := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/exchange", bodySuccess)
+	wSuccess := httptest.NewRecorder()
+	gw.handleWalletExchange(wSuccess, reqSuccess)
+	if wSuccess.Code != http.StatusOK {
+		t.Fatalf("expected 200 for successful exchange, got %d (%s)", wSuccess.Code, wSuccess.Body.String())
+	}
 }
