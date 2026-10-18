@@ -587,3 +587,151 @@ func TestUpdateWalletKYC_Validation(t *testing.T) {
 		t.Errorf("expected failure for invalid tier")
 	}
 }
+
+func TestParsePaymentRail(t *testing.T) {
+	cases := []struct {
+		rail     walletv1.PaymentRail
+		expected string
+		wantErr  bool
+	}{
+		{walletv1.PaymentRail_CARD, "CARD", false},
+		{walletv1.PaymentRail_ACH, "ACH", false},
+		{walletv1.PaymentRail_SEPA, "SEPA", false},
+		{walletv1.PaymentRail_WIRE, "WIRE", false},
+		{walletv1.PaymentRail_PAYMENT_RAIL_UNSPECIFIED, "", true},
+		{walletv1.PaymentRail(999), "", true},
+	}
+
+	for _, c := range cases {
+		got, err := parsePaymentRail(c.rail)
+		if c.wantErr && err == nil {
+			t.Errorf("expected error for rail %v, got nil", c.rail)
+		}
+		if !c.wantErr && err != nil {
+			t.Errorf("unexpected error for rail %v: %v", c.rail, err)
+		}
+		if got != c.expected {
+			t.Errorf("for rail %v: expected %s, got %s", c.rail, c.expected, got)
+		}
+	}
+}
+
+func TestDepositFunds_Validations(t *testing.T) {
+	srv := &server{isActive: true, region: "us-east-1"}
+	ctx := context.Background()
+
+	// 1. Nil request
+	if _, err := srv.DepositFunds(ctx, nil); err == nil {
+		t.Errorf("expected error for nil request")
+	}
+
+	// 2. Missing idempotency key
+	if _, err := srv.DepositFunds(ctx, &walletv1.DepositFundsRequest{
+		WalletId:    "w1",
+		Amount:      &walletv1.Money{Currency: "USD", Units: 100},
+		PaymentRail: walletv1.PaymentRail_CARD,
+	}); err == nil {
+		t.Errorf("expected error for missing idempotency key")
+	}
+
+	// 3. Missing wallet_id
+	if _, err := srv.DepositFunds(ctx, &walletv1.DepositFundsRequest{
+		IdempotencyKey: "k1",
+		Amount:         &walletv1.Money{Currency: "USD", Units: 100},
+		PaymentRail:    walletv1.PaymentRail_CARD,
+	}); err == nil {
+		t.Errorf("expected error for missing wallet_id")
+	}
+
+	// 4. Non-positive amount
+	if _, err := srv.DepositFunds(ctx, &walletv1.DepositFundsRequest{
+		IdempotencyKey: "k1",
+		WalletId:       "w1",
+		Amount:         &walletv1.Money{Currency: "USD", Units: 0},
+		PaymentRail:    walletv1.PaymentRail_CARD,
+	}); err == nil {
+		t.Errorf("expected error for zero amount")
+	}
+
+	// 5. Unspecified payment rail
+	if _, err := srv.DepositFunds(ctx, &walletv1.DepositFundsRequest{
+		IdempotencyKey: "k1",
+		WalletId:       "w1",
+		Amount:         &walletv1.Money{Currency: "USD", Units: 100},
+		PaymentRail:    walletv1.PaymentRail_PAYMENT_RAIL_UNSPECIFIED,
+	}); err == nil {
+		t.Errorf("expected error for unspecified payment rail")
+	}
+
+	// 6. Standby replica rejection
+	standbySrv := &server{isActive: false, region: "eu-west-1"}
+	respStandby, errStandby := standbySrv.DepositFunds(ctx, &walletv1.DepositFundsRequest{
+		IdempotencyKey: "k1",
+		WalletId:       "w1",
+		Amount:         &walletv1.Money{Currency: "USD", Units: 100},
+		PaymentRail:    walletv1.PaymentRail_ACH,
+	})
+	if errStandby != nil || respStandby == nil || respStandby.Status != walletv1.DepositFundsResponse_INVALID_ARGUMENT {
+		t.Errorf("expected standby rejection response, got resp=%+v, err=%v", respStandby, errStandby)
+	}
+}
+
+func TestWithdrawFunds_Validations(t *testing.T) {
+	srv := &server{isActive: true, region: "us-east-1"}
+	ctx := context.Background()
+
+	// 1. Nil request
+	if _, err := srv.WithdrawFunds(ctx, nil); err == nil {
+		t.Errorf("expected error for nil request")
+	}
+
+	// 2. Missing idempotency key
+	if _, err := srv.WithdrawFunds(ctx, &walletv1.WithdrawFundsRequest{
+		WalletId:    "w1",
+		Amount:      &walletv1.Money{Currency: "USD", Units: 100},
+		PaymentRail: walletv1.PaymentRail_ACH,
+	}); err == nil {
+		t.Errorf("expected error for missing idempotency key")
+	}
+
+	// 3. Missing wallet_id
+	if _, err := srv.WithdrawFunds(ctx, &walletv1.WithdrawFundsRequest{
+		IdempotencyKey: "k1",
+		Amount:         &walletv1.Money{Currency: "USD", Units: 100},
+		PaymentRail:    walletv1.PaymentRail_ACH,
+	}); err == nil {
+		t.Errorf("expected error for missing wallet_id")
+	}
+
+	// 4. Non-positive amount
+	if _, err := srv.WithdrawFunds(ctx, &walletv1.WithdrawFundsRequest{
+		IdempotencyKey: "k1",
+		WalletId:       "w1",
+		Amount:         &walletv1.Money{Currency: "USD", Units: -10},
+		PaymentRail:    walletv1.PaymentRail_ACH,
+	}); err == nil {
+		t.Errorf("expected error for negative amount")
+	}
+
+	// 5. Unspecified payment rail
+	if _, err := srv.WithdrawFunds(ctx, &walletv1.WithdrawFundsRequest{
+		IdempotencyKey: "k1",
+		WalletId:       "w1",
+		Amount:         &walletv1.Money{Currency: "USD", Units: 100},
+		PaymentRail:    walletv1.PaymentRail_PAYMENT_RAIL_UNSPECIFIED,
+	}); err == nil {
+		t.Errorf("expected error for unspecified payment rail")
+	}
+
+	// 6. Standby replica rejection
+	standbySrv := &server{isActive: false, region: "eu-west-1"}
+	respStandby, errStandby := standbySrv.WithdrawFunds(ctx, &walletv1.WithdrawFundsRequest{
+		IdempotencyKey: "k1",
+		WalletId:       "w1",
+		Amount:         &walletv1.Money{Currency: "USD", Units: 100},
+		PaymentRail:    walletv1.PaymentRail_WIRE,
+	})
+	if errStandby != nil || respStandby == nil || respStandby.Status != walletv1.WithdrawFundsResponse_INVALID_ARGUMENT {
+		t.Errorf("expected standby rejection response, got resp=%+v, err=%v", respStandby, errStandby)
+	}
+}

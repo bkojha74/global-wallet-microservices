@@ -10,6 +10,8 @@ service WalletService {
   rpc ExchangeCurrency (ExchangeCurrencyRequest) returns (ExchangeCurrencyResponse);
   rpc UpdateWalletKYC (UpdateWalletKYCRequest) returns (UpdateWalletKYCResponse);
   rpc GetWalletLimits (GetWalletLimitsRequest) returns (GetWalletLimitsResponse);
+  rpc DepositFunds (DepositFundsRequest) returns (DepositFundsResponse);
+  rpc WithdrawFunds (WithdrawFundsRequest) returns (WithdrawFundsResponse);
   rpc HealthCheck (HealthRequest) returns (HealthResponse);
 }
 
@@ -134,5 +136,65 @@ message HealthResponse {
   string status = 1;
   string region = 2;
   bool is_active = 3;
+}
+
+enum PaymentRail {
+  PAYMENT_RAIL_UNSPECIFIED = 0;
+  CARD = 1;
+  ACH = 2;
+  SEPA = 3;
+  WIRE = 4;
+}
+
+message DepositFundsRequest {
+  string idempotency_key = 1;
+  string wallet_id = 2;
+  Money amount = 3;
+  PaymentRail payment_rail = 4;
+  string reference = 5;
+}
+
+message DepositFundsResponse {
+  string transaction_id = 1;
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    SUCCESS = 1;
+    REJECTED_DUPLICATE = 2;
+    INVALID_ARGUMENT = 3;
+    INTERNAL_ERROR = 4;
+  }
+  Status status = 2;
+  string error_message = 3;
+  string handled_by_region = 4;
+  Money credited_amount = 5;
+  PaymentRail payment_rail = 6;
+  string external_reference = 7;
+}
+
+message WithdrawFundsRequest {
+  string idempotency_key = 1;
+  string wallet_id = 2;
+  Money amount = 3;
+  PaymentRail payment_rail = 4;
+  string beneficiary_details = 5;
+}
+
+message WithdrawFundsResponse {
+  string transaction_id = 1;
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    SUCCESS = 1;
+    FAILED_INSUFFICIENT_FUNDS = 2;
+    REJECTED_DUPLICATE = 3;
+    INVALID_ARGUMENT = 4;
+    INTERNAL_ERROR = 5;
+    FAILED_VELOCITY_LIMIT_EXCEEDED = 6;
+  }
+  Status status = 2;
+  string error_message = 3;
+  string handled_by_region = 4;
+  Money debited_amount = 5;
+  PaymentRail payment_rail = 6;
+  string external_reference = 7;
 }
 

@@ -67,6 +67,42 @@ func (m *mockWalletClient) GetWalletLimits(ctx context.Context, in *walletv1.Get
 	}, nil
 }
 
+func (m *mockWalletClient) DepositFunds(ctx context.Context, in *walletv1.DepositFundsRequest, opts ...grpc.CallOption) (*walletv1.DepositFundsResponse, error) {
+	if in.Amount == nil || in.Amount.Units <= 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "amount must be positive")
+	}
+	return &walletv1.DepositFundsResponse{
+		TransactionId:     "tx-mock-dep-1",
+		Status:            walletv1.DepositFundsResponse_SUCCESS,
+		HandledByRegion:   "us-test-1",
+		CreditedAmount:    in.Amount,
+		PaymentRail:       in.PaymentRail,
+		ExternalReference: in.Reference,
+	}, nil
+}
+
+func (m *mockWalletClient) WithdrawFunds(ctx context.Context, in *walletv1.WithdrawFundsRequest, opts ...grpc.CallOption) (*walletv1.WithdrawFundsResponse, error) {
+	if in.Amount == nil || in.Amount.Units <= 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "amount must be positive")
+	}
+	if in.Amount.Units > 1000000 {
+		return &walletv1.WithdrawFundsResponse{
+			TransactionId:   "tx-mock-wth-fail",
+			Status:          walletv1.WithdrawFundsResponse_FAILED_VELOCITY_LIMIT_EXCEEDED,
+			ErrorMessage:    "velocity limit exceeded",
+			HandledByRegion: "us-test-1",
+		}, nil
+	}
+	return &walletv1.WithdrawFundsResponse{
+		TransactionId:     "tx-mock-wth-1",
+		Status:            walletv1.WithdrawFundsResponse_SUCCESS,
+		HandledByRegion:   "us-test-1",
+		DebitedAmount:     in.Amount,
+		PaymentRail:       in.PaymentRail,
+		ExternalReference: in.BeneficiaryDetails,
+	}, nil
+}
+
 func TestGatewayEmitAndWriteJSON(t *testing.T) {
 	_ = walletv1.CreateWalletRequest{}
 	gw := &Gateway{}
@@ -389,5 +425,109 @@ func TestHandleGetWalletLimits_Routes(t *testing.T) {
 	gw.handleGetWalletLimits(wSuccess, reqSuccess)
 	if wSuccess.Code != http.StatusOK {
 		t.Fatalf("expected 200 for limits query, got %d (%s)", wSuccess.Code, wSuccess.Body.String())
+	}
+}
+
+func TestHandleDepositFunds_Routes(t *testing.T) {
+	gw := &Gateway{
+		primaryClient: &mockWalletClient{},
+		standbyClient: &mockWalletClient{},
+		activeTarget:  coordinator.TargetPrimary,
+	}
+
+	// 1. GET method not allowed
+	reqGet := httptest.NewRequest(http.MethodGet, "/api/v1/wallets/deposit", nil)
+	wGet := httptest.NewRecorder()
+	gw.handleDepositFunds(wGet, reqGet)
+	if wGet.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for GET deposit, got %d", wGet.Code)
+	}
+
+	// 2. Missing wallet_id
+	bodyNoWallet := bytes.NewBufferString(`{"amount":1000,"currency":"USD","payment_rail":"CARD"}`)
+	reqNoWallet := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/deposit", bodyNoWallet)
+	wNoWallet := httptest.NewRecorder()
+	gw.handleDepositFunds(wNoWallet, reqNoWallet)
+	if wNoWallet.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing wallet_id, got %d", wNoWallet.Code)
+	}
+
+	// 3. Unsupported payment rail
+	bodyBadRail := bytes.NewBufferString(`{"wallet_id":"alice","amount":1000,"currency":"USD","payment_rail":"BITCOIN"}`)
+	reqBadRail := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/deposit", bodyBadRail)
+	wBadRail := httptest.NewRecorder()
+	gw.handleDepositFunds(wBadRail, reqBadRail)
+	if wBadRail.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for bad rail, got %d", wBadRail.Code)
+	}
+
+	// 4. Success via /api/v1/wallets/deposit
+	bodySuccess := bytes.NewBufferString(`{"wallet_id":"alice","amount":5000,"currency":"USD","payment_rail":"CARD","reference":"ref_123"}`)
+	reqSuccess := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/deposit", bodySuccess)
+	wSuccess := httptest.NewRecorder()
+	gw.handleDepositFunds(wSuccess, reqSuccess)
+	if wSuccess.Code != http.StatusOK {
+		t.Fatalf("expected 200 for successful deposit, got %d (%s)", wSuccess.Code, wSuccess.Body.String())
+	}
+
+	// 5. Success via subroute /api/v1/wallets/{id}/deposit
+	bodySubroute := bytes.NewBufferString(`{"amount":2500,"currency":"USD","payment_rail":"ACH"}`)
+	reqSubroute := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/alice/deposit", bodySubroute)
+	wSubroute := httptest.NewRecorder()
+	gw.handleWalletSubroutes(wSubroute, reqSubroute)
+	if wSubroute.Code != http.StatusOK {
+		t.Fatalf("expected 200 for subroute deposit, got %d (%s)", wSubroute.Code, wSubroute.Body.String())
+	}
+}
+
+func TestHandleWithdrawFunds_Routes(t *testing.T) {
+	gw := &Gateway{
+		primaryClient: &mockWalletClient{},
+		standbyClient: &mockWalletClient{},
+		activeTarget:  coordinator.TargetPrimary,
+	}
+
+	// 1. GET method not allowed
+	reqGet := httptest.NewRequest(http.MethodGet, "/api/v1/wallets/withdraw", nil)
+	wGet := httptest.NewRecorder()
+	gw.handleWithdrawFunds(wGet, reqGet)
+	if wGet.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for GET withdraw, got %d", wGet.Code)
+	}
+
+	// 2. Missing wallet_id
+	bodyNoWallet := bytes.NewBufferString(`{"amount":1000,"currency":"USD","payment_rail":"ACH"}`)
+	reqNoWallet := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/withdraw", bodyNoWallet)
+	wNoWallet := httptest.NewRecorder()
+	gw.handleWithdrawFunds(wNoWallet, reqNoWallet)
+	if wNoWallet.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing wallet_id, got %d", wNoWallet.Code)
+	}
+
+	// 3. Success via /api/v1/wallets/withdraw
+	bodySuccess := bytes.NewBufferString(`{"wallet_id":"alice","amount":5000,"currency":"USD","payment_rail":"ACH","beneficiary_details":"Bank routing 123"}`)
+	reqSuccess := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/withdraw", bodySuccess)
+	wSuccess := httptest.NewRecorder()
+	gw.handleWithdrawFunds(wSuccess, reqSuccess)
+	if wSuccess.Code != http.StatusOK {
+		t.Fatalf("expected 200 for successful withdraw, got %d (%s)", wSuccess.Code, wSuccess.Body.String())
+	}
+
+	// 4. Velocity limit exceeded (429)
+	bodyVelocity := bytes.NewBufferString(`{"wallet_id":"alice","amount":5000000,"currency":"USD","payment_rail":"WIRE"}`)
+	reqVelocity := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/withdraw", bodyVelocity)
+	wVelocity := httptest.NewRecorder()
+	gw.handleWithdrawFunds(wVelocity, reqVelocity)
+	if wVelocity.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 for velocity limit exceeded, got %d (%s)", wVelocity.Code, wVelocity.Body.String())
+	}
+
+	// 5. Success via subroute /api/v1/wallets/{id}/withdraw
+	bodySubroute := bytes.NewBufferString(`{"amount":1200,"currency":"EUR","payment_rail":"SEPA","beneficiary_details":"IBAN DE12345"}`)
+	reqSubroute := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/alice/withdraw", bodySubroute)
+	wSubroute := httptest.NewRecorder()
+	gw.handleWalletSubroutes(wSubroute, reqSubroute)
+	if wSubroute.Code != http.StatusOK {
+		t.Fatalf("expected 200 for subroute withdraw, got %d (%s)", wSubroute.Code, wSubroute.Body.String())
 	}
 }
