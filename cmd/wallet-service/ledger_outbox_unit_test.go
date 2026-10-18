@@ -138,8 +138,8 @@ func TestLedgerRelay_OfflineUnit(t *testing.T) {
 	relayWithStoreFail.store = mockStoreFail
 
 	countFail, errFail := relayWithStoreFail.ProcessBatch(context.Background())
-	if errFail != nil || countFail != 0 {
-		t.Errorf("Expected ProcessBatch count 0 on failure, got count=%d, err=%v", countFail, errFail)
+	if errFail == nil || countFail != 0 {
+		t.Errorf("Expected ProcessBatch error and count 0 on failure, got count=%d, err=%v", countFail, errFail)
 	}
 	if len(mockStoreFail.failedIDs) != 1 {
 		t.Errorf("Expected 1 failed ID in mock store")
@@ -297,5 +297,38 @@ func TestMongoRelayLeaseManager_NilColSafety(t *testing.T) {
 	}
 	if defaultMgr.HolderID() == "" {
 		t.Errorf("Expected non-empty resolved instance ID")
+	}
+}
+
+func TestLedgerRelay_CalculateBackoff(t *testing.T) {
+	relay := NewLedgerRelay(nil, nil, 100*time.Millisecond, 10, nil, WithMaxBackoff(2*time.Second))
+
+	// 0 consecutive errors should return base pollInterval
+	b0 := relay.CalculateBackoff(0)
+	if b0 != 100*time.Millisecond {
+		t.Errorf("Expected 100ms for 0 errors, got %v", b0)
+	}
+
+	// 1 consecutive error: multiplier 2^0 = 1, cap = 100ms, range = 0 -> exactly 100ms
+	b1 := relay.CalculateBackoff(1)
+	if b1 != 100*time.Millisecond {
+		t.Errorf("Expected 100ms for 1 error, got %v", b1)
+	}
+
+	// Increasing errors should stay bounded by pollInterval and maxBackoff
+	for i := 1; i <= 20; i++ {
+		backoff := relay.CalculateBackoff(i)
+		if backoff < 100*time.Millisecond {
+			t.Errorf("Backoff for attempt %d was below base interval: %v", i, backoff)
+		}
+		if backoff > 2*time.Second {
+			t.Errorf("Backoff for attempt %d exceeded maxBackoff: %v", i, backoff)
+		}
+	}
+
+	// Edge case: maxBackoff <= pollInterval
+	relayNoLimit := NewLedgerRelay(nil, nil, 500*time.Millisecond, 10, nil, WithMaxBackoff(100*time.Millisecond))
+	if b := relayNoLimit.CalculateBackoff(5); b != 500*time.Millisecond {
+		t.Errorf("Expected pollInterval when maxBackoff <= pollInterval, got %v", b)
 	}
 }
