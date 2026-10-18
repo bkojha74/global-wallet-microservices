@@ -673,6 +673,350 @@ func (g *Gateway) handleGetWalletLimits(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func parseProtoPaymentRail(railStr string) walletv1.PaymentRail {
+	switch strings.ToUpper(strings.TrimSpace(railStr)) {
+	case "CARD":
+		return walletv1.PaymentRail_CARD
+	case "ACH":
+		return walletv1.PaymentRail_ACH
+	case "SEPA":
+		return walletv1.PaymentRail_SEPA
+	case "WIRE":
+		return walletv1.PaymentRail_WIRE
+	default:
+		return walletv1.PaymentRail_PAYMENT_RAIL_UNSPECIFIED
+	}
+}
+
+func (gw *Gateway) handleWalletSubroutes(w http.ResponseWriter, r *http.Request) {
+	path := strings.Trim(r.URL.Path, "/")
+	parts := strings.Split(path, "/")
+	// /api/v1/wallets/{id}/deposit or /api/v1/wallets/{id}/withdraw
+	if len(parts) >= 5 && parts[0] == "api" && parts[1] == "v1" && parts[2] == "wallets" {
+		walletID := parts[3]
+		action := parts[4]
+		if action == "deposit" {
+			gw.executeDeposit(w, r, walletID)
+			return
+		}
+		if action == "withdraw" {
+			gw.executeWithdraw(w, r, walletID)
+			return
+		}
+	}
+	http.Error(w, "Not Found", http.StatusNotFound)
+}
+
+func (gw *Gateway) handleDepositFunds(w http.ResponseWriter, r *http.Request) {
+	gw.executeDeposit(w, r, "")
+}
+
+func (gw *Gateway) handleWithdrawFunds(w http.ResponseWriter, r *http.Request) {
+	gw.executeWithdraw(w, r, "")
+}
+
+func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWalletID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	correlation := observability.FromHTTPRequest(r)
+	traceID := correlation.AssociationID
+
+	body, err := readClientJSON(traceID, r.Body)
+	if err != nil {
+		log.Printf("[TRACE] trace_id=%s step=http_read_body_failed error=%v", traceID, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		IdempotencyKey string `json:"idempotency_key"`
+		WalletID       string `json:"wallet_id"`
+		Amount         int64  `json:"amount"`
+		Currency       string `json:"currency"`
+		PaymentRail    string `json:"payment_rail"`
+		Reference      string `json:"reference"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		log.Printf("[TRACE] trace_id=%s step=http_json_decode_failed error=%v", traceID, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	walletID := strings.TrimSpace(pathWalletID)
+	if walletID == "" {
+		walletID = strings.TrimSpace(req.WalletID)
+	}
+	if walletID == "" {
+		walletID = strings.TrimSpace(r.URL.Query().Get("id"))
+	}
+	if walletID == "" {
+		walletID = strings.TrimSpace(r.URL.Query().Get("wallet_id"))
+	}
+	if walletID == "" {
+		http.Error(w, "wallet_id is required", http.StatusBadRequest)
+		return
+	}
+
+	curr := db.NormalizeCurrency(req.Currency)
+	if curr == "" {
+		http.Error(w, "currency is required", http.StatusBadRequest)
+		return
+	}
+	if req.Amount <= 0 {
+		http.Error(w, "amount must be strictly positive", http.StatusBadRequest)
+		return
+	}
+	if err := db.ValidateAmount(req.Amount, curr); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	railProto := parseProtoPaymentRail(req.PaymentRail)
+	if railProto == walletv1.PaymentRail_PAYMENT_RAIL_UNSPECIFIED {
+		http.Error(w, "payment_rail must be one of CARD, ACH, SEPA, WIRE", http.StatusBadRequest)
+		return
+	}
+
+	idempKey := strings.TrimSpace(req.IdempotencyKey)
+	if idempKey == "" {
+		idempKey = r.Header.Get("Idempotency-Key")
+	}
+	if idempKey == "" {
+		idempKey = "idemp_dep_" + traceID
+	}
+	correlation.IdempotencyKey = idempKey
+
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		if err := ValidateWalletOwnership(claims, walletID); err != nil && !claims.HasRole(auth.RoleAdmin) {
+			log.Printf("[SECURITY] IDOR blocked: subject %s tried to deposit into wallet %s", claims.Subject, walletID)
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
+			return
+		}
+	}
+
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	g.emit(ctx, eventAPIRequestReceived, observability.LevelInfo, "HTTP deposit funds request received", map[string]any{
+		"operation":    "deposit_funds",
+		"wallet_id":    walletID,
+		"currency":     curr,
+		"amount":       req.Amount,
+		"payment_rail": req.PaymentRail,
+		"reference":    req.Reference,
+	})
+
+	protoReq := &walletv1.DepositFundsRequest{
+		IdempotencyKey: idempKey,
+		WalletId:       walletID,
+		Amount: &walletv1.Money{
+			Currency: curr,
+			Units:    req.Amount,
+		},
+		PaymentRail: railProto,
+		Reference:   req.Reference,
+	}
+
+	client, target := g.getActiveWalletClient(ctx)
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	resp, err := client.DepositFunds(callCtx, protoReq)
+	if err != nil {
+		log.Printf(traceWalletGRPCRespFmt, traceID, err)
+		handleWalletGRPCError(w, err, "depositing funds")
+		return
+	}
+
+	if resp.Status != walletv1.DepositFundsResponse_SUCCESS {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"status":         resp.Status.String(),
+			"error_message":  resp.ErrorMessage,
+			"transaction_id": resp.TransactionId,
+			"routed_gateway": target,
+			"handled_region": resp.HandledByRegion,
+		})
+		return
+	}
+
+	g.emit(ctx, eventAPIResponseSent, observability.LevelInfo, "Deposit funds response sent", map[string]any{
+		"operation":      "deposit_funds",
+		"transaction_id": resp.TransactionId,
+		"wallet_id":      walletID,
+		"currency":       curr,
+		"amount":         req.Amount,
+		"payment_rail":   req.PaymentRail,
+	})
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":             resp.Status.String(),
+		"transaction_id":     resp.TransactionId,
+		"wallet_id":          walletID,
+		"amount":             resp.GetCreditedAmount().GetUnits(),
+		"currency":           resp.GetCreditedAmount().GetCurrency(),
+		"payment_rail":       resp.PaymentRail.String(),
+		"external_reference": resp.ExternalReference,
+		"routed_gateway":     target,
+		"handled_region":     resp.HandledByRegion,
+	})
+}
+
+func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWalletID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	correlation := observability.FromHTTPRequest(r)
+	traceID := correlation.AssociationID
+
+	body, err := readClientJSON(traceID, r.Body)
+	if err != nil {
+		log.Printf("[TRACE] trace_id=%s step=http_read_body_failed error=%v", traceID, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		IdempotencyKey     string `json:"idempotency_key"`
+		WalletID           string `json:"wallet_id"`
+		Amount             int64  `json:"amount"`
+		Currency           string `json:"currency"`
+		PaymentRail        string `json:"payment_rail"`
+		BeneficiaryDetails string `json:"beneficiary_details"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		log.Printf("[TRACE] trace_id=%s step=http_json_decode_failed error=%v", traceID, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	walletID := strings.TrimSpace(pathWalletID)
+	if walletID == "" {
+		walletID = strings.TrimSpace(req.WalletID)
+	}
+	if walletID == "" {
+		walletID = strings.TrimSpace(r.URL.Query().Get("id"))
+	}
+	if walletID == "" {
+		walletID = strings.TrimSpace(r.URL.Query().Get("wallet_id"))
+	}
+	if walletID == "" {
+		http.Error(w, "wallet_id is required", http.StatusBadRequest)
+		return
+	}
+
+	curr := db.NormalizeCurrency(req.Currency)
+	if curr == "" {
+		http.Error(w, "currency is required", http.StatusBadRequest)
+		return
+	}
+	if req.Amount <= 0 {
+		http.Error(w, "amount must be strictly positive", http.StatusBadRequest)
+		return
+	}
+	if err := db.ValidateAmount(req.Amount, curr); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	railProto := parseProtoPaymentRail(req.PaymentRail)
+	if railProto == walletv1.PaymentRail_PAYMENT_RAIL_UNSPECIFIED {
+		http.Error(w, "payment_rail must be one of CARD, ACH, SEPA, WIRE", http.StatusBadRequest)
+		return
+	}
+
+	idempKey := strings.TrimSpace(req.IdempotencyKey)
+	if idempKey == "" {
+		idempKey = r.Header.Get("Idempotency-Key")
+	}
+	if idempKey == "" {
+		idempKey = "idemp_wth_" + traceID
+	}
+	correlation.IdempotencyKey = idempKey
+
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		if err := ValidateWalletOwnership(claims, walletID); err != nil && !claims.HasRole(auth.RoleAdmin) {
+			log.Printf("[SECURITY] IDOR blocked: subject %s tried to withdraw from wallet %s", claims.Subject, walletID)
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
+			return
+		}
+	}
+
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	g.emit(ctx, eventAPIRequestReceived, observability.LevelInfo, "HTTP withdraw funds request received", map[string]any{
+		"operation":           "withdraw_funds",
+		"wallet_id":           walletID,
+		"currency":            curr,
+		"amount":              req.Amount,
+		"payment_rail":        req.PaymentRail,
+		"beneficiary_details": req.BeneficiaryDetails,
+	})
+
+	protoReq := &walletv1.WithdrawFundsRequest{
+		IdempotencyKey: idempKey,
+		WalletId:       walletID,
+		Amount: &walletv1.Money{
+			Currency: curr,
+			Units:    req.Amount,
+		},
+		PaymentRail:        railProto,
+		BeneficiaryDetails: req.BeneficiaryDetails,
+	}
+
+	client, target := g.getActiveWalletClient(ctx)
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	resp, err := client.WithdrawFunds(callCtx, protoReq)
+	if err != nil {
+		log.Printf(traceWalletGRPCRespFmt, traceID, err)
+		handleWalletGRPCError(w, err, "withdrawing funds")
+		return
+	}
+
+	if resp.Status != walletv1.WithdrawFundsResponse_SUCCESS {
+		statusHTTP := http.StatusBadRequest
+		if resp.Status == walletv1.WithdrawFundsResponse_FAILED_INSUFFICIENT_FUNDS {
+			statusHTTP = http.StatusUnprocessableEntity
+		} else if resp.Status == walletv1.WithdrawFundsResponse_FAILED_VELOCITY_LIMIT_EXCEEDED {
+			statusHTTP = http.StatusTooManyRequests
+		}
+		writeJSON(w, statusHTTP, map[string]interface{}{
+			"status":         resp.Status.String(),
+			"error_message":  resp.ErrorMessage,
+			"transaction_id": resp.TransactionId,
+			"routed_gateway": target,
+			"handled_region": resp.HandledByRegion,
+		})
+		return
+	}
+
+	g.emit(ctx, eventAPIResponseSent, observability.LevelInfo, "Withdraw funds response sent", map[string]any{
+		"operation":      "withdraw_funds",
+		"transaction_id": resp.TransactionId,
+		"wallet_id":      walletID,
+		"currency":       curr,
+		"amount":         req.Amount,
+		"payment_rail":   req.PaymentRail,
+	})
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":             resp.Status.String(),
+		"transaction_id":     resp.TransactionId,
+		"wallet_id":          walletID,
+		"amount":             resp.GetDebitedAmount().GetUnits(),
+		"currency":           resp.GetDebitedAmount().GetCurrency(),
+		"payment_rail":       resp.PaymentRail.String(),
+		"external_reference": resp.ExternalReference,
+		"routed_gateway":     target,
+		"handled_region":     resp.HandledByRegion,
+	})
+}
+
 func (g *Gateway) handleLedger(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
@@ -1346,6 +1690,9 @@ func (gw *Gateway) handleFXRatesRefresh(w http.ResponseWriter, r *http.Request) 
 
 func registerGatewayRoutes(mux *http.ServeMux, gw *Gateway) {
 	mux.HandleFunc("/api/v1/wallets", gw.handleWallets)
+	mux.HandleFunc("/api/v1/wallets/", gw.handleWalletSubroutes)
+	mux.HandleFunc("/api/v1/wallets/deposit", gw.handleDepositFunds)
+	mux.HandleFunc("/api/v1/wallets/withdraw", gw.handleWithdrawFunds)
 	mux.HandleFunc("/api/v1/wallets/exchange", gw.handleWalletExchange)
 	mux.HandleFunc("/api/v1/wallets/kyc", gw.handleUpdateWalletKYC)
 	mux.HandleFunc("/api/v1/wallets/limits", gw.handleGetWalletLimits)
