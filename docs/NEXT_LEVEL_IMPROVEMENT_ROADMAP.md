@@ -44,6 +44,7 @@ graph TD
     P4 --> B1[Multi-Currency Pots per Wallet]
     P4 --> B2[Velocity Limits Engine]
     P4 --> B3[Deposit & Withdraw External Rails]
+    P4 --> B4[Partner Webhook Dispatcher]
 
     P5 --> D1[OpenAPI 3.0 & Swagger UI]
     P5 --> D2[Unified CLI walletctl]
