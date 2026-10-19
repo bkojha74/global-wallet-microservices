@@ -92,6 +92,28 @@ func EnsureWalletIndexes(ctx context.Context, db *mongo.Database) error {
 	}
 	log.Printf("[DB-INDEX] Ensured ledger_tasks indexes: %v", taskNames)
 
+	// 3. Compliance velocity tracking collection (wallet_velocity_records)
+	velocityCol := db.Collection("wallet_velocity_records")
+	velocityTTLSeconds := int32(3 * 24 * 60 * 60) // 3 days
+	velocityIndexes := []mongo.IndexModel{
+		{
+			Keys: bson.D{
+				bson.E{Key: "wallet_id", Value: 1},
+				bson.E{Key: "created_at", Value: -1},
+			},
+			Options: options.Index().SetName("idx_wallet_velocity_wallet_time"),
+		},
+		{
+			Keys:    bson.D{bson.E{Key: "created_at", Value: 1}},
+			Options: options.Index().SetExpireAfterSeconds(velocityTTLSeconds).SetName("idx_wallet_velocity_ttl_3d"),
+		},
+	}
+	velocityNames, err := velocityCol.Indexes().CreateMany(ctx, velocityIndexes)
+	if err != nil {
+		return fmt.Errorf("failed to create wallet_velocity_records indexes: %w", err)
+	}
+	log.Printf("[DB-INDEX] Ensured wallet_velocity_records indexes: %v", velocityNames)
+
 	return nil
 }
 
@@ -151,5 +173,51 @@ func EnsureFXIndexes(ctx context.Context, database *mongo.Database) error {
 	}
 
 	log.Printf("[DB-INDEX] Ensured FX Engine indexes on fx_rates, fx_quotes, and fx_conversions")
+	return nil
+}
+
+// EnsureWebhookIndexes creates indexes for outbound partner webhook subscriptions and delivery audit tracking:
+//   - webhook_subscriptions: lookup index on is_active + events, owner index
+//   - webhook_deliveries: polling index on status + next_retry_at, TTL index on created_at (30 days)
+func EnsureWebhookIndexes(ctx context.Context, database *mongo.Database) error {
+	if database == nil {
+		return nil
+	}
+
+	subsCol := database.Collection("webhook_subscriptions")
+	subIndexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{bson.E{Key: "is_active", Value: 1}, bson.E{Key: "events", Value: 1}},
+			Options: options.Index().SetName("idx_webhook_subs_active_events"),
+		},
+		{
+			Keys:    bson.D{bson.E{Key: "owner_id", Value: 1}},
+			Options: options.Index().SetName("idx_webhook_subs_owner"),
+		},
+	}
+	if _, err := subsCol.Indexes().CreateMany(ctx, subIndexes); err != nil {
+		return fmt.Errorf("failed to create webhook_subscriptions indexes: %w", err)
+	}
+
+	delCol := database.Collection("webhook_deliveries")
+	delTTLSeconds := int32(30 * 24 * 60 * 60) // 30 days
+	delIndexes := []mongo.IndexModel{
+		{
+			Keys: bson.D{
+				bson.E{Key: "status", Value: 1},
+				bson.E{Key: "next_retry_at", Value: 1},
+			},
+			Options: options.Index().SetName("idx_webhook_del_status_retry"),
+		},
+		{
+			Keys:    bson.D{bson.E{Key: "created_at", Value: 1}},
+			Options: options.Index().SetExpireAfterSeconds(delTTLSeconds).SetName("idx_webhook_del_ttl_30d"),
+		},
+	}
+	if _, err := delCol.Indexes().CreateMany(ctx, delIndexes); err != nil {
+		return fmt.Errorf("failed to create webhook_deliveries indexes: %w", err)
+	}
+
+	log.Printf("[DB-INDEX] Ensured webhook indexes on webhook_subscriptions and webhook_deliveries")
 	return nil
 }

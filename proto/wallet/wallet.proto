@@ -7,6 +7,11 @@ service WalletService {
   rpc CreateWallet (CreateWalletRequest) returns (CreateWalletResponse);
   rpc GetBalance (GetBalanceRequest) returns (GetBalanceResponse);
   rpc TransferFunds (TransferFundsRequest) returns (TransferFundsResponse);
+  rpc ExchangeCurrency (ExchangeCurrencyRequest) returns (ExchangeCurrencyResponse);
+  rpc UpdateWalletKYC (UpdateWalletKYCRequest) returns (UpdateWalletKYCResponse);
+  rpc GetWalletLimits (GetWalletLimitsRequest) returns (GetWalletLimitsResponse);
+  rpc DepositFunds (DepositFundsRequest) returns (DepositFundsResponse);
+  rpc WithdrawFunds (WithdrawFundsRequest) returns (WithdrawFundsResponse);
   rpc HealthCheck (HealthRequest) returns (HealthResponse);
 }
 
@@ -19,6 +24,7 @@ message CreateWalletRequest {
   string wallet_id = 1;
   string currency = 2;
   int64 initial_balance = 3;
+  string kyc_tier = 4;
 }
 
 message CreateWalletResponse {
@@ -55,6 +61,7 @@ message TransferFundsResponse {
     FAILED_INSUFFICIENT_FUNDS = 2;
     REJECTED_DUPLICATE = 3;
     INTERNAL_ERROR = 4;
+    FAILED_VELOCITY_LIMIT_EXCEEDED = 5;
   }
   Status status = 2;
   string error_message = 3;
@@ -64,6 +71,65 @@ message TransferFundsResponse {
   Money converted_amount = 7;
 }
 
+message ExchangeCurrencyRequest {
+  string idempotency_key = 1;
+  string wallet_id = 2;
+  string from_currency = 3;
+  string to_currency = 4;
+  int64 from_amount = 5;
+  // Optional: Locked FX Quote ID from fx-service (e.g., fxq_...)
+  string fx_quote_id = 6;
+}
+
+message ExchangeCurrencyResponse {
+  string transaction_id = 1;
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    SUCCESS = 1;
+    FAILED_INSUFFICIENT_FUNDS = 2;
+    REJECTED_DUPLICATE = 3;
+    INVALID_ARGUMENT = 4;
+    INTERNAL_ERROR = 5;
+    FAILED_VELOCITY_LIMIT_EXCEEDED = 6;
+  }
+  Status status = 2;
+  string error_message = 3;
+  string handled_by_region = 4;
+  string fx_quote_id = 5;
+  double exchange_rate = 6;
+  Money debited_amount = 7;
+  Money credited_amount = 8;
+}
+
+message UpdateWalletKYCRequest {
+  string wallet_id = 1;
+  string kyc_tier = 2;
+}
+
+message UpdateWalletKYCResponse {
+  bool success = 1;
+  string wallet_id = 2;
+  string previous_tier = 3;
+  string current_tier = 4;
+  string message = 5;
+}
+
+message GetWalletLimitsRequest {
+  string wallet_id = 1;
+}
+
+message GetWalletLimitsResponse {
+  string wallet_id = 1;
+  string kyc_tier = 2;
+  int64 single_transaction_limit = 3;
+  int64 daily_rolling_limit = 4;
+  int64 daily_rolling_spent = 5;
+  int64 daily_rolling_remaining = 6;
+  int32 hourly_rate_limit = 7;
+  int32 hourly_rate_spent = 8;
+  int32 hourly_rate_remaining = 9;
+}
+
 message HealthRequest {}
 
 message HealthResponse {
@@ -71,3 +137,64 @@ message HealthResponse {
   string region = 2;
   bool is_active = 3;
 }
+
+enum PaymentRail {
+  PAYMENT_RAIL_UNSPECIFIED = 0;
+  CARD = 1;
+  ACH = 2;
+  SEPA = 3;
+  WIRE = 4;
+}
+
+message DepositFundsRequest {
+  string idempotency_key = 1;
+  string wallet_id = 2;
+  Money amount = 3;
+  PaymentRail payment_rail = 4;
+  string reference = 5;
+}
+
+message DepositFundsResponse {
+  string transaction_id = 1;
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    SUCCESS = 1;
+    REJECTED_DUPLICATE = 2;
+    INVALID_ARGUMENT = 3;
+    INTERNAL_ERROR = 4;
+  }
+  Status status = 2;
+  string error_message = 3;
+  string handled_by_region = 4;
+  Money credited_amount = 5;
+  PaymentRail payment_rail = 6;
+  string external_reference = 7;
+}
+
+message WithdrawFundsRequest {
+  string idempotency_key = 1;
+  string wallet_id = 2;
+  Money amount = 3;
+  PaymentRail payment_rail = 4;
+  string beneficiary_details = 5;
+}
+
+message WithdrawFundsResponse {
+  string transaction_id = 1;
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    SUCCESS = 1;
+    FAILED_INSUFFICIENT_FUNDS = 2;
+    REJECTED_DUPLICATE = 3;
+    INVALID_ARGUMENT = 4;
+    INTERNAL_ERROR = 5;
+    FAILED_VELOCITY_LIMIT_EXCEEDED = 6;
+  }
+  Status status = 2;
+  string error_message = 3;
+  string handled_by_region = 4;
+  Money debited_amount = 5;
+  PaymentRail payment_rail = 6;
+  string external_reference = 7;
+}
+

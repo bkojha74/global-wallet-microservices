@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -35,6 +36,7 @@ import (
 	"wallet-system/pkg/observability"
 	"wallet-system/pkg/resilience"
 	"wallet-system/pkg/tlsutil"
+	"wallet-system/pkg/webhook"
 	fxv1 "wallet-system/proto/fx"
 	ledgerv1 "wallet-system/proto/ledger"
 	walletv1 "wallet-system/proto/wallet"
@@ -59,7 +61,8 @@ type server struct {
 	aiClient      *ai.Client
 	fraudDetector *ai.FraudDetector
 	// In-memory read-through balance cache with immediate write invalidation
-	balanceCache *BalanceCache
+	balanceCache      *BalanceCache
+	webhookDispatcher *webhook.Dispatcher
 }
 
 func (s *server) cache() *BalanceCache {
@@ -120,11 +123,13 @@ const (
 )
 
 type WalletModel struct {
-	ID        string `bson:"_id" json:"id"`
-	Currency  string `bson:"currency" json:"currency"`
-	Balance   int64  `bson:"balance" json:"balance"`
-	Status    string `bson:"status" json:"status"`
-	UpdatedAt string `bson:"updated_at" json:"updated_at"`
+	ID        string           `bson:"_id" json:"id"`
+	Currency  string           `bson:"currency,omitempty" json:"currency,omitempty"`
+	Balance   int64            `bson:"balance,omitempty" json:"balance,omitempty"`
+	Balances  map[string]int64 `bson:"balances,omitempty" json:"balances,omitempty"`
+	Status    string           `bson:"status" json:"status"`
+	KYCTier   string           `bson:"kyc_tier,omitempty" json:"kyc_tier,omitempty"`
+	UpdatedAt string           `bson:"updated_at" json:"updated_at"`
 }
 
 func (w *WalletModel) EffectiveStatus() string {
@@ -132,6 +137,53 @@ func (w *WalletModel) EffectiveStatus() string {
 		return WalletStatusActive
 	}
 	return w.Status
+}
+
+func (w *WalletModel) EffectiveKYCTier() string {
+	if w.KYCTier == "" {
+		return KYCTier1
+	}
+	return w.KYCTier
+}
+
+func (w *WalletModel) GetAllBalances() []*walletv1.Money {
+	if len(w.Balances) > 0 {
+		out := make([]*walletv1.Money, 0, len(w.Balances))
+		for curr, units := range w.Balances {
+			out = append(out, &walletv1.Money{
+				Currency: curr,
+				Units:    units,
+			})
+		}
+		sort.Slice(out, func(i, j int) bool {
+			return out[i].Currency < out[j].Currency
+		})
+		return out
+	}
+	if w.Currency != "" {
+		return []*walletv1.Money{
+			{Currency: w.Currency, Units: w.Balance},
+		}
+	}
+	return []*walletv1.Money{}
+}
+
+func (w *WalletModel) GetBalance(curr string) int64 {
+	curr = db.NormalizeCurrency(curr)
+	if len(w.Balances) > 0 {
+		return w.Balances[curr]
+	}
+	if db.NormalizeCurrency(w.Currency) == curr {
+		return w.Balance
+	}
+	return 0
+}
+
+func (w *WalletModel) HasSufficientBalance(curr string, amount int64) bool {
+	if amount <= 0 {
+		return false
+	}
+	return w.GetBalance(curr) >= amount
 }
 
 type AdminWalletStatusRequest struct {
@@ -195,11 +247,26 @@ func (s *server) CreateWallet(ctx context.Context, req *walletv1.CreateWalletReq
 
 	col := s.db().Collection("wallets")
 
+	curr := db.NormalizeCurrency(req.Currency)
+	if curr == "" {
+		curr = "USD"
+	}
+
+	kycTier := strings.TrimSpace(req.KycTier)
+	if kycTier == "" {
+		kycTier = KYCTier1
+	}
+	if _, ok := TierConfigs[kycTier]; !ok {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid kyc_tier: %s (must be TIER_1, TIER_2, or TIER_3)", kycTier)
+	}
+
 	model := WalletModel{
 		ID:        req.WalletId,
-		Currency:  req.Currency,
+		Currency:  curr,
 		Balance:   req.InitialBalance,
+		Balances:  map[string]int64{curr: req.InitialBalance},
 		Status:    WalletStatusActive,
+		KYCTier:   kycTier,
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 
@@ -216,7 +283,7 @@ func (s *server) CreateWallet(ctx context.Context, req *walletv1.CreateWalletReq
 	}
 
 	log.Printf("[WALLET] Wallet initialized: ID=%s, Currency=%s, Balance=%d (Region: %s)",
-		req.WalletId, req.Currency, req.InitialBalance, s.region)
+		req.WalletId, curr, req.InitialBalance, s.region)
 
 	return &walletv1.CreateWalletResponse{
 		Success:         true,
@@ -255,10 +322,8 @@ func (s *server) GetBalance(ctx context.Context, req *walletv1.GetBalanceRequest
 	}
 
 	resp := &walletv1.GetBalanceResponse{
-		WalletId: walletID,
-		Balances: []*walletv1.Money{
-			{Currency: wallet.Currency, Units: wallet.Balance},
-		},
+		WalletId:        walletID,
+		Balances:        wallet.GetAllBalances(),
 		HandledByRegion: s.region,
 		Status:          wallet.EffectiveStatus(),
 	}
@@ -467,6 +532,23 @@ func (s *server) validateTransferRequest(ctx context.Context, req *walletv1.Tran
 					"risk_score": decision.RiskScore,
 					"reason":     decision.Reason,
 				})
+			if s.webhookDispatcher != nil {
+				bgCtx := context.WithoutCancel(ctx)
+				// #nosec G118 -- asynchronous webhook dispatch must decouple from request context cancellation
+				go func() {
+					_ = s.webhookDispatcher.Dispatch(bgCtx, webhook.EventFraudFlagged, map[string]any{
+						"idempotency_key":       req.IdempotencyKey,
+						"source_wallet_id":      req.SourceWalletId,
+						"destination_wallet_id": req.DestinationWalletId,
+						"amount":                req.Amount.Units,
+						"currency":              req.Amount.Currency,
+						"risk_score":            decision.RiskScore,
+						"reason":                decision.Reason,
+						"region":                s.region,
+						"timestamp":             time.Now().UTC().Format(time.RFC3339),
+					})
+				}()
+			}
 			return &walletv1.TransferFundsResponse{
 				Status:          walletv1.TransferFundsResponse_INTERNAL_ERROR,
 				ErrorMessage:    "Transfer blocked: " + decision.Reason,
@@ -526,6 +608,14 @@ func (s *server) validateWalletsOperational(sessCtx mongo.SessionContext, wallet
 		return err
 	}
 
+	if err := s.CheckVelocityLimits(sessCtx, srcWallet, req.Amount.Units, req.Amount.Currency); err != nil {
+		state.txnStatus = walletv1.TransferFundsResponse_FAILED_VELOCITY_LIMIT_EXCEEDED
+		state.txnErrMsg = err.Error()
+		log.Printf("[COMPLIANCE-TX] trace_id=%s step=velocity_limit_exceeded wallet_id=%s reason=%v",
+			req.IdempotencyKey, req.SourceWalletId, err)
+		return err
+	}
+
 	var dstWallet WalletModel
 	if err := walletsCol.FindOne(sessCtx, bson.M{"_id": req.DestinationWalletId}).Decode(&dstWallet); err != nil {
 		if err == mongo.ErrNoDocuments {
@@ -553,13 +643,21 @@ func (s *server) executeDebitAndCredit(sessCtx mongo.SessionContext, ctx context
 		destUnits = req.Amount.Units
 	}
 
+	srcCurr := db.NormalizeCurrency(req.Amount.Currency)
+	dstCurr := db.NormalizeCurrency(destCurrency)
+
 	filterSource := bson.M{
-		"_id":      req.SourceWalletId,
-		"currency": req.Amount.Currency,
-		"balance":  bson.M{"$gte": req.Amount.Units},
+		"_id": req.SourceWalletId,
+		"$or": []bson.M{
+			{"balances." + srcCurr: bson.M{"$gte": req.Amount.Units}},
+			{"currency": srcCurr, "balance": bson.M{"$gte": req.Amount.Units}},
+		},
 	}
 	updateSource := bson.M{
-		"$inc": bson.M{"balance": -req.Amount.Units},
+		"$inc": bson.M{
+			"balance":             -req.Amount.Units,
+			"balances." + srcCurr: -req.Amount.Units,
+		},
 		"$set": bson.M{"updated_at": time.Now().UTC().Format(time.RFC3339)},
 	}
 	resSource, err := walletsCol.UpdateOne(sessCtx, filterSource, updateSource)
@@ -606,7 +704,10 @@ func (s *server) executeDebitAndCredit(sessCtx mongo.SessionContext, ctx context
 		"currency": destCurrency,
 	}
 	updateDest := bson.M{
-		"$inc": bson.M{"balance": destUnits},
+		"$inc": bson.M{
+			"balance":             destUnits,
+			"balances." + dstCurr: destUnits,
+		},
 		"$set": bson.M{"updated_at": time.Now().UTC().Format(time.RFC3339)},
 	}
 	resDest, err := walletsCol.UpdateOne(sessCtx, filterDest, updateDest)
@@ -649,6 +750,12 @@ func (s *server) executeDebitAndCredit(sessCtx mongo.SessionContext, ctx context
 			return fmt.Errorf("outbox append (destination_credited) failed: %w", err)
 		}
 	}
+
+	// Record velocity usage for compliance tracking
+	if recErr := s.RecordVelocityUsage(sessCtx, req.SourceWalletId, req.Amount.Units, req.Amount.Currency, "TRANSFER"); recErr != nil {
+		log.Printf("[COMPLIANCE-TX] Warning: failed to record velocity usage for wallet %s: %v", req.SourceWalletId, recErr)
+	}
+
 	return nil
 }
 
@@ -871,6 +978,722 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 		}
 	}
 	return resp, nil
+}
+
+// ExchangeCurrency executes an atomic intra-wallet currency exchange between two currency pots.
+func (s *server) ExchangeCurrency(ctx context.Context, req *walletv1.ExchangeCurrencyRequest) (*walletv1.ExchangeCurrencyResponse, error) {
+	startTime := time.Now()
+	if req == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "request is required")
+	}
+	idempKey := strings.TrimSpace(req.IdempotencyKey)
+	walletID := strings.TrimSpace(req.WalletId)
+	fromCurr := db.NormalizeCurrency(req.FromCurrency)
+	toCurr := db.NormalizeCurrency(req.ToCurrency)
+	fromAmount := req.FromAmount
+
+	if idempKey == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "idempotency_key is required")
+	}
+	if walletID == "" {
+		return nil, status.Errorf(codes.InvalidArgument, errWalletIDRequired)
+	}
+	if fromCurr == "" || toCurr == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "from_currency and to_currency are required")
+	}
+	if fromCurr == toCurr {
+		return nil, status.Errorf(codes.InvalidArgument, "from_currency and to_currency must be different")
+	}
+	if fromAmount <= 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "from_amount must be strictly positive")
+	}
+	if err := db.ValidateAmount(fromAmount, fromCurr); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+
+	correlation := observability.FromIncomingContext(ctx)
+	if correlation.IdempotencyKey == "" {
+		correlation.IdempotencyKey = idempKey
+	}
+	ctx = observability.WithCorrelation(ctx, correlation)
+
+	s.emit(ctx, "wallet.exchange.request_received", observability.LevelInfo, "Exchange currency request received", map[string]any{
+		"wallet_id":     walletID,
+		"from_currency": fromCurr,
+		"to_currency":   toCurr,
+		"from_amount":   fromAmount,
+	})
+	log.Printf("[WALLET-FX] trace_id=%s step=exchange_request_received wallet_id=%s from=%s to=%s amount=%d",
+		idempKey, walletID, fromCurr, toCurr, fromAmount)
+
+	if !s.isWritable(ctx) {
+		log.Printf("[WALLET-TX] trace_id=%s step=standby_write_rejected region=%s", idempKey, s.region)
+		return &walletv1.ExchangeCurrencyResponse{
+			Status:          walletv1.ExchangeCurrencyResponse_INVALID_ARGUMENT,
+			ErrorMessage:    fmt.Sprintf(errStandbyReplicaFmt, s.region),
+			HandledByRegion: s.region,
+		}, nil
+	}
+
+	if s.db() == nil {
+		return nil, status.Errorf(codes.Unavailable, "database unavailable")
+	}
+
+	walletsCol := s.db().Collection("wallets")
+	idempCol := s.db().Collection("idempotency_records")
+	ledgerTasksCol := s.db().Collection("ledger_tasks")
+
+	// Pre-transaction check for wallet existence & operational status
+	var wallet WalletModel
+	if err := walletsCol.FindOne(ctx, bson.M{"_id": walletID}).Decode(&wallet); err != nil {
+		if err == mongo.ErrNoDocuments {
+			return &walletv1.ExchangeCurrencyResponse{
+				Status:          walletv1.ExchangeCurrencyResponse_FAILED_INSUFFICIENT_FUNDS,
+				ErrorMessage:    fmt.Sprintf("wallet %s not found", walletID),
+				HandledByRegion: s.region,
+			}, nil
+		}
+		return nil, status.Errorf(codes.Internal, "failed to fetch wallet: %v", err)
+	}
+
+	if msg, err := checkWalletStatus(wallet, "exchange"); err != nil {
+		return &walletv1.ExchangeCurrencyResponse{
+			Status:          walletv1.ExchangeCurrencyResponse_INTERNAL_ERROR,
+			ErrorMessage:    msg,
+			HandledByRegion: s.region,
+		}, nil
+	}
+
+	if !wallet.HasSufficientBalance(fromCurr, fromAmount) {
+		return &walletv1.ExchangeCurrencyResponse{
+			Status:          walletv1.ExchangeCurrencyResponse_FAILED_INSUFFICIENT_FUNDS,
+			ErrorMessage:    fmt.Sprintf("insufficient %s balance in wallet %s (available: %d)", fromCurr, walletID, wallet.GetBalance(fromCurr)),
+			HandledByRegion: s.region,
+		}, nil
+	}
+
+	if err := s.CheckVelocityLimits(ctx, wallet, fromAmount, fromCurr); err != nil {
+		log.Printf("[COMPLIANCE-FX] trace_id=%s step=velocity_limit_exceeded wallet_id=%s reason=%v",
+			idempKey, walletID, err)
+		return &walletv1.ExchangeCurrencyResponse{
+			Status:          walletv1.ExchangeCurrencyResponse_FAILED_VELOCITY_LIMIT_EXCEEDED,
+			ErrorMessage:    err.Error(),
+			HandledByRegion: s.region,
+		}, nil
+	}
+
+	// Resolve FX conversion via fx-service or fallback
+	quoteID := strings.TrimSpace(req.FxQuoteId)
+	targetUnits := int64(0)
+	effectiveRate := float64(0)
+	finalTxnID := primitive.NewObjectID().Hex()
+
+	if s.fxClient != nil {
+		callCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		convResp, err := s.fxClient.ConvertCurrency(callCtx, &fxv1.ConvertCurrencyRequest{
+			IdempotencyKey: "wallet_exchange_" + idempKey,
+			QuoteId:        quoteID,
+			BaseCurrency:   fromCurr,
+			TargetCurrency: toCurr,
+			SourceAmount:   fromAmount,
+			ClientId:       walletServiceName,
+			ReferenceId:    finalTxnID,
+		})
+		cancel()
+		if err == nil && convResp != nil {
+			targetUnits = convResp.TargetAmount
+			effectiveRate = convResp.EffectiveRate
+			quoteID = convResp.QuoteId
+		}
+	}
+	if targetUnits <= 0 {
+		targetUnits, effectiveRate, quoteID = computeFallbackFX(fromCurr, toCurr, fromAmount)
+	}
+	if targetUnits <= 0 {
+		return &walletv1.ExchangeCurrencyResponse{
+			Status:          walletv1.ExchangeCurrencyResponse_INVALID_ARGUMENT,
+			ErrorMessage:    "converted target amount must be strictly positive",
+			HandledByRegion: s.region,
+		}, nil
+	}
+
+	outboxTaskID := primitive.NewObjectID()
+	outboxTask := LedgerTask{
+		ID:                  outboxTaskID,
+		TransactionID:       finalTxnID,
+		IdempotencyKey:      idempKey,
+		SourceWalletID:      walletID,
+		DestinationWalletID: walletID,
+		Amount:              fromAmount,
+		Currency:            fromCurr,
+		DestinationAmount:   targetUnits,
+		DestinationCurrency: toCurr,
+		ExchangeRate:        effectiveRate,
+		FXQuoteID:           quoteID,
+		Region:              s.region,
+		Status:              LedgerTaskStatusPending,
+		CreatedAt:           time.Now().UTC(),
+	}
+
+	session, err := s.mongoClient.StartSession()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to start mongo session: %v", err)
+	}
+	defer session.EndSession(ctx)
+
+	txnOpts := options.Transaction().
+		SetWriteConcern(writeconcern.Majority()).
+		SetReadConcern(readconcern.Snapshot()).
+		SetReadPreference(readpref.Primary())
+
+	_, err = session.WithTransaction(ctx, func(sessCtx mongo.SessionContext) (interface{}, error) {
+		// 1. Idempotency check
+		var existingIdemp IdempotencyRecord
+		if findErr := idempCol.FindOne(sessCtx, bson.M{"_id": idempKey}).Decode(&existingIdemp); findErr == nil {
+			finalTxnID = existingIdemp.TransactionID
+			return nil, nil
+		}
+
+		// 2. Atomic debit from_currency pot & credit to_currency pot
+		filterExchange := bson.M{
+			"_id": walletID,
+			"$or": []bson.M{
+				{"balances." + fromCurr: bson.M{"$gte": fromAmount}},
+				{"currency": fromCurr, "balance": bson.M{"$gte": fromAmount}},
+			},
+		}
+		incMap := bson.M{
+			"balances." + fromCurr: -fromAmount,
+			"balances." + toCurr:   targetUnits,
+		}
+		if fromCurr == wallet.Currency {
+			incMap["balance"] = -fromAmount
+		}
+		if toCurr == wallet.Currency {
+			if b, ok := incMap["balance"]; ok {
+				incMap["balance"] = b.(int64) + targetUnits
+			} else {
+				incMap["balance"] = targetUnits
+			}
+		}
+
+		updateExchange := bson.M{
+			"$inc": incMap,
+			"$set": bson.M{"updated_at": time.Now().UTC().Format(time.RFC3339)},
+		}
+
+		res, updateErr := walletsCol.UpdateOne(sessCtx, filterExchange, updateExchange)
+		if updateErr != nil {
+			return nil, updateErr
+		}
+		if res.ModifiedCount == 0 {
+			return nil, fmt.Errorf("insufficient %s balance", fromCurr)
+		}
+
+		// 3. Append Ledger Outbox task
+		if err := AppendLedgerTask(sessCtx, ledgerTasksCol, outboxTask); err != nil {
+			return nil, fmt.Errorf("failed to append ledger task: %w", err)
+		}
+
+		// 4. Record idempotency record
+		if _, err := idempCol.InsertOne(sessCtx, IdempotencyRecord{
+			ID:            idempKey,
+			TransactionID: finalTxnID,
+			CreatedAt:     time.Now().UTC(),
+		}); err != nil {
+			return nil, err
+		}
+
+		// 5. Record velocity usage for compliance tracking
+		if recErr := s.RecordVelocityUsage(sessCtx, walletID, fromAmount, fromCurr, "EXCHANGE"); recErr != nil {
+			log.Printf("[COMPLIANCE-FX] Warning: failed to record velocity usage for wallet %s: %v", walletID, recErr)
+		}
+		return nil, nil
+	}, txnOpts)
+
+	durationMS := time.Since(startTime).Milliseconds()
+	if err != nil {
+		s.emitTerminal(ctx, "wallet.exchange.failed", observability.LevelError, "Intra-wallet exchange failed", durationMS, false, map[string]any{"error": err.Error()})
+		return &walletv1.ExchangeCurrencyResponse{
+			TransactionId:   finalTxnID,
+			Status:          walletv1.ExchangeCurrencyResponse_FAILED_INSUFFICIENT_FUNDS,
+			ErrorMessage:    err.Error(),
+			HandledByRegion: s.region,
+		}, nil
+	}
+
+	// Dispatch immediate ledger sync fast-path
+	if s.ledgerRelay != nil {
+		_ = s.ledgerRelay.DispatchImmediate(ctx, outboxTask)
+	}
+
+	// Invalidate local and multi-pod caches
+	if c := s.cache(); c != nil {
+		c.Invalidate(walletID)
+	}
+
+	s.emitTerminal(ctx, "wallet.exchange.completed", observability.LevelAudit, "Intra-wallet currency exchange completed successfully", durationMS, true, map[string]any{
+		"transaction_id": finalTxnID,
+		"wallet_id":      walletID,
+		"from_currency":  fromCurr,
+		"from_amount":    fromAmount,
+		"to_currency":    toCurr,
+		"to_amount":      targetUnits,
+		"exchange_rate":  effectiveRate,
+		"fx_quote_id":    quoteID,
+	})
+
+	log.Printf("[WALLET-FX] SUCCESS: TX=%s | Wallet %s converted %d %s -> %d %s @ %.6f (quote: %s)",
+		finalTxnID, walletID, fromAmount, fromCurr, targetUnits, toCurr, effectiveRate, quoteID)
+
+	return &walletv1.ExchangeCurrencyResponse{
+		TransactionId:   finalTxnID,
+		Status:          walletv1.ExchangeCurrencyResponse_SUCCESS,
+		HandledByRegion: s.region,
+		FxQuoteId:       quoteID,
+		ExchangeRate:    effectiveRate,
+		DebitedAmount: &walletv1.Money{
+			Currency: fromCurr,
+			Units:    fromAmount,
+		},
+		CreditedAmount: &walletv1.Money{
+			Currency: toCurr,
+			Units:    targetUnits,
+		},
+	}, nil
+}
+
+func parsePaymentRail(rail walletv1.PaymentRail) (string, error) {
+	switch rail {
+	case walletv1.PaymentRail_CARD:
+		return "CARD", nil
+	case walletv1.PaymentRail_ACH:
+		return "ACH", nil
+	case walletv1.PaymentRail_SEPA:
+		return "SEPA", nil
+	case walletv1.PaymentRail_WIRE:
+		return "WIRE", nil
+	default:
+		return "", fmt.Errorf("unsupported or missing payment rail (supported: CARD, ACH, SEPA, WIRE)")
+	}
+}
+
+// DepositFunds handles external inbound payment rail simulations (CARD, ACH, SEPA, WIRE)
+// atomically crediting the wallet's multi-currency balance and generating balanced double-entry ledger tasks.
+func (s *server) DepositFunds(ctx context.Context, req *walletv1.DepositFundsRequest) (*walletv1.DepositFundsResponse, error) {
+	startTime := time.Now()
+	if req == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "request is required")
+	}
+	idempKey := strings.TrimSpace(req.IdempotencyKey)
+	walletID := strings.TrimSpace(req.WalletId)
+	if idempKey == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "idempotency_key is required")
+	}
+	if walletID == "" {
+		return nil, status.Errorf(codes.InvalidArgument, errWalletIDRequired)
+	}
+	if req.Amount == nil || req.Amount.Units <= 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "amount units must be strictly positive")
+	}
+	curr := db.NormalizeCurrency(req.Amount.Currency)
+	if curr == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "currency is required")
+	}
+	if err := db.ValidateAmount(req.Amount.Units, curr); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	railStr, railErr := parsePaymentRail(req.PaymentRail)
+	if railErr != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", railErr)
+	}
+
+	correlation := observability.FromIncomingContext(ctx)
+	if correlation.IdempotencyKey == "" {
+		correlation.IdempotencyKey = idempKey
+	}
+	ctx = observability.WithCorrelation(ctx, correlation)
+
+	s.emit(ctx, "wallet.deposit.request_received", observability.LevelInfo, "Deposit funds request received", map[string]any{
+		"wallet_id":    walletID,
+		"currency":     curr,
+		"amount":       req.Amount.Units,
+		"payment_rail": railStr,
+		"reference":    req.Reference,
+	})
+
+	if !s.isWritable(ctx) {
+		return &walletv1.DepositFundsResponse{
+			Status:          walletv1.DepositFundsResponse_INVALID_ARGUMENT,
+			ErrorMessage:    fmt.Sprintf(errStandbyReplicaFmt, s.region),
+			HandledByRegion: s.region,
+		}, nil
+	}
+
+	if s.db() == nil {
+		return nil, status.Errorf(codes.Unavailable, "database unavailable")
+	}
+
+	walletsCol := s.db().Collection("wallets")
+	idempCol := s.db().Collection("idempotency_records")
+	ledgerTasksCol := s.db().Collection("ledger_tasks")
+
+	var wallet WalletModel
+	if err := walletsCol.FindOne(ctx, bson.M{"_id": walletID}).Decode(&wallet); err != nil {
+		if err == mongo.ErrNoDocuments {
+			return &walletv1.DepositFundsResponse{
+				Status:          walletv1.DepositFundsResponse_INVALID_ARGUMENT,
+				ErrorMessage:    fmt.Sprintf("wallet %s not found", walletID),
+				HandledByRegion: s.region,
+			}, nil
+		}
+		return nil, status.Errorf(codes.Internal, "failed to fetch wallet: %v", err)
+	}
+
+	if msg, err := checkWalletStatus(wallet, "deposit"); err != nil {
+		return &walletv1.DepositFundsResponse{
+			Status:          walletv1.DepositFundsResponse_INTERNAL_ERROR,
+			ErrorMessage:    msg,
+			HandledByRegion: s.region,
+		}, nil
+	}
+
+	finalTxnID := primitive.NewObjectID().Hex()
+	sourceClearing := fmt.Sprintf("EXTERNAL_CLEARING_%s_%s", railStr, curr)
+	outboxTask := LedgerTask{
+		ID:                  primitive.NewObjectID(),
+		TransactionID:       finalTxnID,
+		IdempotencyKey:      idempKey,
+		SourceWalletID:      sourceClearing,
+		DestinationWalletID: walletID,
+		Amount:              req.Amount.Units,
+		Currency:            curr,
+		Region:              s.region,
+		Status:              LedgerTaskStatusPending,
+		CreatedAt:           time.Now().UTC(),
+	}
+
+	session, err := s.mongoClient.StartSession()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to start mongo session: %v", err)
+	}
+	defer session.EndSession(ctx)
+
+	txnOpts := options.Transaction().
+		SetWriteConcern(writeconcern.Majority()).
+		SetReadConcern(readconcern.Snapshot()).
+		SetReadPreference(readpref.Primary())
+
+	_, err = session.WithTransaction(ctx, func(sessCtx mongo.SessionContext) (interface{}, error) {
+		// 1. Idempotency check
+		var existingIdemp IdempotencyRecord
+		if findErr := idempCol.FindOne(sessCtx, bson.M{"_id": idempKey}).Decode(&existingIdemp); findErr == nil {
+			finalTxnID = existingIdemp.TransactionID
+			return nil, nil
+		}
+
+		// 2. Atomic credit wallet pot & base balance if matching
+		incMap := bson.M{
+			"balances." + curr: req.Amount.Units,
+		}
+		if curr == wallet.Currency {
+			incMap["balance"] = req.Amount.Units
+		}
+		update := bson.M{
+			"$inc": incMap,
+			"$set": bson.M{"updated_at": time.Now().UTC().Format(time.RFC3339)},
+		}
+
+		res, updateErr := walletsCol.UpdateOne(sessCtx, bson.M{"_id": walletID}, update)
+		if updateErr != nil {
+			return nil, updateErr
+		}
+		if res.MatchedCount == 0 {
+			return nil, fmt.Errorf("wallet %s not found on deposit update", walletID)
+		}
+
+		// 3. Append Ledger Outbox task (credit customer liability, debit external clearing)
+		if err := AppendLedgerTask(sessCtx, ledgerTasksCol, outboxTask); err != nil {
+			return nil, fmt.Errorf("failed to append ledger task: %w", err)
+		}
+
+		// 4. Record idempotency record
+		if _, err := idempCol.InsertOne(sessCtx, IdempotencyRecord{
+			ID:            idempKey,
+			TransactionID: finalTxnID,
+			CreatedAt:     time.Now().UTC(),
+		}); err != nil {
+			return nil, err
+		}
+
+		return nil, nil
+	}, txnOpts)
+
+	durationMS := time.Since(startTime).Milliseconds()
+	if err != nil {
+		s.emitTerminal(ctx, "wallet.deposit.failed", observability.LevelError, "External deposit failed", durationMS, false, map[string]any{"error": err.Error()})
+		return &walletv1.DepositFundsResponse{
+			TransactionId:   finalTxnID,
+			Status:          walletv1.DepositFundsResponse_INTERNAL_ERROR,
+			ErrorMessage:    err.Error(),
+			HandledByRegion: s.region,
+		}, nil
+	}
+
+	// Dispatch immediate ledger sync fast-path
+	if s.ledgerRelay != nil {
+		_ = s.ledgerRelay.DispatchImmediate(ctx, outboxTask)
+	}
+
+	// Invalidate local and multi-pod caches
+	if c := s.cache(); c != nil {
+		c.Invalidate(walletID)
+	}
+
+	s.emitTerminal(ctx, "wallet.deposit.completed", observability.LevelAudit, "External deposit completed successfully", durationMS, true, map[string]any{
+		"transaction_id":     finalTxnID,
+		"wallet_id":          walletID,
+		"amount":             req.Amount.Units,
+		"currency":           curr,
+		"payment_rail":       railStr,
+		"external_reference": req.Reference,
+	})
+
+	return &walletv1.DepositFundsResponse{
+		TransactionId:   finalTxnID,
+		Status:          walletv1.DepositFundsResponse_SUCCESS,
+		HandledByRegion: s.region,
+		CreditedAmount: &walletv1.Money{
+			Currency: curr,
+			Units:    req.Amount.Units,
+		},
+		PaymentRail:       req.PaymentRail,
+		ExternalReference: req.Reference,
+	}, nil
+}
+
+// WithdrawFunds handles external outbound payment rail simulations (CARD, ACH, SEPA, WIRE)
+// atomically debiting the wallet's multi-currency balance, enforcing velocity limits, and generating balanced ledger tasks.
+func (s *server) WithdrawFunds(ctx context.Context, req *walletv1.WithdrawFundsRequest) (*walletv1.WithdrawFundsResponse, error) {
+	startTime := time.Now()
+	if req == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "request is required")
+	}
+	idempKey := strings.TrimSpace(req.IdempotencyKey)
+	walletID := strings.TrimSpace(req.WalletId)
+	if idempKey == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "idempotency_key is required")
+	}
+	if walletID == "" {
+		return nil, status.Errorf(codes.InvalidArgument, errWalletIDRequired)
+	}
+	if req.Amount == nil || req.Amount.Units <= 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "amount units must be strictly positive")
+	}
+	curr := db.NormalizeCurrency(req.Amount.Currency)
+	if curr == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "currency is required")
+	}
+	if err := db.ValidateAmount(req.Amount.Units, curr); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	railStr, railErr := parsePaymentRail(req.PaymentRail)
+	if railErr != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", railErr)
+	}
+
+	correlation := observability.FromIncomingContext(ctx)
+	if correlation.IdempotencyKey == "" {
+		correlation.IdempotencyKey = idempKey
+	}
+	ctx = observability.WithCorrelation(ctx, correlation)
+
+	s.emit(ctx, "wallet.withdraw.request_received", observability.LevelInfo, "Withdraw funds request received", map[string]any{
+		"wallet_id":           walletID,
+		"currency":            curr,
+		"amount":              req.Amount.Units,
+		"payment_rail":        railStr,
+		"beneficiary_details": req.BeneficiaryDetails,
+	})
+
+	if !s.isWritable(ctx) {
+		return &walletv1.WithdrawFundsResponse{
+			Status:          walletv1.WithdrawFundsResponse_INVALID_ARGUMENT,
+			ErrorMessage:    fmt.Sprintf(errStandbyReplicaFmt, s.region),
+			HandledByRegion: s.region,
+		}, nil
+	}
+
+	if s.db() == nil {
+		return nil, status.Errorf(codes.Unavailable, "database unavailable")
+	}
+
+	walletsCol := s.db().Collection("wallets")
+	idempCol := s.db().Collection("idempotency_records")
+	ledgerTasksCol := s.db().Collection("ledger_tasks")
+
+	var wallet WalletModel
+	if err := walletsCol.FindOne(ctx, bson.M{"_id": walletID}).Decode(&wallet); err != nil {
+		if err == mongo.ErrNoDocuments {
+			return &walletv1.WithdrawFundsResponse{
+				Status:          walletv1.WithdrawFundsResponse_FAILED_INSUFFICIENT_FUNDS,
+				ErrorMessage:    fmt.Sprintf("wallet %s not found", walletID),
+				HandledByRegion: s.region,
+			}, nil
+		}
+		return nil, status.Errorf(codes.Internal, "failed to fetch wallet: %v", err)
+	}
+
+	if msg, err := checkWalletStatus(wallet, "withdraw"); err != nil {
+		return &walletv1.WithdrawFundsResponse{
+			Status:          walletv1.WithdrawFundsResponse_INTERNAL_ERROR,
+			ErrorMessage:    msg,
+			HandledByRegion: s.region,
+		}, nil
+	}
+
+	if !wallet.HasSufficientBalance(curr, req.Amount.Units) {
+		return &walletv1.WithdrawFundsResponse{
+			Status:          walletv1.WithdrawFundsResponse_FAILED_INSUFFICIENT_FUNDS,
+			ErrorMessage:    fmt.Sprintf("insufficient %s balance in wallet %s (available: %d)", curr, walletID, wallet.GetBalance(curr)),
+			HandledByRegion: s.region,
+		}, nil
+	}
+
+	// Compliance & Velocity Limit Enforcement
+	if err := s.CheckVelocityLimits(ctx, wallet, req.Amount.Units, curr); err != nil {
+		log.Printf("[COMPLIANCE-WITHDRAW] trace_id=%s step=velocity_limit_exceeded wallet_id=%s reason=%v",
+			idempKey, walletID, err)
+		return &walletv1.WithdrawFundsResponse{
+			Status:          walletv1.WithdrawFundsResponse_FAILED_VELOCITY_LIMIT_EXCEEDED,
+			ErrorMessage:    err.Error(),
+			HandledByRegion: s.region,
+		}, nil
+	}
+
+	finalTxnID := primitive.NewObjectID().Hex()
+	destClearing := fmt.Sprintf("EXTERNAL_CLEARING_%s_%s", railStr, curr)
+	outboxTask := LedgerTask{
+		ID:                  primitive.NewObjectID(),
+		TransactionID:       finalTxnID,
+		IdempotencyKey:      idempKey,
+		SourceWalletID:      walletID,
+		DestinationWalletID: destClearing,
+		Amount:              req.Amount.Units,
+		Currency:            curr,
+		Region:              s.region,
+		Status:              LedgerTaskStatusPending,
+		CreatedAt:           time.Now().UTC(),
+	}
+
+	session, err := s.mongoClient.StartSession()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to start mongo session: %v", err)
+	}
+	defer session.EndSession(ctx)
+
+	txnOpts := options.Transaction().
+		SetWriteConcern(writeconcern.Majority()).
+		SetReadConcern(readconcern.Snapshot()).
+		SetReadPreference(readpref.Primary())
+
+	_, err = session.WithTransaction(ctx, func(sessCtx mongo.SessionContext) (interface{}, error) {
+		// 1. Idempotency check
+		var existingIdemp IdempotencyRecord
+		if findErr := idempCol.FindOne(sessCtx, bson.M{"_id": idempKey}).Decode(&existingIdemp); findErr == nil {
+			finalTxnID = existingIdemp.TransactionID
+			return nil, nil
+		}
+
+		// 2. Atomic debit wallet pot & base balance if matching
+		filterWithdraw := bson.M{
+			"_id": walletID,
+			"$or": []bson.M{
+				{"balances." + curr: bson.M{"$gte": req.Amount.Units}},
+				{"currency": curr, "balance": bson.M{"$gte": req.Amount.Units}},
+			},
+		}
+		incMap := bson.M{
+			"balances." + curr: -req.Amount.Units,
+		}
+		if curr == wallet.Currency {
+			incMap["balance"] = -req.Amount.Units
+		}
+		updateWithdraw := bson.M{
+			"$inc": incMap,
+			"$set": bson.M{"updated_at": time.Now().UTC().Format(time.RFC3339)},
+		}
+
+		res, updateErr := walletsCol.UpdateOne(sessCtx, filterWithdraw, updateWithdraw)
+		if updateErr != nil {
+			return nil, updateErr
+		}
+		if res.ModifiedCount == 0 {
+			return nil, fmt.Errorf("insufficient %s balance", curr)
+		}
+
+		// 3. Append Ledger Outbox task (debit customer liability, credit external clearing)
+		if err := AppendLedgerTask(sessCtx, ledgerTasksCol, outboxTask); err != nil {
+			return nil, fmt.Errorf("failed to append ledger task: %w", err)
+		}
+
+		// 4. Record idempotency record
+		if _, err := idempCol.InsertOne(sessCtx, IdempotencyRecord{
+			ID:            idempKey,
+			TransactionID: finalTxnID,
+			CreatedAt:     time.Now().UTC(),
+		}); err != nil {
+			return nil, err
+		}
+
+		// 5. Record velocity usage for compliance tracking
+		if recErr := s.RecordVelocityUsage(sessCtx, walletID, req.Amount.Units, curr, "WITHDRAWAL_"+railStr); recErr != nil {
+			log.Printf("[COMPLIANCE-WITHDRAW] Warning: failed to record velocity usage for wallet %s: %v", walletID, recErr)
+		}
+		return nil, nil
+	}, txnOpts)
+
+	durationMS := time.Since(startTime).Milliseconds()
+	if err != nil {
+		s.emitTerminal(ctx, "wallet.withdraw.failed", observability.LevelError, "External withdrawal failed", durationMS, false, map[string]any{"error": err.Error()})
+		return &walletv1.WithdrawFundsResponse{
+			TransactionId:   finalTxnID,
+			Status:          walletv1.WithdrawFundsResponse_FAILED_INSUFFICIENT_FUNDS,
+			ErrorMessage:    err.Error(),
+			HandledByRegion: s.region,
+		}, nil
+	}
+
+	// Dispatch immediate ledger sync fast-path
+	if s.ledgerRelay != nil {
+		_ = s.ledgerRelay.DispatchImmediate(ctx, outboxTask)
+	}
+
+	// Invalidate local and multi-pod caches
+	if c := s.cache(); c != nil {
+		c.Invalidate(walletID)
+	}
+
+	s.emitTerminal(ctx, "wallet.withdraw.completed", observability.LevelAudit, "External withdrawal completed successfully", durationMS, true, map[string]any{
+		"transaction_id":      finalTxnID,
+		"wallet_id":           walletID,
+		"amount":              req.Amount.Units,
+		"currency":            curr,
+		"payment_rail":        railStr,
+		"beneficiary_details": req.BeneficiaryDetails,
+	})
+
+	return &walletv1.WithdrawFundsResponse{
+		TransactionId:   finalTxnID,
+		Status:          walletv1.WithdrawFundsResponse_SUCCESS,
+		HandledByRegion: s.region,
+		DebitedAmount: &walletv1.Money{
+			Currency: curr,
+			Units:    req.Amount.Units,
+		},
+		PaymentRail:       req.PaymentRail,
+		ExternalReference: req.BeneficiaryDetails,
+	}, nil
 }
 
 func (s *server) UpdateWalletStatus(ctx context.Context, walletID, newStatus string) error {
@@ -1324,20 +2147,26 @@ func runWalletServer(ctx context.Context) error {
 		log.Printf("[WALLET-SERVICE] Wallet balance in-memory cache ENABLED (ttl=%v maxEntries=%d)", balanceCache.ttl, balanceCache.maxEntries)
 	}
 
+	var whDispatcher *webhook.Dispatcher
+	if client != nil {
+		whDispatcher = webhook.NewDispatcher(client.Database("banking_db"), nil)
+	}
+
 	srv := &server{
-		mongoClient:   client,
-		ledgerClient:  ledgerClient,
-		fxClient:      fxClient,
-		region:        region,
-		isActive:      isActive,
-		targetRole:    resolveWalletRole(isActive),
-		coordinator:   coord,
-		logger:        observability.LoggerFromEnvironment(walletServiceName, environment, region, os.Stdout),
-		outbox:        walletOutbox,
-		ledgerRelay:   ledgerRelay,
-		aiClient:      aiClient,
-		fraudDetector: ai.NewFraudDetector(aiClient),
-		balanceCache:  balanceCache,
+		mongoClient:       client,
+		ledgerClient:      ledgerClient,
+		fxClient:          fxClient,
+		region:            region,
+		isActive:          isActive,
+		targetRole:        resolveWalletRole(isActive),
+		coordinator:       coord,
+		logger:            observability.LoggerFromEnvironment(walletServiceName, environment, region, os.Stdout),
+		outbox:            walletOutbox,
+		ledgerRelay:       ledgerRelay,
+		aiClient:          aiClient,
+		fraudDetector:     ai.NewFraudDetector(aiClient),
+		balanceCache:      balanceCache,
+		webhookDispatcher: whDispatcher,
 	}
 	walletv1.RegisterWalletServiceServer(grpcServer, srv)
 

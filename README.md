@@ -58,6 +58,8 @@ The **Global Multi-Currency Digital Wallet & Ledger Service** is engineered to d
 * **Intelligent AI Fraud Detection**: Real-time contextual transaction analysis leveraging Google's `gemini-3.1-flash-lite` to intercept and block anomalous financial activity, utilizing a resilient Fail-Open architecture to ensure high availability.
 * **Distributed Multi-Pod Caching**: Tiered L1 (in-memory) + L2 (Redis) caching layer synchronized in real time across horizontally-scaled pods via an AMQP broadcast invalidation bus (`wallet.cache.events`) with echo suppression to eliminate stale balance reads.
 * **Distributed Outbox Worker Lease**: Atomic leader election lease on MongoDB (`ledger_relay_lease`) via `FindOneAndUpdate` ensuring single-worker active outbox processing and immediate hot-standby failover without database lock contention.
+* **Resilience, Circuit Breaking & Graceful Fallback**: Client-side circuit breaking with `sony/gobreaker` across all microservice network boundaries (API Gateway and Wallet Service) with business-error passthrough, resilient FX stale fallback serving cached rates (`stale_quote: true`), and degraded observability alerts.
+* **Outbox Full-Jitter Exponential Backoff**: Cryptographically secure (`crypto/rand`, OWASP CWE-338 compliant) randomized exponential backoff on consecutive ledger dispatch errors preventing thundering herds.
 * **Operational Tracing & Observability**: Correlation IDs (`association_id`, `idempotency_key`, `transaction_id`) propagated across gRPC metadata and HTTP headers, with a dedicated Log Query API, Prometheus metrics, and preconfigured Grafana dashboards.
 
 ---
@@ -812,6 +814,7 @@ Both Postman and Bruno test runners validate:
 |---|---|
 | [docs/KUBERNETES_COMPLETE_GUIDE.md](docs/KUBERNETES_COMPLETE_GUIDE.md) | Complete Kubernetes operations guide: 13-manifest reference, local Docker Desktop configuration, automated CI/CD autodeployment, and Web Dashboard navigation. |
 | [docs/DISTRIBUTED_CACHING_ARCHITECTURE.md](docs/DISTRIBUTED_CACHING_ARCHITECTURE.md) | Architectural specification and blueprint for multi-pod L1/L2 hybrid balance caching, AMQP invalidation bus, and atomic outbox relay worker leasing. |
+| [docs/RESILIENCE_CIRCUIT_BREAKING_GUIDE.md](docs/RESILIENCE_CIRCUIT_BREAKING_GUIDE.md) | Production resilience & fault tolerance guide: client-side circuit breaking with GoBreaker, resilient FX stale fallback, and outbox jittered backoff. |
 | [docs/NEXT_LEVEL_IMPROVEMENT_ROADMAP.md](docs/NEXT_LEVEL_IMPROVEMENT_ROADMAP.md) | Next-level architectural & operational improvement roadmap covering Kubernetes completeness, distributed caching, circuit breaking, and core banking expansion. |
 | [docs/PRODUCTION_READINESS_AUDIT.md](docs/PRODUCTION_READINESS_AUDIT.md) | Comprehensive 8-pillar production audit, gap catalog, risk analysis, and 4-phase remediation roadmap. |
 | [docs/PHASE1_IMPLEMENTATION.md](docs/PHASE1_IMPLEMENTATION.md) | Technical deep-dive on Phase 1: transactional outbox pattern, database indexing, TTL, and pagination. |

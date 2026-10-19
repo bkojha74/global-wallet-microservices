@@ -24,12 +24,16 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+
 	"wallet-system/pkg/auth"
 	"wallet-system/pkg/coordinator"
 	"wallet-system/pkg/db"
 	"wallet-system/pkg/observability"
 	"wallet-system/pkg/resilience"
 	"wallet-system/pkg/tlsutil"
+	"wallet-system/pkg/webhook"
 	authv1 "wallet-system/proto/auth"
 	fxv1 "wallet-system/proto/fx"
 	ledgerv1 "wallet-system/proto/ledger"
@@ -40,17 +44,18 @@ const defaultJWTSecret = "development-wallet-insecure-secret-key-change-in-prod"
 
 // Gateway routes incoming HTTP requests to the appropriate gRPC backend service.
 type Gateway struct {
-	mu             sync.RWMutex
-	activeTarget   string // "PRIMARY" or "STANDBY" (cached fallback)
-	coordinator    coordinator.FailoverCoordinator
-	primaryClient  walletv1.WalletServiceClient
-	standbyClient  walletv1.WalletServiceClient
-	ledgerClient   ledgerv1.LedgerServiceClient
-	authClient     authv1.AuthServiceClient // auth-service gRPC client
-	fxClient       fxv1.FXServiceClient     // fx-service gRPC client
-	primaryAddress string
-	standbyAddress string
-	logger         observability.Logger
+	mu                sync.RWMutex
+	activeTarget      string // "PRIMARY" or "STANDBY" (cached fallback)
+	coordinator       coordinator.FailoverCoordinator
+	primaryClient     walletv1.WalletServiceClient
+	standbyClient     walletv1.WalletServiceClient
+	ledgerClient      ledgerv1.LedgerServiceClient
+	authClient        authv1.AuthServiceClient // auth-service gRPC client
+	fxClient          fxv1.FXServiceClient     // fx-service gRPC client
+	primaryAddress    string
+	standbyAddress    string
+	logger            observability.Logger
+	webhookDispatcher *webhook.Dispatcher
 }
 
 func (g *Gateway) emit(ctx context.Context, eventType, level, message string, attributes map[string]any) {
@@ -136,6 +141,7 @@ func parseCreateWalletRequest(r *http.Request, traceID string) (*walletv1.Create
 		WalletID       string `json:"wallet_id"`
 		Currency       string `json:"currency"`
 		InitialBalance int64  `json:"initial_balance"`
+		KYCTier        string `json:"kyc_tier"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		log.Printf("[TRACE] trace_id=%s step=http_json_decode_failed error=%v", traceID, err)
@@ -153,8 +159,13 @@ func parseCreateWalletRequest(r *http.Request, traceID string) (*walletv1.Create
 			return nil, fmt.Errorf("forbidden: %w", err)
 		}
 	}
-	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=create_wallet wallet_id=%s", traceID, req.WalletID)
-	return &walletv1.CreateWalletRequest{WalletId: req.WalletID, Currency: req.Currency, InitialBalance: req.InitialBalance}, nil
+	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=create_wallet wallet_id=%s kyc_tier=%s", traceID, req.WalletID, req.KYCTier)
+	return &walletv1.CreateWalletRequest{
+		WalletId:       req.WalletID,
+		Currency:       req.Currency,
+		InitialBalance: req.InitialBalance,
+		KycTier:        req.KYCTier,
+	}, nil
 }
 
 func handleWalletGRPCError(w http.ResponseWriter, err error, action string) {
@@ -388,6 +399,24 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		"transaction_id": resp.TransactionId,
 	})
 
+	if isSuccess {
+		if d := g.getWebhookDispatcher(); d != nil {
+			bgCtx := context.WithoutCancel(r.Context())
+			// #nosec G118 -- asynchronous webhook dispatch must decouple from HTTP request context cancellation
+			go func() {
+				_ = d.Dispatch(bgCtx, webhook.EventTransferCompleted, map[string]interface{}{
+					"transaction_id":        resp.TransactionId,
+					"source_wallet_id":      protoReq.SourceWalletId,
+					"destination_wallet_id": protoReq.DestinationWalletId,
+					"amount":                protoReq.Amount.Units,
+					"currency":              protoReq.Amount.Currency,
+					"fx_quote_id":           resp.FxQuoteId,
+					"handled_region":        resp.HandledByRegion,
+				})
+			}()
+		}
+	}
+
 	respMap := map[string]interface{}{
 		"transaction_id": resp.TransactionId,
 		"status":         resp.Status.String(),
@@ -405,6 +434,833 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		respMap["converted_amount"] = resp.ConvertedAmount
 	}
 	writeJSON(w, http.StatusOK, respMap)
+}
+
+func (g *Gateway) handleWalletExchange(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	correlation := observability.FromHTTPRequest(r)
+	traceID := correlation.AssociationID
+	body, err := readClientJSON(traceID, r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		IdempotencyKey string `json:"idempotency_key"`
+		WalletID       string `json:"wallet_id"`
+		FromCurrency   string `json:"from_currency"`
+		ToCurrency     string `json:"to_currency"`
+		FromAmount     int64  `json:"from_amount"`
+		Amount         int64  `json:"amount"`
+		FXQuoteID      string `json:"fx_quote_id"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		log.Printf("[TRACE] trace_id=%s step=http_json_decode_failed error=%v", traceID, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	walletID := strings.TrimSpace(req.WalletID)
+	if walletID == "" {
+		http.Error(w, "wallet_id is required", http.StatusBadRequest)
+		return
+	}
+	fromAmount := req.FromAmount
+	if fromAmount <= 0 {
+		fromAmount = req.Amount
+	}
+	fromCurr := db.NormalizeCurrency(req.FromCurrency)
+	toCurr := db.NormalizeCurrency(req.ToCurrency)
+	if fromCurr == "" || toCurr == "" {
+		http.Error(w, "from_currency and to_currency are required", http.StatusBadRequest)
+		return
+	}
+	if fromCurr == toCurr {
+		http.Error(w, "from_currency and to_currency must be different", http.StatusBadRequest)
+		return
+	}
+	if err := db.ValidateAmount(fromAmount, fromCurr); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	idempKey := strings.TrimSpace(req.IdempotencyKey)
+	if idempKey == "" {
+		idempKey = r.Header.Get("Idempotency-Key")
+	}
+	if idempKey == "" {
+		idempKey = "idemp_exch_" + traceID
+	}
+	correlation.IdempotencyKey = idempKey
+
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		if err := ValidateWalletOwnership(claims, walletID); err != nil {
+			log.Printf("[SECURITY] IDOR blocked: subject %s tried to exchange currency in wallet %s", claims.Subject, walletID)
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
+			return
+		}
+	}
+
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	g.emit(ctx, eventAPIRequestReceived, observability.LevelInfo, "HTTP intra-wallet exchange request received", map[string]any{
+		"operation":     "exchange_currency",
+		"wallet_id":     walletID,
+		"from_currency": fromCurr,
+		"to_currency":   toCurr,
+		"from_amount":   fromAmount,
+		"fx_quote_id":   req.FXQuoteID,
+	})
+
+	protoReq := &walletv1.ExchangeCurrencyRequest{
+		IdempotencyKey: idempKey,
+		WalletId:       walletID,
+		FromCurrency:   fromCurr,
+		ToCurrency:     toCurr,
+		FromAmount:     fromAmount,
+		FxQuoteId:      strings.TrimSpace(req.FXQuoteID),
+	}
+
+	client, target := g.getActiveWalletClient(ctx)
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	resp, err := client.ExchangeCurrency(callCtx, protoReq)
+	if err != nil {
+		log.Printf(traceWalletGRPCRespFmt, traceID, err)
+		handleWalletGRPCError(w, err, "exchanging currency")
+		return
+	}
+
+	if resp.Status != walletv1.ExchangeCurrencyResponse_SUCCESS {
+		statusHTTP := http.StatusBadRequest
+		if resp.Status == walletv1.ExchangeCurrencyResponse_FAILED_INSUFFICIENT_FUNDS {
+			statusHTTP = http.StatusUnprocessableEntity
+		}
+		writeJSON(w, statusHTTP, map[string]interface{}{
+			"status":         resp.Status.String(),
+			"error_message":  resp.ErrorMessage,
+			"transaction_id": resp.TransactionId,
+			"routed_gateway": target,
+			"handled_region": resp.HandledByRegion,
+		})
+		return
+	}
+
+	g.emit(ctx, eventAPIResponseSent, observability.LevelInfo, "Intra-wallet currency exchange response sent", map[string]any{
+		"operation":      "exchange_currency",
+		"transaction_id": resp.TransactionId,
+		"wallet_id":      walletID,
+		"from_currency":  fromCurr,
+		"from_amount":    fromAmount,
+		"to_currency":    toCurr,
+		"exchange_rate":  resp.ExchangeRate,
+	})
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":          resp.Status.String(),
+		"transaction_id":  resp.TransactionId,
+		"wallet_id":       walletID,
+		"from_currency":   fromCurr,
+		"debited_amount":  resp.GetDebitedAmount().GetUnits(),
+		"to_currency":     toCurr,
+		"credited_amount": resp.GetCreditedAmount().GetUnits(),
+		"exchange_rate":   resp.ExchangeRate,
+		"fx_quote_id":     resp.FxQuoteId,
+		"routed_gateway":  target,
+		"handled_region":  resp.HandledByRegion,
+	})
+}
+
+func (g *Gateway) handleUpdateWalletKYC(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut && r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	correlation := observability.FromHTTPRequest(r)
+	traceID := correlation.AssociationID
+	body, err := readClientJSON(traceID, r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		WalletID string `json:"wallet_id"`
+		KYCTier  string `json:"kyc_tier"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	walletID := strings.TrimSpace(req.WalletID)
+	if walletID == "" {
+		http.Error(w, "wallet_id is required", http.StatusBadRequest)
+		return
+	}
+	tier := strings.ToUpper(strings.TrimSpace(req.KYCTier))
+	if tier == "" {
+		http.Error(w, "kyc_tier is required (TIER_1, TIER_2, TIER_3)", http.StatusBadRequest)
+		return
+	}
+
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		if err := ValidateWalletOwnership(claims, walletID); err != nil && !claims.HasRole(auth.RoleAdmin) {
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
+			return
+		}
+	}
+
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	client, target := g.getActiveWalletClient(ctx)
+	callCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+
+	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	resp, err := client.UpdateWalletKYC(callCtx, &walletv1.UpdateWalletKYCRequest{
+		WalletId: walletID,
+		KycTier:  tier,
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to update wallet KYC: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if !resp.Success {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"message": resp.Message,
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success":        resp.Success,
+		"wallet_id":      resp.WalletId,
+		"previous_tier":  resp.PreviousTier,
+		"current_tier":   resp.CurrentTier,
+		"message":        resp.Message,
+		"routed_gateway": target,
+	})
+}
+
+func (g *Gateway) handleGetWalletLimits(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	walletID := strings.TrimSpace(r.URL.Query().Get("id"))
+	if walletID == "" {
+		http.Error(w, "Missing 'id' query parameter", http.StatusBadRequest)
+		return
+	}
+
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		if err := ValidateWalletOwnership(claims, walletID); err != nil && !claims.HasRole(auth.RoleAdmin) {
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
+			return
+		}
+	}
+
+	correlation := observability.FromHTTPRequest(r)
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	client, target := g.getActiveWalletClient(ctx)
+	callCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+
+	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	resp, err := client.GetWalletLimits(callCtx, &walletv1.GetWalletLimitsRequest{
+		WalletId: walletID,
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get wallet limits: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"wallet_id":                resp.WalletId,
+		"kyc_tier":                 resp.KycTier,
+		"single_transaction_limit": resp.SingleTransactionLimit,
+		"daily_rolling_limit":      resp.DailyRollingLimit,
+		"daily_rolling_spent":      resp.DailyRollingSpent,
+		"daily_rolling_remaining":  resp.DailyRollingRemaining,
+		"hourly_rate_limit":        resp.HourlyRateLimit,
+		"hourly_rate_spent":        resp.HourlyRateSpent,
+		"hourly_rate_remaining":    resp.HourlyRateRemaining,
+		"routed_gateway":           target,
+	})
+}
+
+func parseProtoPaymentRail(railStr string) walletv1.PaymentRail {
+	switch strings.ToUpper(strings.TrimSpace(railStr)) {
+	case "CARD":
+		return walletv1.PaymentRail_CARD
+	case "ACH":
+		return walletv1.PaymentRail_ACH
+	case "SEPA":
+		return walletv1.PaymentRail_SEPA
+	case "WIRE":
+		return walletv1.PaymentRail_WIRE
+	default:
+		return walletv1.PaymentRail_PAYMENT_RAIL_UNSPECIFIED
+	}
+}
+
+func (gw *Gateway) handleWalletSubroutes(w http.ResponseWriter, r *http.Request) {
+	path := strings.Trim(r.URL.Path, "/")
+	parts := strings.Split(path, "/")
+	// /api/v1/wallets/{id}/deposit or /api/v1/wallets/{id}/withdraw
+	if len(parts) >= 5 && parts[0] == "api" && parts[1] == "v1" && parts[2] == "wallets" {
+		walletID := parts[3]
+		action := parts[4]
+		if action == "deposit" {
+			gw.executeDeposit(w, r, walletID)
+			return
+		}
+		if action == "withdraw" {
+			gw.executeWithdraw(w, r, walletID)
+			return
+		}
+	}
+	http.Error(w, "Not Found", http.StatusNotFound)
+}
+
+func (gw *Gateway) handleDepositFunds(w http.ResponseWriter, r *http.Request) {
+	gw.executeDeposit(w, r, "")
+}
+
+func (gw *Gateway) handleWithdrawFunds(w http.ResponseWriter, r *http.Request) {
+	gw.executeWithdraw(w, r, "")
+}
+
+func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWalletID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	correlation := observability.FromHTTPRequest(r)
+	traceID := correlation.AssociationID
+
+	body, err := readClientJSON(traceID, r.Body)
+	if err != nil {
+		log.Printf("[TRACE] trace_id=%s step=http_read_body_failed error=%v", traceID, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		IdempotencyKey string `json:"idempotency_key"`
+		WalletID       string `json:"wallet_id"`
+		Amount         int64  `json:"amount"`
+		Currency       string `json:"currency"`
+		PaymentRail    string `json:"payment_rail"`
+		Reference      string `json:"reference"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		log.Printf("[TRACE] trace_id=%s step=http_json_decode_failed error=%v", traceID, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	walletID := strings.TrimSpace(pathWalletID)
+	if walletID == "" {
+		walletID = strings.TrimSpace(req.WalletID)
+	}
+	if walletID == "" {
+		walletID = strings.TrimSpace(r.URL.Query().Get("id"))
+	}
+	if walletID == "" {
+		walletID = strings.TrimSpace(r.URL.Query().Get("wallet_id"))
+	}
+	if walletID == "" {
+		http.Error(w, "wallet_id is required", http.StatusBadRequest)
+		return
+	}
+
+	curr := db.NormalizeCurrency(req.Currency)
+	if curr == "" {
+		http.Error(w, "currency is required", http.StatusBadRequest)
+		return
+	}
+	if req.Amount <= 0 {
+		http.Error(w, "amount must be strictly positive", http.StatusBadRequest)
+		return
+	}
+	if err := db.ValidateAmount(req.Amount, curr); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	railProto := parseProtoPaymentRail(req.PaymentRail)
+	if railProto == walletv1.PaymentRail_PAYMENT_RAIL_UNSPECIFIED {
+		http.Error(w, "payment_rail must be one of CARD, ACH, SEPA, WIRE", http.StatusBadRequest)
+		return
+	}
+
+	idempKey := strings.TrimSpace(req.IdempotencyKey)
+	if idempKey == "" {
+		idempKey = r.Header.Get("Idempotency-Key")
+	}
+	if idempKey == "" {
+		idempKey = "idemp_dep_" + traceID
+	}
+	correlation.IdempotencyKey = idempKey
+
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		if err := ValidateWalletOwnership(claims, walletID); err != nil && !claims.HasRole(auth.RoleAdmin) {
+			log.Printf("[SECURITY] IDOR blocked: subject %s tried to deposit into wallet %s", claims.Subject, walletID)
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
+			return
+		}
+	}
+
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	g.emit(ctx, eventAPIRequestReceived, observability.LevelInfo, "HTTP deposit funds request received", map[string]any{
+		"operation":    "deposit_funds",
+		"wallet_id":    walletID,
+		"currency":     curr,
+		"amount":       req.Amount,
+		"payment_rail": req.PaymentRail,
+		"reference":    req.Reference,
+	})
+
+	protoReq := &walletv1.DepositFundsRequest{
+		IdempotencyKey: idempKey,
+		WalletId:       walletID,
+		Amount: &walletv1.Money{
+			Currency: curr,
+			Units:    req.Amount,
+		},
+		PaymentRail: railProto,
+		Reference:   req.Reference,
+	}
+
+	client, target := g.getActiveWalletClient(ctx)
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	resp, err := client.DepositFunds(callCtx, protoReq)
+	if err != nil {
+		log.Printf(traceWalletGRPCRespFmt, traceID, err)
+		handleWalletGRPCError(w, err, "depositing funds")
+		return
+	}
+
+	if resp.Status != walletv1.DepositFundsResponse_SUCCESS {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"status":         resp.Status.String(),
+			"error_message":  resp.ErrorMessage,
+			"transaction_id": resp.TransactionId,
+			"routed_gateway": target,
+			"handled_region": resp.HandledByRegion,
+		})
+		return
+	}
+
+	g.emit(ctx, eventAPIResponseSent, observability.LevelInfo, "Deposit funds response sent", map[string]any{
+		"operation":      "deposit_funds",
+		"transaction_id": resp.TransactionId,
+		"wallet_id":      walletID,
+		"currency":       curr,
+		"amount":         req.Amount,
+		"payment_rail":   req.PaymentRail,
+	})
+
+	if d := g.getWebhookDispatcher(); d != nil {
+		bgCtx := context.WithoutCancel(r.Context())
+		// #nosec G118 -- asynchronous webhook dispatch must decouple from HTTP request context cancellation
+		go func() {
+			_ = d.Dispatch(bgCtx, webhook.EventDepositCompleted, map[string]interface{}{
+				"transaction_id":     resp.TransactionId,
+				"wallet_id":          walletID,
+				"amount":             resp.GetCreditedAmount().GetUnits(),
+				"currency":           resp.GetCreditedAmount().GetCurrency(),
+				"payment_rail":       resp.PaymentRail.String(),
+				"external_reference": resp.ExternalReference,
+				"handled_region":     resp.HandledByRegion,
+			})
+		}()
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":             resp.Status.String(),
+		"transaction_id":     resp.TransactionId,
+		"wallet_id":          walletID,
+		"amount":             resp.GetCreditedAmount().GetUnits(),
+		"currency":           resp.GetCreditedAmount().GetCurrency(),
+		"payment_rail":       resp.PaymentRail.String(),
+		"external_reference": resp.ExternalReference,
+		"routed_gateway":     target,
+		"handled_region":     resp.HandledByRegion,
+	})
+}
+
+func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWalletID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	correlation := observability.FromHTTPRequest(r)
+	traceID := correlation.AssociationID
+
+	body, err := readClientJSON(traceID, r.Body)
+	if err != nil {
+		log.Printf("[TRACE] trace_id=%s step=http_read_body_failed error=%v", traceID, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		IdempotencyKey     string `json:"idempotency_key"`
+		WalletID           string `json:"wallet_id"`
+		Amount             int64  `json:"amount"`
+		Currency           string `json:"currency"`
+		PaymentRail        string `json:"payment_rail"`
+		BeneficiaryDetails string `json:"beneficiary_details"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		log.Printf("[TRACE] trace_id=%s step=http_json_decode_failed error=%v", traceID, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	walletID := strings.TrimSpace(pathWalletID)
+	if walletID == "" {
+		walletID = strings.TrimSpace(req.WalletID)
+	}
+	if walletID == "" {
+		walletID = strings.TrimSpace(r.URL.Query().Get("id"))
+	}
+	if walletID == "" {
+		walletID = strings.TrimSpace(r.URL.Query().Get("wallet_id"))
+	}
+	if walletID == "" {
+		http.Error(w, "wallet_id is required", http.StatusBadRequest)
+		return
+	}
+
+	curr := db.NormalizeCurrency(req.Currency)
+	if curr == "" {
+		http.Error(w, "currency is required", http.StatusBadRequest)
+		return
+	}
+	if req.Amount <= 0 {
+		http.Error(w, "amount must be strictly positive", http.StatusBadRequest)
+		return
+	}
+	if err := db.ValidateAmount(req.Amount, curr); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	railProto := parseProtoPaymentRail(req.PaymentRail)
+	if railProto == walletv1.PaymentRail_PAYMENT_RAIL_UNSPECIFIED {
+		http.Error(w, "payment_rail must be one of CARD, ACH, SEPA, WIRE", http.StatusBadRequest)
+		return
+	}
+
+	idempKey := strings.TrimSpace(req.IdempotencyKey)
+	if idempKey == "" {
+		idempKey = r.Header.Get("Idempotency-Key")
+	}
+	if idempKey == "" {
+		idempKey = "idemp_wth_" + traceID
+	}
+	correlation.IdempotencyKey = idempKey
+
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		if err := ValidateWalletOwnership(claims, walletID); err != nil && !claims.HasRole(auth.RoleAdmin) {
+			log.Printf("[SECURITY] IDOR blocked: subject %s tried to withdraw from wallet %s", claims.Subject, walletID)
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
+			return
+		}
+	}
+
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	g.emit(ctx, eventAPIRequestReceived, observability.LevelInfo, "HTTP withdraw funds request received", map[string]any{
+		"operation":           "withdraw_funds",
+		"wallet_id":           walletID,
+		"currency":            curr,
+		"amount":              req.Amount,
+		"payment_rail":        req.PaymentRail,
+		"beneficiary_details": req.BeneficiaryDetails,
+	})
+
+	protoReq := &walletv1.WithdrawFundsRequest{
+		IdempotencyKey: idempKey,
+		WalletId:       walletID,
+		Amount: &walletv1.Money{
+			Currency: curr,
+			Units:    req.Amount,
+		},
+		PaymentRail:        railProto,
+		BeneficiaryDetails: req.BeneficiaryDetails,
+	}
+
+	client, target := g.getActiveWalletClient(ctx)
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	resp, err := client.WithdrawFunds(callCtx, protoReq)
+	if err != nil {
+		log.Printf(traceWalletGRPCRespFmt, traceID, err)
+		handleWalletGRPCError(w, err, "withdrawing funds")
+		return
+	}
+
+	if resp.Status != walletv1.WithdrawFundsResponse_SUCCESS {
+		statusHTTP := http.StatusBadRequest
+		switch resp.Status {
+		case walletv1.WithdrawFundsResponse_FAILED_INSUFFICIENT_FUNDS:
+			statusHTTP = http.StatusUnprocessableEntity
+		case walletv1.WithdrawFundsResponse_FAILED_VELOCITY_LIMIT_EXCEEDED:
+			statusHTTP = http.StatusTooManyRequests
+		}
+		writeJSON(w, statusHTTP, map[string]interface{}{
+			"status":         resp.Status.String(),
+			"error_message":  resp.ErrorMessage,
+			"transaction_id": resp.TransactionId,
+			"routed_gateway": target,
+			"handled_region": resp.HandledByRegion,
+		})
+		return
+	}
+
+	g.emit(ctx, eventAPIResponseSent, observability.LevelInfo, "Withdraw funds response sent", map[string]any{
+		"operation":      "withdraw_funds",
+		"transaction_id": resp.TransactionId,
+		"wallet_id":      walletID,
+		"currency":       curr,
+		"amount":         req.Amount,
+		"payment_rail":   req.PaymentRail,
+	})
+
+	if d := g.getWebhookDispatcher(); d != nil {
+		bgCtx := context.WithoutCancel(r.Context())
+		// #nosec G118 -- asynchronous webhook dispatch must decouple from HTTP request context cancellation
+		go func() {
+			_ = d.Dispatch(bgCtx, webhook.EventWithdrawalCompleted, map[string]interface{}{
+				"transaction_id":      resp.TransactionId,
+				"wallet_id":           walletID,
+				"amount":              resp.GetDebitedAmount().GetUnits(),
+				"currency":            resp.GetDebitedAmount().GetCurrency(),
+				"payment_rail":        resp.PaymentRail.String(),
+				"external_reference":  resp.ExternalReference,
+				"beneficiary_details": req.BeneficiaryDetails,
+				"handled_region":      resp.HandledByRegion,
+			})
+		}()
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":             resp.Status.String(),
+		"transaction_id":     resp.TransactionId,
+		"wallet_id":          walletID,
+		"amount":             resp.GetDebitedAmount().GetUnits(),
+		"currency":           resp.GetDebitedAmount().GetCurrency(),
+		"payment_rail":       resp.PaymentRail.String(),
+		"external_reference": resp.ExternalReference,
+		"routed_gateway":     target,
+		"handled_region":     resp.HandledByRegion,
+	})
+}
+
+func (g *Gateway) getWebhookDispatcher() *webhook.Dispatcher {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.webhookDispatcher
+}
+
+func (g *Gateway) handleWebhookSubscriptions(w http.ResponseWriter, r *http.Request) {
+	d := g.getWebhookDispatcher()
+	if d == nil {
+		http.Error(w, "Webhook subsystem unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPost:
+		var req struct {
+			URL       string   `json:"url"`
+			TargetURL string   `json:"target_url"`
+			Events    []string `json:"events"`
+			Secret    string   `json:"secret"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		targetURL := req.URL
+		if targetURL == "" {
+			targetURL = req.TargetURL
+		}
+		if targetURL == "" {
+			http.Error(w, "url is required", http.StatusBadRequest)
+			return
+		}
+		if len(req.Events) == 0 {
+			req.Events = []string{"*"}
+		}
+
+		ownerID := ""
+		if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+			ownerID = claims.Subject
+		}
+
+		sub := &webhook.WebhookSubscription{
+			URL:     targetURL,
+			Events:  req.Events,
+			Secret:  req.Secret,
+			OwnerID: ownerID,
+		}
+
+		if err := d.RegisterSubscription(r.Context(), sub); err != nil {
+			http.Error(w, fmt.Sprintf("failed to register webhook: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		writeJSON(w, http.StatusCreated, map[string]interface{}{
+			"id":         sub.ID.Hex(),
+			"url":        sub.URL,
+			"events":     sub.Events,
+			"secret":     sub.Secret,
+			"is_active":  sub.IsActive,
+			"created_at": sub.CreatedAt.Format(time.RFC3339),
+		})
+
+	case http.MethodGet:
+		ownerID := ""
+		if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+			if !claims.HasRole(auth.RoleAdmin) {
+				ownerID = claims.Subject
+			}
+		}
+
+		subs, err := d.ListSubscriptions(r.Context(), ownerID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to list webhooks: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		type subView struct {
+			ID         string    `json:"id"`
+			URL        string    `json:"url"`
+			Events     []string  `json:"events"`
+			SecretMask string    `json:"secret_mask"`
+			IsActive   bool      `json:"is_active"`
+			CreatedAt  time.Time `json:"created_at"`
+		}
+
+		views := make([]subView, 0, len(subs))
+		for _, s := range subs {
+			masked := "whsec_****"
+			if len(s.Secret) > 10 {
+				masked = s.Secret[:6] + "..." + s.Secret[len(s.Secret)-4:]
+			}
+			views = append(views, subView{
+				ID:         s.ID.Hex(),
+				URL:        s.URL,
+				Events:     s.Events,
+				SecretMask: masked,
+				IsActive:   s.IsActive,
+				CreatedAt:  s.CreatedAt,
+			})
+		}
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"count":         len(views),
+			"subscriptions": views,
+		})
+
+	case http.MethodDelete:
+		idStr := strings.TrimSpace(r.URL.Query().Get("id"))
+		if idStr == "" {
+			http.Error(w, "missing 'id' query parameter", http.StatusBadRequest)
+			return
+		}
+		oid, err := primitive.ObjectIDFromHex(idStr)
+		if err != nil {
+			http.Error(w, "invalid subscription id", http.StatusBadRequest)
+			return
+		}
+		if err := d.DeleteSubscription(r.Context(), oid); err != nil {
+			if err == mongo.ErrNoDocuments {
+				http.Error(w, "subscription not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, fmt.Sprintf("failed to delete subscription: %v", err), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"message": "subscription deactivated successfully"})
+
+	default:
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+	}
+}
+
+func (g *Gateway) handleWebhookTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	d := g.getWebhookDispatcher()
+	if d == nil {
+		http.Error(w, "Webhook subsystem unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req struct {
+		URL       string `json:"url"`
+		TargetURL string `json:"target_url"`
+		Secret    string `json:"secret"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	targetURL := req.URL
+	if targetURL == "" {
+		targetURL = req.TargetURL
+	}
+	if targetURL == "" {
+		http.Error(w, "url is required", http.StatusBadRequest)
+		return
+	}
+	if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
+		http.Error(w, "valid webhook url (http/https) is required", http.StatusBadRequest)
+		return
+	}
+	if req.Secret == "" {
+		req.Secret = "whsec_test_secret_for_ping"
+	}
+
+	code, latency, err := d.TestEndpoint(r.Context(), targetURL, req.Secret)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]interface{}{
+			"success":    false,
+			"url":        targetURL,
+			"error":      err.Error(),
+			"latency_ms": latency.Milliseconds(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success":     code >= 200 && code < 300,
+		"url":         targetURL,
+		"status_code": code,
+		"latency_ms":  latency.Milliseconds(),
+	})
 }
 
 func (g *Gateway) handleLedger(w http.ResponseWriter, r *http.Request) {
@@ -1080,6 +1936,14 @@ func (gw *Gateway) handleFXRatesRefresh(w http.ResponseWriter, r *http.Request) 
 
 func registerGatewayRoutes(mux *http.ServeMux, gw *Gateway) {
 	mux.HandleFunc("/api/v1/wallets", gw.handleWallets)
+	mux.HandleFunc("/api/v1/wallets/", gw.handleWalletSubroutes)
+	mux.HandleFunc("/api/v1/wallets/deposit", gw.handleDepositFunds)
+	mux.HandleFunc("/api/v1/wallets/withdraw", gw.handleWithdrawFunds)
+	mux.HandleFunc("/api/v1/wallets/exchange", gw.handleWalletExchange)
+	mux.HandleFunc("/api/v1/wallets/kyc", gw.handleUpdateWalletKYC)
+	mux.HandleFunc("/api/v1/wallets/limits", gw.handleGetWalletLimits)
+	mux.HandleFunc("/api/v1/webhooks/subscriptions", gw.handleWebhookSubscriptions)
+	mux.HandleFunc("/api/v1/webhooks/test", gw.handleWebhookTest)
 	mux.HandleFunc("/api/v1/transfers", gw.handleTransfer)
 	mux.HandleFunc("/api/v1/ledger", gw.handleLedger)
 	mux.HandleFunc("/api/v1/fx/currencies", gw.handleFXCurrencies)
@@ -1204,20 +2068,37 @@ func runGatewayServer(ctx context.Context) error {
 		fxClient = fxv1.NewFXServiceClient(fxConn)
 	}
 
-	coord, cleanupCoord := initFailoverCoordinator(os.Getenv("MONGO_URI"))
+	mongoURI := os.Getenv("MONGO_URI")
+	coord, cleanupCoord := initFailoverCoordinator(mongoURI)
 	defer cleanupCoord()
 
+	var whDispatcher *webhook.Dispatcher
+	if mongoURI != "" {
+		mCtx, mCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if mClient, err := db.ConnectWithRetry(mCtx, mongoURI, 3); err == nil {
+			database := mClient.Database("banking_db")
+			_ = db.EnsureWebhookIndexes(context.Background(), database)
+			whDispatcher = webhook.NewDispatcher(database, nil)
+			go whDispatcher.StartRetryWorker(subCtx, 5*time.Second)
+		}
+		mCancel()
+	}
+	if whDispatcher == nil {
+		whDispatcher = webhook.NewDispatcher(nil, nil)
+	}
+
 	gw := &Gateway{
-		activeTarget:   "PRIMARY",
-		coordinator:    coord,
-		primaryClient:  walletv1.NewWalletServiceClient(pConn),
-		standbyClient:  walletv1.NewWalletServiceClient(sConn),
-		ledgerClient:   ledgerv1.NewLedgerServiceClient(lConn),
-		authClient:     authv1.NewAuthServiceClient(aConn),
-		fxClient:       fxClient,
-		primaryAddress: primaryAddr,
-		standbyAddress: standbyAddr,
-		logger:         logger,
+		activeTarget:      "PRIMARY",
+		coordinator:       coord,
+		primaryClient:     walletv1.NewWalletServiceClient(pConn),
+		standbyClient:     walletv1.NewWalletServiceClient(sConn),
+		ledgerClient:      ledgerv1.NewLedgerServiceClient(lConn),
+		authClient:        authv1.NewAuthServiceClient(aConn),
+		fxClient:          fxClient,
+		primaryAddress:    primaryAddr,
+		standbyAddress:    standbyAddr,
+		logger:            logger,
+		webhookDispatcher: whDispatcher,
 	}
 
 	if initTarget, err := coord.GetActiveTarget(subCtx); err == nil {

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -108,21 +109,30 @@ func ValidatePostings(postings []JournalPosting) error {
 	return checkCurrencyEquilibrium(debits, credits)
 }
 
+// DetermineAccountType classifies an account ID into its GAAP balance sheet category.
+// External clearing rails and FX liquidity pools are bank settlement assets; customer wallets are customer liabilities.
+func DetermineAccountType(accountID string) AccountType {
+	if strings.HasPrefix(accountID, "EXTERNAL_CLEARING_") || strings.HasPrefix(accountID, "CLEARING_") || strings.HasPrefix(accountID, "FX_LIQUIDITY_POOL_") {
+		return AccountTypeSettlementAsset
+	}
+	return AccountTypeCustomerLiability
+}
+
 // CreateTransferPostings creates balanced GAAP double-entry postings for a transfer:
-// - Debit Source Customer Liability (reduces liability to sender)
-// - Credit Destination Customer Liability (increases liability to receiver)
+// - Debit Source Liability or Asset (reduces liability to sender or increases clearing asset)
+// - Credit Destination Liability or Asset (increases liability to receiver or settles clearing asset)
 func CreateTransferPostings(sourceWalletID, destWalletID string, amount int64, currency string) ([]JournalPosting, error) {
 	postings := []JournalPosting{
 		{
 			AccountID:   sourceWalletID,
-			AccountType: AccountTypeCustomerLiability,
+			AccountType: DetermineAccountType(sourceWalletID),
 			Direction:   PostingDebit,
 			Amount:      amount,
 			Currency:    currency,
 		},
 		{
 			AccountID:   destWalletID,
-			AccountType: AccountTypeCustomerLiability,
+			AccountType: DetermineAccountType(destWalletID),
 			Direction:   PostingCredit,
 			Amount:      amount,
 			Currency:    currency,
@@ -133,6 +143,30 @@ func CreateTransferPostings(sourceWalletID, destWalletID string, amount int64, c
 		return nil, err
 	}
 	return postings, nil
+}
+
+// CreateDepositPostings creates balanced GAAP double-entry postings for an external rail deposit:
+// - Debit Settlement Asset (e.g. EXTERNAL_CLEARING_CARD_USD) -> increases bank settlement assets
+// - Credit Customer Liability (e.g. walletID) -> increases customer deposit liability
+func CreateDepositPostings(walletID string, rail string, amount int64, currency string) ([]JournalPosting, error) {
+	railStr := strings.ToUpper(strings.TrimSpace(rail))
+	if railStr == "" {
+		railStr = "CARD"
+	}
+	clearingAccount := fmt.Sprintf("EXTERNAL_CLEARING_%s_%s", railStr, currency)
+	return CreateTransferPostings(clearingAccount, walletID, amount, currency)
+}
+
+// CreateWithdrawalPostings creates balanced GAAP double-entry postings for an external rail withdrawal:
+// - Debit Customer Liability (e.g. walletID) -> decreases customer deposit liability
+// - Credit Settlement Asset (e.g. EXTERNAL_CLEARING_ACH_USD) -> decreases bank assets (payout to rail)
+func CreateWithdrawalPostings(walletID string, rail string, amount int64, currency string) ([]JournalPosting, error) {
+	railStr := strings.ToUpper(strings.TrimSpace(rail))
+	if railStr == "" {
+		railStr = "ACH"
+	}
+	clearingAccount := fmt.Sprintf("EXTERNAL_CLEARING_%s_%s", railStr, currency)
+	return CreateTransferPostings(walletID, clearingAccount, amount, currency)
 }
 
 // CreateMultiCurrencyTransferPostings generates balanced GAAP/IFRS double-entry journal postings

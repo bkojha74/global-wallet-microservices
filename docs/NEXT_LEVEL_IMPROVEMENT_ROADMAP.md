@@ -44,6 +44,7 @@ graph TD
     P4 --> B1[Multi-Currency Pots per Wallet]
     P4 --> B2[Velocity Limits Engine]
     P4 --> B3[Deposit & Withdraw External Rails]
+    P4 --> B4[Partner Webhook Dispatcher]
 
     P5 --> D1[OpenAPI 3.0 & Swagger UI]
     P5 --> D2[Unified CLI walletctl]
@@ -136,19 +137,21 @@ graph TD
 ### Pillar 4: Core Banking & Financial Product Expansion
 *Focus: Support multi-currency wallets, payment rails, and velocity limits.*
 
-- [ ] **FIN-01: Multi-Currency Pots per Wallet**
-  - [ ] Extend `WalletModel` to support balances map `map[string]int64` (e.g. `USD: 10000`, `EUR: 5000`).
-  - [ ] Enable atomic intra-wallet currency exchanges.
-- [ ] **FIN-02: Velocity Limits & Compliance Engine**
-  - [ ] Add configurable 24-hour rolling volume limits and transaction rate caps per user.
-  - [ ] Support KYC tier enforcement (`TIER_1`, `TIER_2`, `TIER_3`).
-- [ ] **FIN-03: External Deposit & Withdrawal Rails Simulator**
-  - [ ] Add `POST /api/v1/wallets/{id}/deposit` (Card/ACH/SEPA inbound simulation).
-  - [ ] Add `POST /api/v1/wallets/{id}/withdraw` (External bank payout simulation).
-  - [ ] Record corresponding 2-leg external settlement journal entries in `ledger-service`.
-- [ ] **FIN-04: Outbound Partner Webhook Dispatcher**
-  - [ ] Support merchant/partner webhook registration (`transfer.completed`, `fraud.flagged`).
-  - [ ] Sign payloads with HMAC-SHA256 (`X-Wallet-Signature`) with retry worker.
+- [x] **FIN-01: Multi-Currency Pots per Wallet**
+  - [x] Extend `WalletModel` to support balances map `map[string]int64` (e.g. `USD: 10000`, `EUR: 5000`).
+  - [x] Enable atomic intra-wallet currency exchanges.
+- [x] **FIN-02: Velocity Limits & Compliance Engine**
+  - [x] Add configurable 24-hour rolling volume limits and transaction rate caps per user.
+  - [x] Support KYC tier enforcement (`TIER_1`, `TIER_2`, `TIER_3`).
+- [x] **FIN-03: External Deposit & Withdrawal Rails Simulator**
+  - [x] Add `POST /api/v1/wallets/{id}/deposit` (Card/ACH/SEPA/WIRE inbound simulation).
+  - [x] Add `POST /api/v1/wallets/{id}/withdraw` (External bank payout simulation).
+  - [x] Record corresponding 2-leg external settlement journal entries in `ledger-service`.
+- [x] **FIN-04: Outbound Partner Webhook Dispatcher**
+  - [x] Support merchant/partner webhook registration (`transfer.completed`, `fraud.flagged`, `deposit.completed`, `withdrawal.completed`).
+  - [x] Sign payloads with HMAC-SHA256 (`X-Wallet-Signature`, `X-Wallet-Timestamp`) with replay attack tolerance.
+  - [x] Exponential backoff retry engine with full jitter and MongoDB delivery state tracking.
+  - [x] RESTful webhook subscription and live endpoint ping test APIs in API Gateway.
 
 ---
 
@@ -209,4 +212,72 @@ graph TD
 | FX Stale Fallback Unit & Race Suite | `cmd/fx-service/main_test.go` | ✅ Complete |
 | Outbox Relay Full-Jitter Exponential Backoff | `cmd/wallet-service/ledger_outbox.go` | ✅ Complete |
 | Outbox Backoff Unit & Race Test Suite | `cmd/wallet-service/ledger_outbox_unit_test.go` | ✅ Complete |
+
+---
+
+## 7. Current Execution Status: Track 4 (Core Banking Expansion - FIN-01)
+
+| Component / Subsystem | File Path | Status |
+|---|---|:---:|
+| Multi-Currency Protobuf Definition (`ExchangeCurrency`) | `proto/wallet/wallet.proto` | ✅ Complete |
+| Wallet Multi-Currency Pots Model (`Balances map[string]int64`) | `cmd/wallet-service/main.go` | ✅ Complete |
+| Atomic Intra-Wallet FX Exchange Handler & ACID Flow | `cmd/wallet-service/main.go` | ✅ Complete |
+| Double-Entry Intra-Wallet Ledger Outbox Integration | `cmd/wallet-service/main.go` | ✅ Complete |
+| API Gateway REST Route (`POST /api/v1/wallets/exchange`) | `cmd/api-gateway/main.go` | ✅ Complete |
+| Wallet Service Multi-Currency & Exchange Unit Tests | `cmd/wallet-service/main_unit_test.go` | ✅ Complete |
+| API Gateway Exchange Endpoint Unit Tests | `cmd/api-gateway/gateway_routes_unit_test.go` | ✅ Complete |
+
+---
+
+## 8. Current Execution Status: Track 4 (Core Banking Expansion - FIN-02)
+
+| Component / Subsystem | File Path | Status |
+|---|---|:---:|
+| Protobuf Contracts (`UpdateWalletKYC`, `GetWalletLimits`) | `proto/wallet/wallet.proto` | ✅ Complete |
+| Compliance & Velocity Engine (`TierConfigs`, `CheckVelocityLimits`) | `cmd/wallet-service/compliance.go` | ✅ Complete |
+| Dynamic 24h Rolling Volume & 1h Rate Verification | `cmd/wallet-service/compliance.go` | ✅ Complete |
+| KYC Tier Persistence & Transfer Pipeline Enforcement | `cmd/wallet-service/main.go` | ✅ Complete |
+| Exchange Pipeline Compliance Guard & Velocity Logging | `cmd/wallet-service/main.go` | ✅ Complete |
+| MongoDB Velocity Logs TTL & Indexing | `pkg/db/indexes.go` | ✅ Complete |
+| REST Endpoints (`PUT /api/v1/wallets/kyc`, `GET /api/v1/wallets/limits`) | `cmd/api-gateway/main.go` | ✅ Complete |
+| Unit & Concurrency Test Suites | `cmd/wallet-service/main_unit_test.go`, `cmd/api-gateway/gateway_routes_unit_test.go` | ✅ Complete |
+
+---
+
+## 9. Current Execution Status: Track 4 (Core Banking Expansion - FIN-03)
+
+| Component / Subsystem | File Path | Status |
+|---|---|:---:|
+| Protobuf Contracts (`DepositFunds`, `WithdrawFunds`, `PaymentRail`) | `proto/wallet/wallet.proto` | ✅ Complete |
+| GAAP Double-Entry Settlement Rails (`CreateDepositPostings`, `CreateWithdrawalPostings`, `DetermineAccountType`) | `cmd/ledger-service/double_entry.go` | ✅ Complete |
+| Wallet Inbound Rail Credit Engine & Transactional Outbox | `cmd/wallet-service/main.go` | ✅ Complete |
+| Wallet Outbound Payout Rail Engine with Velocity Limits & Compliance Guard | `cmd/wallet-service/main.go` | ✅ Complete |
+| API Gateway REST Deposit Routes (`POST /api/v1/wallets/deposit` & `/api/v1/wallets/{id}/deposit`) | `cmd/api-gateway/main.go` | ✅ Complete |
+| API Gateway REST Withdrawal Routes (`POST /api/v1/wallets/withdraw` & `/api/v1/wallets/{id}/withdraw`) | `cmd/api-gateway/main.go` | ✅ Complete |
+| Zero-Trust IDOR Ownership Verification & Payment Rail Enums | `cmd/api-gateway/main.go` | ✅ Complete |
+| Wallet Service Payment Rail & Rails Validation Unit Tests | `cmd/wallet-service/main_unit_test.go` | ✅ Complete |
+| API Gateway Deposit & Withdrawal HTTP Route Unit Tests | `cmd/api-gateway/gateway_routes_unit_test.go` | ✅ Complete |
+| Mock Implementations & Integration | `cmd/api-gateway/main_test.go` | ✅ Complete |
+| Full Concurrency & Race Detector Suite (`-race`) | All Services | ✅ Complete (0 data races) |
+| GoSec Static Security Analysis | All Services (48 files, 15,990 lines) | ✅ Complete (0 issues) |
+
+---
+
+## 10. Current Execution Status: Track 4 (Core Banking Expansion - FIN-04)
+
+| Component / Subsystem | File Path | Status |
+|---|---|:---:|
+| Webhook Domain Models & Event Enums (`transfer.completed`, `fraud.flagged`, etc.) | `pkg/webhook/models.go` | ✅ Complete |
+| HMAC-SHA256 Signature Engine & Anti-Replay Verification | `pkg/webhook/signature.go` | ✅ Complete |
+| Outbound Dispatcher & Jittered Exponential Backoff Retry Engine | `pkg/webhook/dispatcher.go` | ✅ Complete |
+| MongoDB Webhook Subscriptions & Deliveries TTL Indexing | `pkg/db/indexes.go` | ✅ Complete |
+| Wallet Service Fraud Detection Webhook Dispatch | `cmd/wallet-service/main.go` | ✅ Complete |
+| API Gateway Webhook Subscription & Ping Test Routes | `cmd/api-gateway/main.go` | ✅ Complete |
+| API Gateway Async Fanout on Transfer/Deposit/Withdrawal Events | `cmd/api-gateway/main.go` | ✅ Complete |
+| Dedicated Webhook Package Test Suite (`-race`) | `pkg/webhook/webhook_test.go` | ✅ Complete (0 data races) |
+| API Gateway Webhook Endpoints Unit Tests | `cmd/api-gateway/gateway_routes_unit_test.go` | ✅ Complete |
+| Staticcheck & GoSec Code Quality Gates | All Services | ✅ Complete (0 issues) |
+
+
+
 
