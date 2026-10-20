@@ -1962,6 +1962,13 @@ func registerGatewayRoutes(mux *http.ServeMux, gw *Gateway) {
 	})
 	mux.HandleFunc("/readyz", gw.handleReadyz)
 	mux.Handle("/metrics", observability.DefaultMetrics.Handler())
+
+	// DEV-01: OpenAPI 3.0 & Embedded Swagger UI
+	mux.HandleFunc("/swagger", handleSwaggerRedirect)
+	mux.HandleFunc("/swagger/", handleSwaggerUI)
+	mux.HandleFunc("/docs", handleSwaggerRedirect)
+	mux.HandleFunc("/docs/", handleSwaggerUI)
+	mux.HandleFunc("/api-docs/openapi.json", handleOpenAPISpec)
 }
 
 func wrapGatewayMiddleware(handler http.Handler, authClient authv1.AuthServiceClient) http.Handler {
@@ -1969,6 +1976,11 @@ func wrapGatewayMiddleware(handler http.Handler, authClient authv1.AuthServiceCl
 		"/healthz":               true,
 		"/readyz":                true,
 		"/metrics":               true,
+		"/swagger":               true,
+		"/swagger/":              true,
+		"/docs":                  true,
+		"/docs/":                 true,
+		"/api-docs/openapi.json": true,
 		"/api/v1/auth/login":     true,
 		"/api/v1/auth/refresh":   true,
 		"/api/v1/auth/token":     true,

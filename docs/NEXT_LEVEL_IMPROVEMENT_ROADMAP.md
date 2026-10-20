@@ -278,6 +278,22 @@ graph TD
 | API Gateway Webhook Endpoints Unit Tests | `cmd/api-gateway/gateway_routes_unit_test.go` | ✅ Complete |
 | Staticcheck & GoSec Code Quality Gates | All Services | ✅ Complete (0 issues) |
 
+---
+
+## 11. Current Execution Status: Track 5 (Developer Experience, Tooling & Auditing)
+
+| Component / Subsystem | File Path | Status |
+|---|---|:---:|
+| OpenAPI 3.0 Contract Specification | `api/openapi/openapi.json` | 🔄 In Progress (DEV-01) |
+| Embedded Swagger UI & Documentation Engine | `cmd/api-gateway/swagger.go` | 🔄 In Progress (DEV-01) |
+| Gateway Route Registration (`/swagger`, `/docs`, `/api-docs/openapi.json`) | `cmd/api-gateway/main.go` | 🔄 In Progress (DEV-01) |
+| Swagger & OpenAPI Unit Tests | `cmd/api-gateway/gateway_routes_unit_test.go` | 🔄 In Progress (DEV-01) |
+| Unified CLI Tool (`walletctl`) Architecture & Health/Token Subcommands | `cmd/walletctl/` | ⏳ Pending (DEV-02) |
+| Merkle Tree Batch Calculation & Proof Generation Engine | `pkg/merkle/` | ⏳ Pending (DEV-03) |
+| Ledger Merkle Periodic Checkpointing Worker | `cmd/ledger-service/merkle.go` | ⏳ Pending (DEV-03) |
+| Architectural Documentation | `docs/PILLAR5_DEV_EXPERIENCE_TOOLING_GUIDE.md` | ✅ Complete |
+
+
 
 
 
