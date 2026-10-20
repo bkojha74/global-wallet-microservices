@@ -1,0 +1,1110 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Global Wallet Microservices API",
+    "version": "1.5.0",
+    "description": "High-performance, distributed multi-currency digital wallet and core banking platform with zero-trust security, real-time FX, GAAP double-entry ledger settlement, velocity controls, payment rails simulation, and partner webhooks.",
+    "contact": {
+      "name": "Global Wallet Engineering Team",
+      "url": "https://github.com/bkojha74/global-wallet-microservices"
+    },
+    "license": {
+      "name": "Apache 2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
+    }
+  },
+  "servers": [
+    {
+      "url": "/",
+      "description": "Current Gateway Host (Relative)"
+    },
+    {
+      "url": "http://localhost:8080",
+      "description": "Local Development Gateway"
+    }
+  ],
+  "tags": [
+    {
+      "name": "System & Health",
+      "description": "Kubernetes liveness, readiness, and monitoring probes"
+    },
+    {
+      "name": "Authentication",
+      "description": "OAuth2/OIDC and JWT access token issuance, refresh, and revocation"
+    },
+    {
+      "name": "Wallets",
+      "description": "Multi-currency wallet accounts and balance pot management"
+    },
+    {
+      "name": "Transfers & FX",
+      "description": "Cross-wallet money movements and intra-wallet atomic currency exchange"
+    },
+    {
+      "name": "Compliance & Limits",
+      "description": "KYC tier configuration and real-time velocity limits"
+    },
+    {
+      "name": "Payment Rails",
+      "description": "Inbound external deposit and outbound external payout rails simulation"
+    },
+    {
+      "name": "Partner Webhooks",
+      "description": "Merchant/partner event subscription registry and diagnostic ping testing"
+    },
+    {
+      "name": "Ledger & Auditing",
+      "description": "Immutable cryptographic double-entry ledger journal queries"
+    },
+    {
+      "name": "Foreign Exchange (FX)",
+      "description": "Live currency catalog, mid-market rates, RFQ quotes, and conversions"
+    },
+    {
+      "name": "Cluster Management",
+      "description": "Multi-region failover and distributed routing control"
+    }
+  ],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": ["System & Health"],
+        "summary": "Liveness Probe",
+        "description": "Returns HTTP 200 UP if the API gateway process is alive.",
+        "responses": {
+          "200": {
+            "description": "Gateway is alive",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string", "example": "UP" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "tags": ["System & Health"],
+        "summary": "Readiness Probe",
+        "description": "Returns HTTP 200 if the gateway and downstream gRPC services (Primary/Standby Wallet, Ledger, FX, Auth) are healthy.",
+        "responses": {
+          "200": {
+            "description": "All backend dependencies are healthy and serving traffic",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string", "example": "READY" },
+                    "active_target": { "type": "string", "example": "PRIMARY" },
+                    "wallet_status": { "type": "string", "example": "SERVING" }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Gateway or upstream dependency degraded",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/token": {
+      "post": {
+        "tags": ["Authentication"],
+        "summary": "Issue Development or Service JWT Token",
+        "description": "Issues a signed JWT bearer token with customized subject, roles, and scopes for testing and API integration.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AuthTokenRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Token successfully generated",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AuthTokenResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid token parameters",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/refresh": {
+      "post": {
+        "tags": ["Authentication"],
+        "summary": "Refresh Access Token",
+        "description": "Exchanges a valid refresh token for a newly minted access token.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AuthRefreshRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Access token refreshed",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AuthTokenResponse" }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or expired refresh token",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/logout": {
+      "post": {
+        "tags": ["Authentication"],
+        "summary": "Revoke Token / Logout",
+        "description": "Revokes an active access token or refresh token session.",
+        "security": [{ "BearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AuthLogoutRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Session revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": { "type": "string", "example": "logged out successfully" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wallets": {
+      "post": {
+        "tags": ["Wallets"],
+        "summary": "Create Multi-Currency Wallet",
+        "description": "Initializes a new wallet document supporting multi-currency pots and KYC tier configurations.",
+        "security": [{ "BearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateWalletRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Wallet created successfully",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CreateWalletResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid wallet parameters or currency",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "409": {
+            "description": "Wallet ID already exists",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wallets/{id}/balance": {
+      "get": {
+        "tags": ["Wallets"],
+        "summary": "Get Wallet Balances",
+        "description": "Retrieves the active balances across all multi-currency pots for a specified wallet ID.",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The unique identifier of the wallet",
+            "schema": { "type": "string", "example": "alice" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Wallet balance retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GetBalanceResponse" }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden: Subject does not own this wallet (IDOR protection)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "Wallet not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wallets/transfer": {
+      "post": {
+        "tags": ["Transfers & FX"],
+        "summary": "Transfer Funds",
+        "description": "Executes an atomic money movement from a source wallet to a destination wallet. Supports cross-currency transfers with automatic real-time FX conversion and GAAP double-entry ledger settlement.",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "X-Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "description": "Unique key to ensure idempotent transaction processing",
+            "schema": { "type": "string", "example": "idemp_tx_78912" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/TransferFundsRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Transfer processed successfully",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TransferFundsResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Insufficient funds or invalid transfer parameters",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "403": {
+            "description": "Transfer blocked by AI fraud detection or IDOR check",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "429": {
+            "description": "Transfer exceeded rolling velocity limits or hourly rate cap",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wallets/exchange": {
+      "post": {
+        "tags": ["Transfers & FX"],
+        "summary": "Intra-Wallet FX Currency Exchange",
+        "description": "Executes an atomic currency conversion between two pots within the same wallet document under MongoDB ACID guarantees.",
+        "security": [{ "BearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ExchangeCurrencyRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Currency exchanged successfully",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ExchangeCurrencyResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Insufficient source currency or invalid pair",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wallets/kyc": {
+      "put": {
+        "tags": ["Compliance & Limits"],
+        "summary": "Update Wallet KYC Tier",
+        "description": "Updates the compliance verification tier (TIER_1, TIER_2, TIER_3) of a wallet to adjust transaction and velocity limits.",
+        "security": [{ "BearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/UpdateWalletKYCRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "KYC tier updated",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/UpdateWalletKYCResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid KYC tier code",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wallets/limits": {
+      "get": {
+        "tags": ["Compliance & Limits"],
+        "summary": "Get Wallet Velocity Limits",
+        "description": "Calculates remaining 24-hour rolling volume and hourly rate allowance for a wallet based on recent transactions.",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "wallet_id",
+            "in": "query",
+            "required": true,
+            "description": "Wallet identifier to inspect",
+            "schema": { "type": "string", "example": "alice" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Limit calculations returned",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GetWalletLimitsResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wallets/deposit": {
+      "post": {
+        "tags": ["Payment Rails"],
+        "summary": "Simulate Inbound Payment Rail Deposit",
+        "description": "Simulates an external inbound deposit via Card, ACH, SEPA, or Wire into a customer wallet with GAAP settlement records.",
+        "security": [{ "BearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/DepositFundsRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Deposit accepted and credited",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DepositFundsResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Unsupported payment rail or non-positive amount",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wallets/withdraw": {
+      "post": {
+        "tags": ["Payment Rails"],
+        "summary": "Simulate Outbound Payment Rail Withdrawal",
+        "description": "Simulates an external payout withdrawal via ACH, SEPA, or Wire to a beneficiary bank account.",
+        "security": [{ "BearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/WithdrawFundsRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Withdrawal processed",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/WithdrawFundsResponse" }
+              }
+            }
+          },
+          "429": {
+            "description": "Velocity limit exceeded for withdrawal",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/webhooks/subscriptions": {
+      "post": {
+        "tags": ["Partner Webhooks"],
+        "summary": "Register Partner Webhook Subscription",
+        "description": "Registers an HTTPS endpoint to receive asynchronous event notifications with HMAC-SHA256 payload signing.",
+        "security": [{ "BearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/WebhookSubscriptionCreateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Subscription created with generated signing secret",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/WebhookSubscription" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid URL or missing subscribed events",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": ["Partner Webhooks"],
+        "summary": "List Webhook Subscriptions",
+        "description": "Lists all active partner webhook subscriptions registered to the caller.",
+        "security": [{ "BearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "List of subscriptions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": { "type": "integer", "example": 2 },
+                    "subscriptions": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/WebhookSubscription" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": ["Partner Webhooks"],
+        "summary": "Deactivate Webhook Subscription",
+        "description": "Marks a registered webhook subscription as inactive by ID.",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "description": "The unique hex ID of the webhook subscription",
+            "schema": { "type": "string", "example": "6ad513c93b856a6d9f96a119" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Subscription deactivated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": { "type": "string", "example": "subscription deactivated successfully" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/webhooks/test": {
+      "post": {
+        "tags": ["Partner Webhooks"],
+        "summary": "Ping Test Webhook Endpoint",
+        "description": "Dispatches a synthetic `webhook.test` signed ping to verify endpoint connectivity, signature verification, and round-trip latency.",
+        "security": [{ "BearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/WebhookTestRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Ping succeeded",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/WebhookTestResponse" }
+              }
+            }
+          },
+          "502": {
+            "description": "Partner endpoint unreachable or returned HTTP error",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/WebhookTestResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/ledger": {
+      "get": {
+        "tags": ["Ledger & Auditing"],
+        "summary": "Query Cryptographic Ledger Journal",
+        "description": "Returns cryptographically chained double-entry ledger records with sequence numbers and SHA-256 integrity hashes.",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "wallet_id",
+            "in": "query",
+            "required": true,
+            "description": "Wallet ID to inspect",
+            "schema": { "type": "string", "example": "alice" }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Max entries to return (default 50)",
+            "schema": { "type": "integer", "example": 50 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Ledger entries returned",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LedgerEntriesResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/fx/currencies": {
+      "get": {
+        "tags": ["Foreign Exchange (FX)"],
+        "summary": "List Supported FX Currencies",
+        "description": "Returns the ISO-4217 catalog of supported fiat and institutional currencies.",
+        "responses": {
+          "200": {
+            "description": "Currency catalog",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FXCurrenciesResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/fx/rates": {
+      "get": {
+        "tags": ["Foreign Exchange (FX)"],
+        "summary": "Get Live FX Rates",
+        "description": "Returns active mid-market exchange rates normalized to USD base.",
+        "responses": {
+          "200": {
+            "description": "Active rates",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FXRateResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/cluster/status": {
+      "get": {
+        "tags": ["Cluster Management"],
+        "summary": "Get Multi-Region Cluster Status",
+        "description": "Returns active distributed routing target (PRIMARY or STANDBY) and regional health.",
+        "responses": {
+          "200": {
+            "description": "Cluster routing state",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ClusterStatusResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/cluster/failover": {
+      "post": {
+        "tags": ["Cluster Management"],
+        "summary": "Trigger Multi-Region Failover",
+        "description": "Switches the active wallet service routing target between PRIMARY and STANDBY. Restricted to cluster:admin role.",
+        "security": [{ "BearerAuth": [] }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/FailoverRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Failover completed",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FailoverResponse" }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden: Requires cluster:admin role",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Enter your signed JWT access token in the format: Bearer <token>"
+      }
+    },
+    "schemas": {
+      "AuthTokenRequest": {
+        "type": "object",
+        "required": ["subject"],
+        "properties": {
+          "subject": { "type": "string", "example": "alice" },
+          "roles": { "type": "array", "items": { "type": "string" }, "example": ["USER"] },
+          "scopes": { "type": "array", "items": { "type": "string" }, "example": ["wallet:read", "wallet:transfer", "wallet:write"] }
+        }
+      },
+      "AuthTokenResponse": {
+        "type": "object",
+        "properties": {
+          "access_token": { "type": "string" },
+          "token_type": { "type": "string", "example": "Bearer" },
+          "expires_in": { "type": "integer", "example": 3600 },
+          "refresh_token": { "type": "string" },
+          "subject": { "type": "string", "example": "alice" },
+          "roles": { "type": "array", "items": { "type": "string" } },
+          "scopes": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "AuthRefreshRequest": {
+        "type": "object",
+        "required": ["refresh_token"],
+        "properties": {
+          "refresh_token": { "type": "string", "example": "refresh_token_example_123" }
+        }
+      },
+      "AuthLogoutRequest": {
+        "type": "object",
+        "properties": {
+          "token": { "type": "string" },
+          "refresh_token": { "type": "string" }
+        }
+      },
+      "CreateWalletRequest": {
+        "type": "object",
+        "required": ["wallet_id", "currency"],
+        "properties": {
+          "wallet_id": { "type": "string", "example": "alice" },
+          "currency": { "type": "string", "example": "USD" },
+          "initial_balance": { "type": "integer", "example": 10000 },
+          "kyc_tier": { "type": "string", "enum": ["TIER_1", "TIER_2", "TIER_3"], "example": "TIER_1" }
+        }
+      },
+      "CreateWalletResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "example": true },
+          "message": { "type": "string", "example": "wallet created successfully" },
+          "routed_gateway": { "type": "string", "example": "PRIMARY" }
+        }
+      },
+      "BalancePot": {
+        "type": "object",
+        "properties": {
+          "currency": { "type": "string", "example": "USD" },
+          "units": { "type": "integer", "example": 25000 }
+        }
+      },
+      "GetBalanceResponse": {
+        "type": "object",
+        "properties": {
+          "wallet_id": { "type": "string", "example": "alice" },
+          "status": { "type": "string", "example": "ACTIVE" },
+          "balances": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/BalancePot" }
+          },
+          "handled_region": { "type": "string", "example": "us-east-1" },
+          "routed_gateway": { "type": "string", "example": "PRIMARY" }
+        }
+      },
+      "TransferFundsRequest": {
+        "type": "object",
+        "required": ["source_wallet_id", "destination_wallet_id", "amount", "currency"],
+        "properties": {
+          "source_wallet_id": { "type": "string", "example": "alice" },
+          "destination_wallet_id": { "type": "string", "example": "bob" },
+          "amount": { "type": "integer", "example": 500 },
+          "currency": { "type": "string", "example": "USD" },
+          "idempotency_key": { "type": "string", "example": "idemp_tx_12345" }
+        }
+      },
+      "TransferFundsResponse": {
+        "type": "object",
+        "properties": {
+          "transaction_id": { "type": "string", "example": "tx_9981293a" },
+          "status": { "type": "string", "example": "SUCCESS" },
+          "routed_gateway": { "type": "string", "example": "PRIMARY" },
+          "fx_quote_id": { "type": "string", "example": "" },
+          "handled_region": { "type": "string", "example": "us-east-1" }
+        }
+      },
+      "ExchangeCurrencyRequest": {
+        "type": "object",
+        "required": ["wallet_id", "from_currency", "to_currency", "from_amount"],
+        "properties": {
+          "wallet_id": { "type": "string", "example": "alice" },
+          "from_currency": { "type": "string", "example": "USD" },
+          "to_currency": { "type": "string", "example": "EUR" },
+          "from_amount": { "type": "integer", "example": 1000 }
+        }
+      },
+      "ExchangeCurrencyResponse": {
+        "type": "object",
+        "properties": {
+          "transaction_id": { "type": "string", "example": "tx_exch_4451" },
+          "status": { "type": "string", "example": "SUCCESS" },
+          "wallet_id": { "type": "string", "example": "alice" },
+          "debited_amount": { "type": "integer", "example": 1000 },
+          "from_currency": { "type": "string", "example": "USD" },
+          "credited_amount": { "type": "integer", "example": 920 },
+          "to_currency": { "type": "string", "example": "EUR" },
+          "exchange_rate": { "type": "number", "example": 0.92 }
+        }
+      },
+      "UpdateWalletKYCRequest": {
+        "type": "object",
+        "required": ["wallet_id", "kyc_tier"],
+        "properties": {
+          "wallet_id": { "type": "string", "example": "alice" },
+          "kyc_tier": { "type": "string", "enum": ["TIER_1", "TIER_2", "TIER_3"], "example": "TIER_2" }
+        }
+      },
+      "UpdateWalletKYCResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "example": true },
+          "wallet_id": { "type": "string", "example": "alice" },
+          "previous_tier": { "type": "string", "example": "TIER_1" },
+          "current_tier": { "type": "string", "example": "TIER_2" },
+          "message": { "type": "string", "example": "KYC tier updated successfully" }
+        }
+      },
+      "GetWalletLimitsResponse": {
+        "type": "object",
+        "properties": {
+          "wallet_id": { "type": "string", "example": "alice" },
+          "kyc_tier": { "type": "string", "example": "TIER_1" },
+          "single_transaction_limit": { "type": "integer", "example": 100000 },
+          "daily_rolling_limit": { "type": "integer", "example": 500000 },
+          "daily_rolling_spent": { "type": "integer", "example": 50000 },
+          "daily_rolling_remaining": { "type": "integer", "example": 450000 },
+          "hourly_rate_limit": { "type": "integer", "example": 10 },
+          "hourly_rate_spent": { "type": "integer", "example": 2 },
+          "hourly_rate_remaining": { "type": "integer", "example": 8 }
+        }
+      },
+      "DepositFundsRequest": {
+        "type": "object",
+        "required": ["wallet_id", "amount", "currency", "payment_rail"],
+        "properties": {
+          "wallet_id": { "type": "string", "example": "alice" },
+          "amount": { "type": "integer", "example": 5000 },
+          "currency": { "type": "string", "example": "USD" },
+          "payment_rail": { "type": "string", "enum": ["CARD", "ACH", "SEPA", "WIRE"], "example": "CARD" },
+          "reference": { "type": "string", "example": "stripe_ch_9921" }
+        }
+      },
+      "DepositFundsResponse": {
+        "type": "object",
+        "properties": {
+          "transaction_id": { "type": "string", "example": "tx_dep_1" },
+          "status": { "type": "string", "example": "SUCCESS" },
+          "wallet_id": { "type": "string", "example": "alice" },
+          "amount": { "type": "integer", "example": 5000 },
+          "currency": { "type": "string", "example": "USD" },
+          "payment_rail": { "type": "string", "example": "CARD" },
+          "external_reference": { "type": "string", "example": "stripe_ch_9921" }
+        }
+      },
+      "WithdrawFundsRequest": {
+        "type": "object",
+        "required": ["wallet_id", "amount", "currency", "payment_rail"],
+        "properties": {
+          "wallet_id": { "type": "string", "example": "alice" },
+          "amount": { "type": "integer", "example": 2000 },
+          "currency": { "type": "string", "example": "USD" },
+          "payment_rail": { "type": "string", "enum": ["ACH", "SEPA", "WIRE"], "example": "ACH" },
+          "beneficiary_details": { "type": "string", "example": "Bank routing 12345, Account 987654321" }
+        }
+      },
+      "WithdrawFundsResponse": {
+        "type": "object",
+        "properties": {
+          "transaction_id": { "type": "string", "example": "tx_wth_1" },
+          "status": { "type": "string", "example": "SUCCESS" },
+          "wallet_id": { "type": "string", "example": "alice" },
+          "amount": { "type": "integer", "example": 2000 },
+          "currency": { "type": "string", "example": "USD" },
+          "payment_rail": { "type": "string", "example": "ACH" }
+        }
+      },
+      "WebhookSubscriptionCreateRequest": {
+        "type": "object",
+        "required": ["url"],
+        "properties": {
+          "url": { "type": "string", "example": "https://partner.example.com/webhooks" },
+          "events": { "type": "array", "items": { "type": "string" }, "example": ["transfer.completed", "fraud.flagged"] },
+          "secret": { "type": "string", "description": "Optional custom HMAC secret; auto-generated if omitted" }
+        }
+      },
+      "WebhookSubscription": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "example": "6ad513c93b856a6d9f96a119" },
+          "url": { "type": "string", "example": "https://partner.example.com/webhooks" },
+          "events": { "type": "array", "items": { "type": "string" } },
+          "secret_mask": { "type": "string", "example": "whsec_...87b5" },
+          "secret": { "type": "string", "description": "Provided only upon initial creation" },
+          "is_active": { "type": "boolean", "example": true },
+          "created_at": { "type": "string" }
+        }
+      },
+      "WebhookTestRequest": {
+        "type": "object",
+        "required": ["url"],
+        "properties": {
+          "url": { "type": "string", "example": "https://partner.example.com/webhooks" },
+          "secret": { "type": "string", "example": "whsec_test_secret" }
+        }
+      },
+      "WebhookTestResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "example": true },
+          "status_code": { "type": "integer", "example": 200 },
+          "latency_ms": { "type": "integer", "example": 24 },
+          "url": { "type": "string", "example": "https://partner.example.com/webhooks" }
+        }
+      },
+      "ClusterStatusResponse": {
+        "type": "object",
+        "properties": {
+          "current_routed_target": { "type": "string", "example": "PRIMARY" },
+          "primary_region": {
+            "type": "object",
+            "properties": {
+              "address": { "type": "string", "example": "localhost:50051" },
+              "status": { "type": "string", "example": "SERVING" }
+            }
+          },
+          "standby_region": {
+            "type": "object",
+            "properties": {
+              "address": { "type": "string", "example": "localhost:50053" },
+              "status": { "type": "string", "example": "SERVING" }
+            }
+          }
+        }
+      },
+      "FailoverRequest": {
+        "type": "object",
+        "properties": {
+          "target": { "type": "string", "enum": ["PRIMARY", "STANDBY"] }
+        }
+      },
+      "FailoverResponse": {
+        "type": "object",
+        "properties": {
+          "message": { "type": "string", "example": "Failover routing triggered" },
+          "active_routed_target": { "type": "string", "example": "STANDBY" }
+        }
+      },
+      "LedgerPosting": {
+        "type": "object",
+        "properties": {
+          "account_id": { "type": "string", "example": "alice" },
+          "account_type": { "type": "string", "example": "USER_WALLET" },
+          "direction": { "type": "string", "enum": ["DEBIT", "CREDIT"], "example": "DEBIT" },
+          "currency": { "type": "string", "example": "USD" },
+          "units": { "type": "integer", "example": 500 }
+        }
+      },
+      "LedgerEntry": {
+        "type": "object",
+        "properties": {
+          "transaction_id": { "type": "string", "example": "tx_9981293a" },
+          "sequence_number": { "type": "integer", "example": 1042 },
+          "hash": { "type": "string", "example": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
+          "previous_hash": { "type": "string", "example": "c78515b6...0000" },
+          "postings": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/LedgerPosting" }
+          }
+        }
+      },
+      "LedgerEntriesResponse": {
+        "type": "object",
+        "properties": {
+          "wallet_id": { "type": "string", "example": "alice" },
+          "total_count": { "type": "integer", "example": 1 },
+          "entries": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/LedgerEntry" }
+          }
+        }
+      },
+      "FXCurrenciesResponse": {
+        "type": "object",
+        "properties": {
+          "currencies": {
+            "type": "array",
+            "items": { "type": "string" },
+            "example": ["USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "SGD", "INR"]
+          }
+        }
+      },
+      "FXRateResponse": {
+        "type": "object",
+        "properties": {
+          "base_currency": { "type": "string", "example": "USD" },
+          "rates": {
+            "type": "object",
+            "additionalProperties": { "type": "number" },
+            "example": { "EUR": 0.92, "GBP": 0.79, "JPY": 155.2 }
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "error": { "type": "string", "example": "invalid request parameters" },
+          "error_message": { "type": "string", "example": "insufficient funds" },
+          "status": { "type": "string", "example": "FAILED_INSUFFICIENT_FUNDS" }
+        }
+      }
+    }
+  }
+}

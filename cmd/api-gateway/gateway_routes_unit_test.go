@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -645,5 +647,89 @@ func TestHandleWebhookTest(t *testing.T) {
 	gw.handleWebhookTest(wPing, reqPing)
 	if wPing.Code != http.StatusOK {
 		t.Fatalf("expected 200 for ping, got %d (%s)", wPing.Code, wPing.Body.String())
+	}
+}
+
+func TestSwaggerAndOpenAPIRoutes(t *testing.T) {
+	// 1. Direct handler tests
+	// 1a. GET /api-docs/openapi.json
+	reqSpec := httptest.NewRequest(http.MethodGet, "/api-docs/openapi.json", nil)
+	wSpec := httptest.NewRecorder()
+	handleOpenAPISpec(wSpec, reqSpec)
+	if wSpec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for openapi.json, got %d", wSpec.Code)
+	}
+	if ct := wSpec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("expected application/json content-type, got %s", ct)
+	}
+	var doc map[string]interface{}
+	if err := json.Unmarshal(wSpec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("failed to parse openapi json: %v", err)
+	}
+	if doc["openapi"] != "3.0.3" {
+		t.Fatalf("expected openapi 3.0.3, got %v", doc["openapi"])
+	}
+
+	// 1b. Method Not Allowed on openapi.json
+	reqBadMethod := httptest.NewRequest(http.MethodPost, "/api-docs/openapi.json", nil)
+	wBadMethod := httptest.NewRecorder()
+	handleOpenAPISpec(wBadMethod, reqBadMethod)
+	if wBadMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for POST openapi.json, got %d", wBadMethod.Code)
+	}
+
+	// 1c. GET /swagger/
+	reqUI := httptest.NewRequest(http.MethodGet, "/swagger/", nil)
+	wUI := httptest.NewRecorder()
+	handleSwaggerUI(wUI, reqUI)
+	if wUI.Code != http.StatusOK {
+		t.Fatalf("expected 200 for /swagger/, got %d", wUI.Code)
+	}
+	if ct := wUI.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Fatalf("expected text/html content-type, got %s", ct)
+	}
+	if !strings.Contains(wUI.Body.String(), "SwaggerUIBundle") {
+		t.Fatalf("expected HTML body to contain SwaggerUIBundle initialization")
+	}
+
+	// 1d. Redirects /swagger and /docs to /swagger/
+	for _, p := range []string{"/swagger", "/docs"} {
+		reqRedir := httptest.NewRequest(http.MethodGet, p, nil)
+		wRedir := httptest.NewRecorder()
+		handleSwaggerRedirect(wRedir, reqRedir)
+		if wRedir.Code != http.StatusMovedPermanently {
+			t.Fatalf("expected 301 for %s, got %d", p, wRedir.Code)
+		}
+		if loc := wRedir.Header().Get("Location"); loc != "/swagger/" {
+			t.Fatalf("expected Location /swagger/, got %s", loc)
+		}
+	}
+
+	// 2. Full router stack integration (middleware, public path bypass, and CSP)
+	gw := &Gateway{
+		primaryClient: &mockWalletClient{},
+		standbyClient: &mockWalletClient{},
+		activeTarget:  coordinator.TargetPrimary,
+	}
+	router := buildGatewayRouter(gw)
+
+	// Verify unauthenticated request to /api-docs/openapi.json succeeds through router
+	reqRouterSpec := httptest.NewRequest(http.MethodGet, "/api-docs/openapi.json", nil)
+	wRouterSpec := httptest.NewRecorder()
+	router.ServeHTTP(wRouterSpec, reqRouterSpec)
+	if wRouterSpec.Code != http.StatusOK {
+		t.Fatalf("expected 200 via router for openapi.json, got %d", wRouterSpec.Code)
+	}
+
+	// Verify unauthenticated request to /swagger/ succeeds through router with tailored CSP
+	reqRouterUI := httptest.NewRequest(http.MethodGet, "/swagger/", nil)
+	wRouterUI := httptest.NewRecorder()
+	router.ServeHTTP(wRouterUI, reqRouterUI)
+	if wRouterUI.Code != http.StatusOK {
+		t.Fatalf("expected 200 via router for /swagger/, got %d", wRouterUI.Code)
+	}
+	csp := wRouterUI.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "cdn.jsdelivr.net") {
+		t.Fatalf("expected CSP to allow cdn.jsdelivr.net for swagger UI, got %s", csp)
 	}
 }
