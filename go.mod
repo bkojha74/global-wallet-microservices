@@ -1,6 +1,6 @@
 module wallet-system
 
-go 1.26.9
+go 1.26.10
 
 require (
 	github.com/google/generative-ai-go v0.20.1
