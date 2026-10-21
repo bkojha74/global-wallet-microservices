@@ -158,10 +158,10 @@ graph TD
 ### Pillar 5: Developer Experience, Tooling & Auditing
 *Focus: Seamless operator experience and regulatory audit exports.*
 
-- [ ] **DEV-01: OpenAPI 3.0 & Embedded Swagger UI**
-  - [ ] Embed OpenAPI 3.0 definition and Swagger UI into `api-gateway` at `/swagger` and `/docs`.
-- [ ] **DEV-02: Unified CLI Utility (`walletctl`)**
-  - [ ] Command-line interface in Go for health inspection, token generation, failover drills, and audit verification.
+- [x] **DEV-01: OpenAPI 3.0 & Embedded Swagger UI**
+  - [x] Embed OpenAPI 3.0 definition and Swagger UI into `api-gateway` at `/swagger` and `/docs`.
+- [x] **DEV-02: Unified CLI Utility (`walletctl`)**
+  - [x] Command-line interface in Go for health inspection, token generation, failover drills, ledger verification, and webhook ping probes (`cmd/walletctl/`).
 - [ ] **DEV-03: Merkle Root Ledger Checkpoints**
   - [ ] Periodic Merkle root generation over batches of SHA-256 ledger entries for external regulatory attestation.
 
@@ -284,11 +284,12 @@ graph TD
 
 | Component / Subsystem | File Path | Status |
 |---|---|:---:|
-| OpenAPI 3.0 Contract Specification | `api/openapi/openapi.json` | 🔄 In Progress (DEV-01) |
-| Embedded Swagger UI & Documentation Engine | `cmd/api-gateway/swagger.go` | 🔄 In Progress (DEV-01) |
-| Gateway Route Registration (`/swagger`, `/docs`, `/api-docs/openapi.json`) | `cmd/api-gateway/main.go` | 🔄 In Progress (DEV-01) |
-| Swagger & OpenAPI Unit Tests | `cmd/api-gateway/gateway_routes_unit_test.go` | 🔄 In Progress (DEV-01) |
-| Unified CLI Tool (`walletctl`) Architecture & Health/Token Subcommands | `cmd/walletctl/` | ⏳ Pending (DEV-02) |
+| OpenAPI 3.0 Contract Specification | `cmd/api-gateway/openapi.json` | ✅ Complete (DEV-01) |
+| Embedded Swagger UI & Documentation Engine | `cmd/api-gateway/swagger.go` | ✅ Complete (DEV-01) |
+| Gateway Route Registration (`/swagger`, `/docs`, `/api-docs/openapi.json`) | `cmd/api-gateway/main.go` | ✅ Complete (DEV-01) |
+| Swagger & OpenAPI Unit Tests | `cmd/api-gateway/gateway_routes_unit_test.go` | ✅ Complete (DEV-01) |
+| Unified CLI Tool (`walletctl`) Core Subcommands (`health`, `token`, `failover`, `ledger`, `webhook`) | `cmd/walletctl/` | ✅ Complete (DEV-02) |
+| Unified CLI Full Concurrency & Race Detector Test Suite (`main_test.go`) | `cmd/walletctl/main_test.go` | ✅ Complete (DEV-02) |
 | Merkle Tree Batch Calculation & Proof Generation Engine | `pkg/merkle/` | ⏳ Pending (DEV-03) |
 | Ledger Merkle Periodic Checkpointing Worker | `cmd/ledger-service/merkle.go` | ⏳ Pending (DEV-03) |
 | Architectural Documentation | `docs/PILLAR5_DEV_EXPERIENCE_TOOLING_GUIDE.md` | ✅ Complete |
