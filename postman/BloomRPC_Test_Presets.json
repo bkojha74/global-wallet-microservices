@@ -1,0 +1,441 @@
+{
+  "_comment": "BloomRPC Test Payloads for Global Wallet & Ledger Microservices (Phase 3 & Phase 4)",
+  "endpoints": {
+    "wallet_primary": "127.0.0.1:50051",
+    "wallet_standby": "127.0.0.1:50053",
+    "ledger_service": "127.0.0.1:50052",
+    "auth_service": "127.0.0.1:50054"
+  },
+  "tests": [
+    {
+      "test_id": "TC-GRPC-01",
+      "name": "Health Check (Primary Active)",
+      "service": "wallet.v1.WalletService",
+      "method": "HealthCheck",
+      "target": "127.0.0.1:50051",
+      "payload": {},
+      "expected_response": {
+        "status": "ACTIVE",
+        "region": "us-east-1",
+        "is_active": true
+      }
+    },
+    {
+      "test_id": "TC-GRPC-02",
+      "name": "Health Check (Standby Hot-DR)",
+      "service": "wallet.v1.WalletService",
+      "method": "HealthCheck",
+      "target": "127.0.0.1:50053",
+      "payload": {},
+      "expected_response": {
+        "status": "STANDBY",
+        "region": "eu-west-1",
+        "is_active": false
+      }
+    },
+    {
+      "test_id": "TC-GRPC-03",
+      "name": "Standard gRPC Health Protocol (Primary)",
+      "service": "grpc.health.v1.Health",
+      "method": "Check",
+      "target": "127.0.0.1:50051",
+      "payload": {
+        "service": ""
+      },
+      "expected_response": {
+        "status": "SERVING"
+      }
+    },
+    {
+      "test_id": "TC-GRPC-04",
+      "name": "Create Wallet (Alice - 5000 USD on Primary)",
+      "service": "wallet.v1.WalletService",
+      "method": "CreateWallet",
+      "target": "127.0.0.1:50051",
+      "payload": {
+        "wallet_id": "bloom-alice",
+        "currency": "USD",
+        "initial_balance": 5000
+      },
+      "expected_response": {
+        "success": true,
+        "message": "Wallet bloom-alice created successfully"
+      }
+    },
+    {
+      "test_id": "TC-GRPC-05",
+      "name": "Create Wallet (Bob - 2000 USD on Primary)",
+      "service": "wallet.v1.WalletService",
+      "method": "CreateWallet",
+      "target": "127.0.0.1:50051",
+      "payload": {
+        "wallet_id": "bloom-bob",
+        "currency": "USD",
+        "initial_balance": 2000
+      },
+      "expected_response": {
+        "success": true,
+        "message": "Wallet bloom-bob created successfully"
+      }
+    },
+    {
+      "test_id": "TC-GRPC-06",
+      "name": "Standby Write Fencing on CreateWallet (Rejected 400/FailedPrecondition)",
+      "service": "wallet.v1.WalletService",
+      "method": "CreateWallet",
+      "target": "127.0.0.1:50053",
+      "payload": {
+        "wallet_id": "fenced-wallet",
+        "currency": "USD",
+        "initial_balance": 100
+      },
+      "expected_error": {
+        "code": "FAILED_PRECONDITION (9)",
+        "message": "instance is standby replica; write operations rejected (region: eu-west-1)"
+      }
+    },
+    {
+      "test_id": "TC-GRPC-07",
+      "name": "Valid Transfer: Alice -> Bob (250 USD on Primary)",
+      "service": "wallet.v1.WalletService",
+      "method": "TransferFunds",
+      "target": "127.0.0.1:50051",
+      "metadata": {
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+      },
+      "payload": {
+        "idempotency_key": "bloom-transfer-001",
+        "source_wallet_id": "bloom-alice",
+        "destination_wallet_id": "bloom-bob",
+        "amount": {
+          "currency": "USD",
+          "units": 250
+        }
+      },
+      "expected_response": {
+        "transaction_id": "<hex-string>",
+        "status": "SUCCESS"
+      }
+    },
+    {
+      "test_id": "TC-GRPC-08",
+      "name": "Idempotent Replay (Identical Key on Primary)",
+      "service": "wallet.v1.WalletService",
+      "method": "TransferFunds",
+      "target": "127.0.0.1:50051",
+      "payload": {
+        "idempotency_key": "bloom-transfer-001",
+        "source_wallet_id": "bloom-alice",
+        "destination_wallet_id": "bloom-bob",
+        "amount": {
+          "currency": "USD",
+          "units": 250
+        }
+      },
+      "expected_response": {
+        "transaction_id": "<same-hex-string>",
+        "status": "REJECTED_DUPLICATE",
+        "error_message": "Transaction already processed"
+      }
+    },
+    {
+      "test_id": "TC-GRPC-09",
+      "name": "Insufficient Funds Transfer (Primary)",
+      "service": "wallet.v1.WalletService",
+      "method": "TransferFunds",
+      "target": "127.0.0.1:50051",
+      "payload": {
+        "idempotency_key": "bloom-transfer-overdraft",
+        "source_wallet_id": "bloom-alice",
+        "destination_wallet_id": "bloom-bob",
+        "amount": {
+          "currency": "USD",
+          "units": 999999
+        }
+      },
+      "expected_response": {
+        "status": "FAILED_INSUFFICIENT_FUNDS",
+        "error_message": "insufficient funds in source wallet bloom-alice"
+      }
+    },
+    {
+      "test_id": "TC-GRPC-10",
+      "name": "Standby Write Fencing on TransferFunds (Rejected on Standby)",
+      "service": "wallet.v1.WalletService",
+      "method": "TransferFunds",
+      "target": "127.0.0.1:50053",
+      "payload": {
+        "idempotency_key": "bloom-transfer-standby-fence",
+        "source_wallet_id": "bloom-alice",
+        "destination_wallet_id": "bloom-bob",
+        "amount": {
+          "currency": "USD",
+          "units": 50
+        }
+      },
+      "expected_error": {
+        "code": "FAILED_PRECONDITION (9)",
+        "message": "instance is standby replica; write operations rejected (region: eu-west-1)"
+      }
+    },
+    {
+      "test_id": "TC-GRPC-11",
+      "name": "Get Balance on Standby (Read Permitted on Standby)",
+      "service": "wallet.v1.WalletService",
+      "method": "GetBalance",
+      "target": "127.0.0.1:50053",
+      "payload": {
+        "wallet_id": "bloom-alice"
+      },
+      "expected_response": {
+        "wallet_id": "bloom-alice",
+        "balances": [
+          {
+            "currency": "USD",
+            "units": 4750
+          }
+        ]
+      }
+    },
+    {
+      "test_id": "TC-GRPC-12",
+      "name": "Get Balance on Primary",
+      "service": "wallet.v1.WalletService",
+      "method": "GetBalance",
+      "target": "127.0.0.1:50051",
+      "payload": {
+        "wallet_id": "bloom-bob"
+      },
+      "expected_response": {
+        "wallet_id": "bloom-bob",
+        "balances": [
+          {
+            "currency": "USD",
+            "units": 2250
+          }
+        ]
+      }
+    },
+    {
+      "test_id": "TC-GRPC-13",
+      "name": "Direct Ledger Inspection on Ledger Service",
+      "service": "ledger.v1.LedgerService",
+      "method": "GetLedgerEntries",
+      "target": "127.0.0.1:50052",
+      "payload": {
+        "wallet_id": "bloom-alice",
+        "limit": 10
+      },
+      "expected_response": {
+        "total_count": 1,
+        "entries": [
+          {
+            "source_wallet_id": "bloom-alice",
+            "destination_wallet_id": "bloom-bob",
+            "amount": 250,
+            "currency": "USD"
+          }
+        ]
+      }
+    },
+    {
+      "test_id": "TC-GRPC-14",
+      "name": "TransferFunds with Frozen Source Wallet (Operational Fencing)",
+      "service": "wallet.v1.WalletService",
+      "method": "TransferFunds",
+      "target": "127.0.0.1:50051",
+      "payload": {
+        "idempotency_key": "bloom-transfer-frozen-source-001",
+        "source_wallet_id": "bloom-alice",
+        "destination_wallet_id": "bloom-bob",
+        "amount": {
+          "currency": "USD",
+          "units": 50
+        }
+      },
+      "expected_response": {
+        "status": "INTERNAL_ERROR",
+        "error_message": "source wallet bloom-alice is FROZEN; transfers prohibited"
+      }
+    },
+    {
+      "test_id": "TC-GRPC-15",
+      "name": "TransferFunds with Frozen Destination Wallet (Operational Fencing)",
+      "service": "wallet.v1.WalletService",
+      "method": "TransferFunds",
+      "target": "127.0.0.1:50051",
+      "payload": {
+        "idempotency_key": "bloom-transfer-frozen-dest-001",
+        "source_wallet_id": "bloom-alice",
+        "destination_wallet_id": "bloom-bob",
+        "amount": {
+          "currency": "USD",
+          "units": 50
+        }
+      },
+      "expected_response": {
+        "status": "INTERNAL_ERROR",
+        "error_message": "destination wallet bloom-bob is FROZEN; transfers prohibited"
+      }
+    },
+    {
+      "test_id": "TC-GRPC-16",
+      "name": "Direct Ledger Query Verifying True Double-Entry Postings (Phase 4)",
+      "service": "ledger.v1.LedgerService",
+      "method": "GetLedgerEntries",
+      "target": "127.0.0.1:50052",
+      "payload": {
+        "wallet_id": "bloom-alice",
+        "limit": 5
+      },
+      "expected_response": {
+        "entries": [
+          {
+            "transaction_id": "<hex-string>",
+            "idempotency_key": "bloom-transfer-001",
+            "source_wallet_id": "bloom-alice",
+            "destination_wallet_id": "bloom-bob",
+            "amount": 250,
+            "currency": "USD"
+          }
+        ]
+      }
+    },
+    {
+      "test_id": "TC-GRPC-17",
+      "name": "Auth Service HealthCheck",
+      "service": "auth.v1.AuthService",
+      "method": "HealthCheck",
+      "target": "127.0.0.1:50054",
+      "payload": {},
+      "expected_response": {
+        "status": "SERVING",
+        "version": "1.1.0"
+      }
+    },
+    {
+      "test_id": "TC-GRPC-18",
+      "name": "Standard gRPC Health Protocol (Auth Service)",
+      "service": "grpc.health.v1.Health",
+      "method": "Check",
+      "target": "127.0.0.1:50054",
+      "payload": {
+        "service": "auth.v1.AuthService"
+      },
+      "expected_response": {
+        "status": "SERVING"
+      }
+    },
+    {
+      "test_id": "TC-GRPC-19",
+      "name": "IssueToken (Admin Login)",
+      "service": "auth.v1.AuthService",
+      "method": "IssueToken",
+      "target": "127.0.0.1:50054",
+      "payload": {
+        "username": "admin",
+        "password": "admin123"
+      },
+      "expected_response": {
+        "token_type": "Bearer",
+        "expires_in": 900,
+        "subject": "admin"
+      }
+    },
+    {
+      "test_id": "TC-GRPC-20",
+      "name": "IssueToken (Alice Login)",
+      "service": "auth.v1.AuthService",
+      "method": "IssueToken",
+      "target": "127.0.0.1:50054",
+      "payload": {
+        "username": "alice",
+        "password": "alice123",
+        "requested_scopes": ["wallet:read", "wallet:transfer"]
+      },
+      "expected_response": {
+        "token_type": "Bearer",
+        "expires_in": 900,
+        "subject": "alice"
+      }
+    },
+    {
+      "test_id": "TC-GRPC-21",
+      "name": "ValidateToken (JWT Signature & Revocation)",
+      "service": "auth.v1.AuthService",
+      "method": "ValidateToken",
+      "target": "127.0.0.1:50054",
+      "payload": {
+        "token": "<paste-jwt-token-here>"
+      },
+      "expected_response": {
+        "valid": true,
+        "error": "TOKEN_OK"
+      }
+    },
+    {
+      "test_id": "TC-GRPC-22",
+      "name": "RefreshToken (Session Rotation)",
+      "service": "auth.v1.AuthService",
+      "method": "RefreshToken",
+      "target": "127.0.0.1:50054",
+      "payload": {
+        "refresh_token": "<paste-refresh-token-here>"
+      },
+      "expected_response": {
+        "token_type": "Bearer",
+        "expires_in": 900
+      }
+    },
+    {
+      "test_id": "TC-GRPC-23",
+      "name": "Authorize (Alice Wallet Read Allowed)",
+      "service": "auth.v1.AuthService",
+      "method": "Authorize",
+      "target": "127.0.0.1:50054",
+      "payload": {
+        "subject": "alice",
+        "roles": ["user"],
+        "scopes": ["wallet:read"],
+        "resource": "wallet:alice",
+        "action": "read"
+      },
+      "expected_response": {
+        "allowed": true
+      }
+    },
+    {
+      "test_id": "TC-GRPC-24",
+      "name": "Authorize (Alice Cluster Failover Denied)",
+      "service": "auth.v1.AuthService",
+      "method": "Authorize",
+      "target": "127.0.0.1:50054",
+      "payload": {
+        "subject": "alice",
+        "roles": ["user"],
+        "scopes": ["wallet:read"],
+        "resource": "cluster:failover",
+        "action": "execute"
+      },
+      "expected_response": {
+        "allowed": false,
+        "reason": "requires cluster:admin scope"
+      }
+    },
+    {
+      "test_id": "TC-GRPC-25",
+      "name": "RevokeToken (Logout / Blocklist)",
+      "service": "auth.v1.AuthService",
+      "method": "RevokeToken",
+      "target": "127.0.0.1:50054",
+      "payload": {
+        "token": "<paste-jwt-or-refresh-token-here>",
+        "reason": "logout"
+      },
+      "expected_response": {
+        "success": true,
+        "message": "token revoked"
+      }
+    }
+  ]
+}

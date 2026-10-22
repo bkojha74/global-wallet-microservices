@@ -1,0 +1,120 @@
+{
+	"info": {
+		"_postman_id": "a1b2c3d4-e5f6-7a8b-9c0d-e1f2a3b4c5d6",
+		"name": "Global Wallet AI Fraud Detection Tests",
+		"description": "Postman Collection for testing the Gemini AI Fraud Detection integration in the Global Wallet Microservices project.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "1. Safe Transfer (AI Allows)",
+			"event": [
+				{
+					"listen": "test",
+					"script": {
+						"exec": [
+							"pm.test(\"Status code is 200\", function () {",
+							"    pm.response.to.have.status(200);",
+							"});"
+						],
+						"type": "text/javascript"
+					}
+				}
+			],
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "Bearer {{admin_token}}",
+						"type": "text"
+					},
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"source_wallet_id\": \"alice\",\n  \"destination_wallet_id\": \"bob\",\n  \"amount\": {\n    \"units\": 500,\n    \"currency\": \"USD\"\n  },\n  \"idempotency_key\": \"safe-txn-{{$timestamp}}\"\n}"
+				},
+				"url": {
+					"raw": "{{baseUrl}}/api/v1/wallets/transfer",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"api",
+						"v1",
+						"wallets",
+						"transfer"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "2. Suspicious Transfer (AI Blocks)",
+			"event": [
+				{
+					"listen": "test",
+					"script": {
+						"exec": [
+							"pm.test(\"Status code is 403 (Forbidden)\", function () {",
+							"    pm.response.to.have.status(403);",
+							"});",
+							"pm.test(\"Response contains fraud block message\", function () {",
+							"    var jsonData = pm.response.json();",
+							"    pm.expect(jsonData.error).to.include(\"blocked by fraud detection\");",
+							"});"
+						],
+						"type": "text/javascript"
+					}
+				}
+			],
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "Bearer {{admin_token}}",
+						"type": "text"
+					},
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"source_wallet_id\": \"alice\",\n  \"destination_wallet_id\": \"unknown-offshore-wallet\",\n  \"amount\": {\n    \"units\": 5000000,\n    \"currency\": \"USD\"\n  },\n  \"idempotency_key\": \"fraud-attempt-{{$timestamp}}\"\n}"
+				},
+				"url": {
+					"raw": "{{baseUrl}}/api/v1/wallets/transfer",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"api",
+						"v1",
+						"wallets",
+						"transfer"
+					]
+				}
+			},
+			"response": []
+		}
+	],
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:8080"
+		},
+		{
+			"key": "admin_token",
+			"value": "put-your-token-here"
+		}
+	]
+}
