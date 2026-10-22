@@ -94,12 +94,10 @@ ehthumbs.db
 Desktop.ini
 
 # Postman and BloomRPC test preset files
+postman/
 *.postman_environment.json
 *.postman_collection.json
 BloomRPC_Test_Presets.json
-!postman/*.json
-!postman/*.postman_collection.json
-!postman/*.postman_environment.json
 
 # Documents, resumes and PDF files
 *.pdf
