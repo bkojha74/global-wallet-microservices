@@ -565,6 +565,8 @@ jobs:
     needs: [docker-publish, deploy-compose]
     if: always() && (needs.docker-publish.result == 'success') && ((github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/feature/'))) || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.deploy_target == 'all' || github.event.inputs.deploy_target == 'kubernetes' || github.event.inputs.deploy_target == '')))
     runs-on: [self-hosted, Windows]
+    env:
+      KUBECONFIG: C:\Users\bkojh\.kube\config
     steps:
       - name: Trust Git Working Directory
         shell: cmd
@@ -583,11 +585,15 @@ jobs:
         continue-on-error: true
         run: |
           echo Checking Kubernetes cluster connectivity...
+          if not defined KUBECONFIG if exist "C:\Users\bkojh\.kube\config" (
+            set "KUBECONFIG=C:\Users\bkojh\.kube\config"
+            echo KUBECONFIG=C:\Users\bkojh\.kube\config>> "%GITHUB_ENV%"
+          )
           kubectl cluster-info
           if errorlevel 1 (
             echo.
             echo ::warning::Kubernetes cluster is not running or accessible on this Windows runner.
-            echo Please ensure Docker Desktop Kubernetes (Settings -^> Kubernetes -^> Enable) or Minikube is started.
+            echo Please ensure Docker Desktop Kubernetes is enabled in Docker Desktop Settings or Minikube is started.
             echo K8S_READY=false>> "%GITHUB_ENV%"
           ) else (
             echo.
