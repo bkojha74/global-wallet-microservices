@@ -82,7 +82,7 @@ The pipeline is configured in [`.github/workflows/ci.yml`](../.github/workflows/
 ```yaml
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, 'feature/*']
     tags: ['v*']
     paths-ignore:
       - '**.md'
@@ -92,7 +92,7 @@ on:
       - '.gitignore'
       - 'postman/**'
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, 'feature/*']
     paths-ignore:
       - '**.md'
       - 'docs/**'
@@ -107,11 +107,12 @@ on:
 
 | Event | Branches / Tags | Stages Executed | Purpose |
 |---|---|---|---|
-| `pull_request` | `main`, `develop` | Stages 1 through 7 (`env-setup-check` $\rightarrow$ `build-artifacts`) | Full quality, SAST security, and test verification gate before code merge |
-| `push` | `develop` | Stages 1 through 7 (`env-setup-check` $\rightarrow$ `build-artifacts`) | Continuous verification on active integration branch |
-| `push` | `main` | Stages 1 through 9 (`env-setup-check` $\rightarrow$ `deploy`) | Full verification, production container packaging, and local rolling deployment |
-| `push` (tag) | `refs/tags/v*` | Stages 1 through 9 (`env-setup-check` $\rightarrow$ `deploy`) | Release creation with semantic version container tagging |
-| `workflow_dispatch` | Any branch | Stages 1 through 9 (`env-setup-check` $\rightarrow$ `deploy`) | On-demand manual triggering from GitHub Actions Web UI |
+| `pull_request` | `main`, `develop`, `feature/*` | Stages 1 through 7 (`env-setup-check` $\rightarrow$ `docker-publish`) | Full quality, SAST security, and test verification gate before code merge |
+| `push` | `feature/*` | Stages 1 through 9 (`env-setup-check` $\rightarrow$ `post-deploy-smoke`) | Continuous verification on active feature branch |
+| `push` | `develop` | Stages 1 through 9 (`env-setup-check` $\rightarrow$ `post-deploy-smoke`) | Continuous verification on active integration branch |
+| `push` | `main` | Stages 1 through 9 (`env-setup-check` $\rightarrow$ `post-deploy-smoke`) | Full production verification, container packaging, and local rolling deployment |
+| `push` (tag) | `refs/tags/v*` | Stages 1 through 9 (`env-setup-check` $\rightarrow$ `post-deploy-smoke`) | Release creation with semantic version container tagging |
+| `workflow_dispatch` | Any branch | Stages 1 through 9 (`env-setup-check` $\rightarrow$ `post-deploy-smoke`) | On-demand manual triggering from GitHub Actions Web UI |
 
 > [!NOTE]
 > **Path Filtering (`paths-ignore`)**: Any commits that strictly update documentation, markdown files, licenses, `.gitignore`, or Postman test files bypass the pipeline entirely, preventing unnecessary test runs and registry build charges.
@@ -453,11 +454,90 @@ Once published by the pipeline, all microservice container images are publicly a
 
 ```bash
 # Pull the latest production images
-docker pull bkojha/wallet-api-gateway:latest
-docker pull bkojha/wallet-service:latest
-docker pull bkojha/wallet-ledger-service:latest
-docker pull bkojha/wallet-auth-service:latest
-docker pull bkojha/wallet-logging-service:latest
+docker pull bkojha74/wallet-api-gateway:latest
+docker pull bkojha74/wallet-service:latest
+docker pull bkojha74/wallet-ledger-service:latest
+docker pull bkojha74/wallet-fx-service:latest
+docker pull bkojha74/wallet-auth-service:latest
+docker pull bkojha74/wallet-logging-service:latest
 ```
 
 These images can be run with standard Docker Compose or deployed onto Kubernetes clusters using the manifests in [`k8s/`](../k8s/).
+
+---
+
+## 9. Refined Enterprise Release Protocol
+
+The repository adheres to a strict, multi-tiered enterprise release workflow ensuring zero regressions and deterministic traceability:
+
+```mermaid
+graph LR
+    Feature["1. Feature Branch<br/>(feature/dev-*)"] -->|Remote Push| FeatCI["2. Feature CI/CD<br/>(100% Green Gates)"]
+    FeatCI -->|Merge PR| Develop["3. Integration Branch<br/>(develop)"]
+    Develop -->|Remote Push| DevCI["4. Develop CI/CD<br/>(100% Green Gates)"]
+    DevCI -->|Annotated Tag| SubRel["5. Sub-Release Candidate<br/>(v1.X.Y-rc.Z)"]
+    SubRel -->|All Sub-Features Done| PRMain["6. Pull Request to main<br/>(PR #57)"]
+    PRMain -->|Merge PR| MainCI["7. main CI/CD<br/>(Production Build & Deploy)"]
+    MainCI -->|Annotated Tag| GARel["8. General Availability (GA)<br/>(v1.X.Y)"]
+```
+
+### Protocol Steps:
+1. **Feature Branch Development**: Work is conducted on isolated feature branches (`feature/<milestone>-<description>`).
+2. **Feature Gate Verification**: Remote CI/CD pipeline runs all stages. No code is merged until the feature pipeline turns completely green.
+3. **Merge to Integration (`develop`)**: Feature branch is merged into `develop` via `--no-ff` merge or PR.
+4. **Develop Verification**: Integration CI/CD executes on `develop` to verify inter-service compatibility.
+5. **Sub-Release Tagging**: Once `develop` is green, an annotated release candidate tag is created on `develop`:
+   ```bash
+   git tag -a v1.6.0-rc.3 -m "Release Candidate 1.6.0-rc.3: DEV-03 Merkle Root Ledger Checkpoints"
+   git push origin v1.6.0-rc.3
+   ```
+6. **Milestone Completion & PR to `main`**: Once all sub-deliverables for the milestone/pillar are completed and verified on `develop`, open a Pull Request from `develop` into `main`.
+7. **Production Verification on `main`**: Merging into `main` executes the production CI/CD pipeline, publishing GA container images and running automated smoke deployments.
+8. **GA Release Tagging**: Tag the final production release on `main`:
+   ```bash
+   git tag -a v1.6.0 -m "Production Release 1.6.0: Pillar 5 Developer Experience, Tooling & Auditing"
+   git push origin v1.6.0
+   ```
+
+---
+
+## 10. Self-Hosted Runner Operational Architecture & Troubleshooting
+
+### Windows Runner Modes: Service vs Interactive Console
+The self-hosted Windows runner can run in two modes:
+1. **Windows Service (`actions.runner.<repo>.<host>`)**: Runs silently in Session 0 in the background. Starts automatically with Windows.
+2. **Interactive Console (`run.cmd`)**: Runs in the active user desktop session for debugging.
+
+> [!CAUTION]
+> **Single Session Broker Rule**: GitHub's job broker permits **strictly ONE active listener session per runner ID**.
+> Running `run.cmd` manually while the Windows Service is already running will trigger:
+> ```text
+> A session for this runner already exists.
+> Runner connect error: Error: Conflict. Retrying until reconnected.
+> ```
+> **Fix**: Do not run `run.cmd` if the Windows Service is active. If you must run interactively, stop the service first with `Stop-Service *runner*`.
+
+### Auto-Update File Lock Handling
+When GitHub pushes a new runner version (e.g. from `2.337.0` to `2.338.0`), the auto-updater attempts to move `bin/` to `bin.<old-version>/`. If `RunnerService.exe` holds an active file handle, it will report:
+```text
+move "D:\actions-runner\bin" "D:\actions-runner\bin.2.337.0"
+Access is denied.
+```
+**Fix in PowerShell (Admin)**:
+```powershell
+Stop-Service "actions.runner.bkojha74-global-wallet-microservices.NANDITA" -Force
+Move-Item "D:\actions-runner\bin" "D:\actions-runner\bin.2.337.0"
+Move-Item "D:\actions-runner\bin.2.338.0" "D:\actions-runner\bin"
+Move-Item "D:\actions-runner\externals" "D:\actions-runner\externals.2.337.0"
+Move-Item "D:\actions-runner\externals.2.338.0" "D:\actions-runner\externals"
+Start-Service "actions.runner.bkojha74-global-wallet-microservices.NANDITA"
+```
+
+### GitHub Profile Contribution Heatmap Attribution
+* GitHub **only displays commits on your contribution graph once they are merged into the default branch (`main`)**.
+* Commits on `develop` or `feature/*` branches are temporarily not visible on the graph until merged into `main`. Once merged, GitHub retroactively attributes all commits to the exact dates they were authored.
+* Ensure your local Git email matches your verified GitHub email:
+  ```powershell
+  git config --global user.email "113495697+bkojha74@users.noreply.github.com"
+  ```
+
