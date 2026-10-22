@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"wallet-system/pkg/auth"
+	"wallet-system/pkg/merkle"
 	"wallet-system/pkg/webhook"
 )
 
@@ -489,6 +490,148 @@ func TestRunCLI_LedgerVerify(t *testing.T) {
 		code := runCLI(args, out, errOut)
 		if code != 0 {
 			t.Fatalf("expected code 0, got %d. errOut: %s", code, errOut.String())
+		}
+	})
+}
+
+func TestRunCLI_LedgerMerkle(t *testing.T) {
+	leaf1 := "0000000000000000000000000000000000000000000000000000000000000001"
+	leaf2 := "0000000000000000000000000000000000000000000000000000000000000002"
+	tree, _ := merkle.NewTree([]string{leaf1, leaf2})
+	root := tree.RootHash()
+	validProof, _ := tree.GetProof(leaf1)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/ledger/merkle/latest", "/audit/merkle/latest":
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"checkpoint_id":  "mcp_test_001",
+				"start_sequence": 1,
+				"end_sequence":   2,
+				"merkle_root":    root,
+				"entry_count":    2,
+				"created_at":     "2026-10-22T10:00:00Z",
+				"leaf_hashes":    []string{leaf1, leaf2},
+			})
+		case "/api/v1/ledger/merkle/proof", "/audit/merkle/proof":
+			eh := r.URL.Query().Get("entry_hash")
+			if eh == leaf1 {
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"entry_hash":    leaf1,
+					"checkpoint_id": "mcp_test_001",
+					"merkle_root":   root,
+					"proof":         validProof,
+					"verified":      true,
+				})
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"entry not found"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	t.Run("inspect latest checkpoint human readable", func(t *testing.T) {
+		out := &bytes.Buffer{}
+		errOut := &bytes.Buffer{}
+		args := []string{"walletctl", "ledger", "merkle", "--gateway-url", ts.URL}
+
+		code := runCLI(args, out, errOut)
+		if code != 0 {
+			t.Fatalf("expected code 0, got %d. errOut: %s", code, errOut.String())
+		}
+		output := out.String()
+		if !strings.Contains(output, "mcp_test_001") {
+			t.Errorf("expected checkpoint id in output, got: %s", output)
+		}
+		if !strings.Contains(output, "[PASS]") {
+			t.Errorf("expected [PASS] in output, got: %s", output)
+		}
+	})
+
+	t.Run("inspect latest checkpoint json format", func(t *testing.T) {
+		out := &bytes.Buffer{}
+		errOut := &bytes.Buffer{}
+		args := []string{"walletctl", "ledger", "merkle", "--gateway-url", ts.URL, "--json"}
+
+		code := runCLI(args, out, errOut)
+		if code != 0 {
+			t.Fatalf("expected code 0, got %d. errOut: %s", code, errOut.String())
+		}
+		var report merkleCheckpointReport
+		if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+			t.Fatalf("failed to decode json report: %v, raw: %s", err, out.String())
+		}
+		if !report.LocalMathCheck {
+			t.Errorf("expected local math check true, got false")
+		}
+		if report.MerkleRoot != root {
+			t.Errorf("expected root %s, got %s", root, report.MerkleRoot)
+		}
+	})
+
+	t.Run("verify valid cryptographic inclusion proof", func(t *testing.T) {
+		out := &bytes.Buffer{}
+		errOut := &bytes.Buffer{}
+		args := []string{
+			"walletctl", "ledger", "merkle",
+			"--gateway-url", ts.URL,
+			"--entry-hash", leaf1,
+		}
+
+		code := runCLI(args, out, errOut)
+		if code != 0 {
+			t.Fatalf("expected code 0, got %d. errOut: %s", code, errOut.String())
+		}
+		output := out.String()
+		if !strings.Contains(output, "[PASS]") {
+			t.Errorf("expected [PASS] for valid inclusion proof, got: %s", output)
+		}
+		if !strings.Contains(output, "PASSED (Root matches SHA-256 tree path)") {
+			t.Errorf("expected local math check passed, got: %s", output)
+		}
+	})
+
+	t.Run("verify inclusion proof with direct ledger URL", func(t *testing.T) {
+		out := &bytes.Buffer{}
+		errOut := &bytes.Buffer{}
+		args := []string{
+			"walletctl", "ledger", "merkle",
+			"--ledger-url", ts.URL,
+			"--entry-hash", leaf1,
+			"--json",
+		}
+
+		code := runCLI(args, out, errOut)
+		if code != 0 {
+			t.Fatalf("expected code 0, got %d. errOut: %s", code, errOut.String())
+		}
+		var report merkleProofReport
+		if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+			t.Fatalf("failed to decode json proof report: %v", err)
+		}
+		if !report.LocalMathCheck || !report.RemoteVerified {
+			t.Errorf("expected verified proof, got: %+v", report)
+		}
+	})
+
+	t.Run("non-existent entry hash returns code 1", func(t *testing.T) {
+		out := &bytes.Buffer{}
+		errOut := &bytes.Buffer{}
+		args := []string{
+			"walletctl", "ledger", "merkle",
+			"--gateway-url", ts.URL,
+			"--entry-hash", "non_existent_hash_123",
+		}
+
+		code := runCLI(args, out, errOut)
+		if code != 1 {
+			t.Fatalf("expected code 1 for missing entry hash, got %d", code)
 		}
 	})
 }
