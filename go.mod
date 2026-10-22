@@ -1,10 +1,12 @@
 module wallet-system
 
-go 1.26.9
+go 1.26.10
 
 require (
 	github.com/google/generative-ai-go v0.20.1
-	github.com/rabbitmq/amqp091-go v1.13.0
+	github.com/rabbitmq/amqp091-go v1.14.0
+	github.com/redis/go-redis/v9 v9.23.0
+	github.com/sony/gobreaker/v2 v2.4.0
 	go.mongodb.org/mongo-driver v1.17.10
 	go.opentelemetry.io/otel v1.45.0
 	go.opentelemetry.io/otel/sdk v1.45.0
@@ -35,8 +37,6 @@ require (
 	github.com/googleapis/gax-go/v2 v2.23.0 // indirect
 	github.com/klauspost/compress v1.16.7 // indirect
 	github.com/montanaflynn/stats v0.7.1 // indirect
-	github.com/redis/go-redis/v9 v9.23.0 // indirect
-	github.com/sony/gobreaker/v2 v2.4.0 // indirect
 	github.com/xdg-go/pbkdf2 v1.0.0 // indirect
 	github.com/xdg-go/scram v1.1.2 // indirect
 	github.com/xdg-go/stringprep v1.0.4 // indirect

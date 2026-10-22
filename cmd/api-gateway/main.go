@@ -54,6 +54,8 @@ type Gateway struct {
 	fxClient          fxv1.FXServiceClient     // fx-service gRPC client
 	primaryAddress    string
 	standbyAddress    string
+	ledgerMgmtURL     string
+	httpClient        *http.Client
 	logger            observability.Logger
 	webhookDispatcher *webhook.Dispatcher
 }
@@ -1315,6 +1317,62 @@ func (g *Gateway) handleLedger(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// DEV-03: handleLedgerMerkle proxies cryptographic Merkle checkpoint and audit proof requests.
+func (g *Gateway) handleLedgerMerkle(w http.ResponseWriter, r *http.Request) {
+	mgmtURL := g.ledgerMgmtURL
+	if mgmtURL == "" {
+		mgmtURL = resolveLedgerMgmtURL()
+	}
+	mgmtURL = strings.TrimRight(mgmtURL, "/")
+
+	subPath := strings.TrimPrefix(r.URL.Path, "/api/v1/ledger/merkle")
+	if subPath == "" || subPath == "/" {
+		subPath = "/latest"
+	}
+	var allowedAuditSubpaths = map[string]bool{
+		"/latest":      true,
+		"/checkpoints": true,
+		"/proof":       true,
+		"/checkpoint":  true,
+	}
+	if !allowedAuditSubpaths[subPath] {
+		http.Error(w, "Invalid audit merkle subpath", http.StatusBadRequest)
+		return
+	}
+	targetURL := mgmtURL + "/audit/merkle" + subPath
+	if r.URL.RawQuery != "" {
+		targetURL += "?" + r.URL.RawQuery
+	}
+
+	client := g.httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Second}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	// #nosec G704 -- internal gateway proxy to ledger-service with strictly allowlisted subpaths
+	proxyReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL, r.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to build proxy request: %v", err), http.StatusInternalServerError)
+		return
+	}
+	proxyReq.Header.Set("Content-Type", "application/json")
+
+	// #nosec G704 -- internal proxy dispatch to verified ledger management backend
+	resp, err := client.Do(proxyReq)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Ledger service unavailable: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
 func (g *Gateway) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	correlation := observability.FromHTTPRequest(r)
 	ctx := observability.WithCorrelation(r.Context(), correlation)
@@ -1661,6 +1719,17 @@ func resolveGatewayServiceAddresses() (primary, standby, ledger, auth string) {
 	return primary, standby, ledger, auth
 }
 
+func resolveLedgerMgmtURL() string {
+	if u := os.Getenv("LEDGER_MGMT_URL"); u != "" {
+		if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+			return "http://" + u
+		}
+		return u
+	}
+	host := resolveServiceAddress("LEDGER_MGMT_ADDR", "ledger-service", "9092")
+	return "http://" + host
+}
+
 func initFailoverCoordinator(mongoURI string) (coordinator.FailoverCoordinator, func()) {
 	if mongoURI != "" {
 		mCtx, mCancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -1946,6 +2015,8 @@ func registerGatewayRoutes(mux *http.ServeMux, gw *Gateway) {
 	mux.HandleFunc("/api/v1/webhooks/test", gw.handleWebhookTest)
 	mux.HandleFunc("/api/v1/transfers", gw.handleTransfer)
 	mux.HandleFunc("/api/v1/ledger", gw.handleLedger)
+	mux.HandleFunc("/api/v1/ledger/merkle", gw.handleLedgerMerkle)
+	mux.HandleFunc("/api/v1/ledger/merkle/", gw.handleLedgerMerkle)
 	mux.HandleFunc("/api/v1/fx/currencies", gw.handleFXCurrencies)
 	mux.HandleFunc("/api/v1/fx/rates", gw.handleFXRates)
 	mux.HandleFunc("/api/v1/fx/quotes", gw.handleFXQuotes)
@@ -1962,19 +2033,35 @@ func registerGatewayRoutes(mux *http.ServeMux, gw *Gateway) {
 	})
 	mux.HandleFunc("/readyz", gw.handleReadyz)
 	mux.Handle("/metrics", observability.DefaultMetrics.Handler())
+
+	// DEV-01: OpenAPI 3.0 & Embedded Swagger UI
+	mux.HandleFunc("/swagger", handleSwaggerRedirect)
+	mux.HandleFunc("/swagger/", handleSwaggerUI)
+	mux.HandleFunc("/docs", handleSwaggerRedirect)
+	mux.HandleFunc("/docs/", handleSwaggerUI)
+	mux.HandleFunc("/api-docs/openapi.json", handleOpenAPISpec)
 }
 
 func wrapGatewayMiddleware(handler http.Handler, authClient authv1.AuthServiceClient) http.Handler {
 	publicPaths := map[string]bool{
-		"/healthz":               true,
-		"/readyz":                true,
-		"/metrics":               true,
-		"/api/v1/auth/login":     true,
-		"/api/v1/auth/refresh":   true,
-		"/api/v1/auth/token":     true,
-		"/api/v1/cluster/status": true,
-		"/api/v1/fx/currencies":  true,
-		"/api/v1/fx/rates":       true,
+		"/healthz":                          true,
+		"/readyz":                           true,
+		"/metrics":                          true,
+		"/swagger":                          true,
+		"/swagger/":                         true,
+		"/docs":                             true,
+		"/docs/":                            true,
+		"/api-docs/openapi.json":            true,
+		"/api/v1/auth/login":                true,
+		"/api/v1/auth/refresh":              true,
+		"/api/v1/auth/token":                true,
+		"/api/v1/cluster/status":            true,
+		"/api/v1/ledger/merkle":             true,
+		"/api/v1/ledger/merkle/latest":      true,
+		"/api/v1/ledger/merkle/checkpoints": true,
+		"/api/v1/ledger/merkle/proof":       true,
+		"/api/v1/fx/currencies":             true,
+		"/api/v1/fx/rates":                  true,
 	}
 
 	cacheFingerprintSecret := os.Getenv("CACHE_FINGERPRINT_SECRET")
@@ -2097,6 +2184,8 @@ func runGatewayServer(ctx context.Context) error {
 		fxClient:          fxClient,
 		primaryAddress:    primaryAddr,
 		standbyAddress:    standbyAddr,
+		ledgerMgmtURL:     resolveLedgerMgmtURL(),
+		httpClient:        &http.Client{Timeout: 5 * time.Second},
 		logger:            logger,
 		webhookDispatcher: whDispatcher,
 	}

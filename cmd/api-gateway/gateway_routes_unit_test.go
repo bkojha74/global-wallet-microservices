@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -646,4 +648,175 @@ func TestHandleWebhookTest(t *testing.T) {
 	if wPing.Code != http.StatusOK {
 		t.Fatalf("expected 200 for ping, got %d (%s)", wPing.Code, wPing.Body.String())
 	}
+}
+
+func TestSwaggerAndOpenAPIRoutes(t *testing.T) {
+	// 1. Direct handler tests
+	// 1a. GET /api-docs/openapi.json
+	reqSpec := httptest.NewRequest(http.MethodGet, "/api-docs/openapi.json", nil)
+	wSpec := httptest.NewRecorder()
+	handleOpenAPISpec(wSpec, reqSpec)
+	if wSpec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for openapi.json, got %d", wSpec.Code)
+	}
+	if ct := wSpec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("expected application/json content-type, got %s", ct)
+	}
+	var doc map[string]interface{}
+	if err := json.Unmarshal(wSpec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("failed to parse openapi json: %v", err)
+	}
+	if doc["openapi"] != "3.0.3" {
+		t.Fatalf("expected openapi 3.0.3, got %v", doc["openapi"])
+	}
+
+	// 1b. Method Not Allowed on openapi.json
+	reqBadMethod := httptest.NewRequest(http.MethodPost, "/api-docs/openapi.json", nil)
+	wBadMethod := httptest.NewRecorder()
+	handleOpenAPISpec(wBadMethod, reqBadMethod)
+	if wBadMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for POST openapi.json, got %d", wBadMethod.Code)
+	}
+
+	// 1c. GET /swagger/
+	reqUI := httptest.NewRequest(http.MethodGet, "/swagger/", nil)
+	wUI := httptest.NewRecorder()
+	handleSwaggerUI(wUI, reqUI)
+	if wUI.Code != http.StatusOK {
+		t.Fatalf("expected 200 for /swagger/, got %d", wUI.Code)
+	}
+	if ct := wUI.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Fatalf("expected text/html content-type, got %s", ct)
+	}
+	if !strings.Contains(wUI.Body.String(), "SwaggerUIBundle") {
+		t.Fatalf("expected HTML body to contain SwaggerUIBundle initialization")
+	}
+
+	// 1d. Redirects /swagger and /docs to /swagger/
+	for _, p := range []string{"/swagger", "/docs"} {
+		reqRedir := httptest.NewRequest(http.MethodGet, p, nil)
+		wRedir := httptest.NewRecorder()
+		handleSwaggerRedirect(wRedir, reqRedir)
+		if wRedir.Code != http.StatusMovedPermanently {
+			t.Fatalf("expected 301 for %s, got %d", p, wRedir.Code)
+		}
+		if loc := wRedir.Header().Get("Location"); loc != "/swagger/" {
+			t.Fatalf("expected Location /swagger/, got %s", loc)
+		}
+	}
+
+	// 2. Full router stack integration (middleware, public path bypass, and CSP)
+	gw := &Gateway{
+		primaryClient: &mockWalletClient{},
+		standbyClient: &mockWalletClient{},
+		activeTarget:  coordinator.TargetPrimary,
+	}
+	router := buildGatewayRouter(gw)
+
+	// Verify unauthenticated request to /api-docs/openapi.json succeeds through router
+	reqRouterSpec := httptest.NewRequest(http.MethodGet, "/api-docs/openapi.json", nil)
+	wRouterSpec := httptest.NewRecorder()
+	router.ServeHTTP(wRouterSpec, reqRouterSpec)
+	if wRouterSpec.Code != http.StatusOK {
+		t.Fatalf("expected 200 via router for openapi.json, got %d", wRouterSpec.Code)
+	}
+
+	// Verify unauthenticated request to /swagger/ succeeds through router with tailored CSP
+	reqRouterUI := httptest.NewRequest(http.MethodGet, "/swagger/", nil)
+	wRouterUI := httptest.NewRecorder()
+	router.ServeHTTP(wRouterUI, reqRouterUI)
+	if wRouterUI.Code != http.StatusOK {
+		t.Fatalf("expected 200 via router for /swagger/, got %d", wRouterUI.Code)
+	}
+	csp := wRouterUI.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "cdn.jsdelivr.net") {
+		t.Fatalf("expected CSP to allow cdn.jsdelivr.net for swagger UI, got %s", csp)
+	}
+}
+
+func TestGateway_LedgerMerkleRoutes(t *testing.T) {
+	mockLedgerMgmt := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/audit/merkle/latest":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"checkpoint_id":"mcp_1","merkle_root":"root123","entry_count":10}`))
+		case "/audit/merkle/checkpoints":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[{"checkpoint_id":"mcp_1","merkle_root":"root123"}]`))
+		case "/audit/merkle/proof":
+			if r.URL.Query().Get("entry_hash") == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"missing entry_hash"}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"entry_hash":"eh1","merkle_root":"root123","verified":true}`))
+		case "/audit/merkle/checkpoint":
+			if r.Method != http.MethodPost {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"checkpoint_id":"mcp_new","merkle_root":"root456"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer mockLedgerMgmt.Close()
+
+	gw := &Gateway{
+		primaryClient: &mockWalletClient{},
+		standbyClient: &mockWalletClient{},
+		activeTarget:  coordinator.TargetPrimary,
+		ledgerMgmtURL: mockLedgerMgmt.URL,
+		httpClient:    mockLedgerMgmt.Client(),
+	}
+	router := buildGatewayRouter(gw)
+
+	t.Run("GET /api/v1/ledger/merkle/latest public bypass", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/ledger/merkle/latest", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "root123") {
+			t.Errorf("expected root123 in response, got: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("GET /api/v1/ledger/merkle/proof public bypass", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/ledger/merkle/proof?entry_hash=eh1", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), `"verified":true`) {
+			t.Errorf("expected verified true, got: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("GET /api/v1/ledger/merkle defaults to latest", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/ledger/merkle", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+	})
+
+	t.Run("Ledger service unavailable returns 502", func(t *testing.T) {
+		badGW := &Gateway{
+			ledgerMgmtURL: "http://127.0.0.1:59999",
+			httpClient:    &http.Client{Timeout: 50 * time.Millisecond},
+		}
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/ledger/merkle/latest", nil)
+		rec := httptest.NewRecorder()
+		badGW.handleLedgerMerkle(rec, req)
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("expected 502 Bad Gateway, got %d", rec.Code)
+		}
+	})
 }

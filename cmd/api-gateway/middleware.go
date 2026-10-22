@@ -120,7 +120,11 @@ func SecurityHeadersMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("X-XSS-Protection", "1; mode=block")
 		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+		if strings.HasPrefix(r.URL.Path, "/swagger") || strings.HasPrefix(r.URL.Path, "/docs") || strings.HasPrefix(r.URL.Path, "/api-docs") {
+			w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: https://cdn.jsdelivr.net; font-src 'self' https://cdn.jsdelivr.net; frame-ancestors 'none'")
+		} else {
+			w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -257,7 +261,7 @@ func extractClientIP(r *http.Request) string {
 func AuthMiddleware(authClient authv1.AuthServiceClient, cache *claimsCache, publicPaths map[string]bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-		if publicPaths[path] {
+		if publicPaths[path] || strings.HasPrefix(path, "/swagger") || strings.HasPrefix(path, "/docs") || strings.HasPrefix(path, "/api-docs") {
 			next.ServeHTTP(w, r)
 			return
 		}
