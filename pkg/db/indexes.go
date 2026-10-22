@@ -48,6 +48,28 @@ func EnsureLedgerIndexes(ctx context.Context, db *mongo.Database) error {
 		return fmt.Errorf("failed to create ledger_entries indexes: %w", err)
 	}
 
+	// Merkle checkpoint indexes
+	merkleCol := db.Collection("ledger_merkle_roots")
+	merkleIndexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{bson.E{Key: "checkpoint_id", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("idx_merkle_checkpoint_id"),
+		},
+		{
+			Keys:    bson.D{bson.E{Key: "end_sequence", Value: -1}},
+			Options: options.Index().SetName("idx_merkle_end_seq_desc"),
+		},
+		{
+			Keys:    bson.D{bson.E{Key: "created_at", Value: -1}},
+			Options: options.Index().SetName("idx_merkle_created_at_desc"),
+		},
+	}
+	if mNames, mErr := merkleCol.Indexes().CreateMany(ctx, merkleIndexes); mErr != nil {
+		log.Printf("[DB-INDEX] Warning: failed to create ledger_merkle_roots indexes: %v", mErr)
+	} else {
+		log.Printf("[DB-INDEX] Ensured ledger_merkle_roots indexes: %v", mNames)
+	}
+
 	log.Printf("[DB-INDEX] Ensured ledger_entries indexes: %v", names)
 	return nil
 }

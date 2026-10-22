@@ -733,3 +733,90 @@ func TestSwaggerAndOpenAPIRoutes(t *testing.T) {
 		t.Fatalf("expected CSP to allow cdn.jsdelivr.net for swagger UI, got %s", csp)
 	}
 }
+
+func TestGateway_LedgerMerkleRoutes(t *testing.T) {
+	mockLedgerMgmt := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/audit/merkle/latest":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"checkpoint_id":"mcp_1","merkle_root":"root123","entry_count":10}`))
+		case "/audit/merkle/checkpoints":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[{"checkpoint_id":"mcp_1","merkle_root":"root123"}]`))
+		case "/audit/merkle/proof":
+			if r.URL.Query().Get("entry_hash") == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"missing entry_hash"}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"entry_hash":"eh1","merkle_root":"root123","verified":true}`))
+		case "/audit/merkle/checkpoint":
+			if r.Method != http.MethodPost {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"checkpoint_id":"mcp_new","merkle_root":"root456"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer mockLedgerMgmt.Close()
+
+	gw := &Gateway{
+		primaryClient: &mockWalletClient{},
+		standbyClient: &mockWalletClient{},
+		activeTarget:  coordinator.TargetPrimary,
+		ledgerMgmtURL: mockLedgerMgmt.URL,
+		httpClient:    mockLedgerMgmt.Client(),
+	}
+	router := buildGatewayRouter(gw)
+
+	t.Run("GET /api/v1/ledger/merkle/latest public bypass", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/ledger/merkle/latest", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "root123") {
+			t.Errorf("expected root123 in response, got: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("GET /api/v1/ledger/merkle/proof public bypass", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/ledger/merkle/proof?entry_hash=eh1", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), `"verified":true`) {
+			t.Errorf("expected verified true, got: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("GET /api/v1/ledger/merkle defaults to latest", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/ledger/merkle", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+	})
+
+	t.Run("Ledger service unavailable returns 502", func(t *testing.T) {
+		badGW := &Gateway{
+			ledgerMgmtURL: "http://127.0.0.1:59999",
+			httpClient:    &http.Client{Timeout: 50 * time.Millisecond},
+		}
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/ledger/merkle/latest", nil)
+		rec := httptest.NewRecorder()
+		badGW.handleLedgerMerkle(rec, req)
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("expected 502 Bad Gateway, got %d", rec.Code)
+		}
+	})
+}

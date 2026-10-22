@@ -439,6 +439,102 @@ func startLedgerMetricsServer(client *mongo.Client, metricsPort, region string) 
 		}
 		_ = json.NewEncoder(w).Encode(res)
 	})
+
+	// DEV-03: Merkle Root Ledger Checkpoints & Cryptographic Verification Endpoints
+	metricsMux.HandleFunc("/audit/merkle/latest", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if client == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "database unavailable"})
+			return
+		}
+		cp, err := GetLatestCheckpoint(r.Context(), client.Database("banking_db"))
+		if err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "no merkle checkpoints found"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(cp)
+	})
+
+	metricsMux.HandleFunc("/audit/merkle/checkpoints", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if client == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "database unavailable"})
+			return
+		}
+		limit := 50
+		if lStr := r.URL.Query().Get("limit"); lStr != "" {
+			if parsed, err := strconv.Atoi(lStr); err == nil && parsed > 0 {
+				limit = parsed
+			}
+		}
+		list, err := GetCheckpoints(r.Context(), client.Database("banking_db"), limit)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(list)
+	})
+
+	metricsMux.HandleFunc("/audit/merkle/proof", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if client == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "database unavailable"})
+			return
+		}
+		entryHash := r.URL.Query().Get("entry_hash")
+		checkpointID := r.URL.Query().Get("checkpoint_id")
+		if entryHash == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "entry_hash query parameter is required"})
+			return
+		}
+		resp, err := GenerateProofForEntry(r.Context(), client.Database("banking_db"), entryHash, checkpointID)
+		if err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	metricsMux.HandleFunc("/audit/merkle/checkpoint", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if client == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "database unavailable"})
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "method not allowed"})
+			return
+		}
+		batchLimit := 1000
+		if bStr := r.URL.Query().Get("batch_limit"); bStr != "" {
+			if parsed, err := strconv.Atoi(bStr); err == nil && parsed > 0 {
+				batchLimit = parsed
+			}
+		}
+		cp, err := GenerateCheckpoint(r.Context(), client.Database("banking_db"), batchLimit)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if cp == nil {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{"message": "no new entries to checkpoint"})
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(cp)
+	})
+
 	server := &http.Server{
 		Addr:              ":" + metricsPort,
 		Handler:           metricsMux,
@@ -531,6 +627,17 @@ func runLedgerServer(ctx context.Context) error {
 		metricsPort = "9092"
 	}
 	metricsServer := startLedgerMetricsServer(client, metricsPort, region)
+
+	// DEV-03: Initialize Merkle Checkpoint background worker
+	if client != nil {
+		merkleInterval := 30 * time.Second
+		if val := os.Getenv("MERKLE_CHECKPOINT_INTERVAL_SECS"); val != "" {
+			if sec, err := strconv.Atoi(val); err == nil && sec > 0 {
+				merkleInterval = time.Duration(sec) * time.Second
+			}
+		}
+		StartMerkleWorker(subCtx, client.Database("banking_db"), merkleInterval, 1000)
+	}
 
 	go func() {
 		log.Printf("[LEDGER-SERVICE] gRPC listening on :%s", port)

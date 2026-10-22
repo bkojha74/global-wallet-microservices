@@ -26,6 +26,7 @@ Available Commands:
   token          Mint offline or remote JWT bearer access tokens with custom scopes
   failover       Inspect active routed target or trigger multi-region failover
   ledger verify  Verify cryptographic SHA-256 hash chains and GAAP balance integrity
+  ledger merkle  Inspect and verify Merkle root checkpoints and inclusion proofs
   webhook ping   Dispatch signed test webhook payload to verify partner endpoint
   version        Print walletctl CLI version and build information
 

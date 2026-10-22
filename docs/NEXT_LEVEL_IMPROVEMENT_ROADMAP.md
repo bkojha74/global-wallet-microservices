@@ -162,8 +162,8 @@ graph TD
   - [x] Embed OpenAPI 3.0 definition and Swagger UI into `api-gateway` at `/swagger` and `/docs`.
 - [x] **DEV-02: Unified CLI Utility (`walletctl`)**
   - [x] Command-line interface in Go for health inspection, token generation, failover drills, ledger verification, and webhook ping probes (`cmd/walletctl/`).
-- [ ] **DEV-03: Merkle Root Ledger Checkpoints**
-  - [ ] Periodic Merkle root generation over batches of SHA-256 ledger entries for external regulatory attestation.
+- [x] **DEV-03: Merkle Root Ledger Checkpoints**
+  - [x] Periodic Merkle root generation over batches of SHA-256 ledger entries for external regulatory attestation (`pkg/merkle/`, `cmd/ledger-service/merkle.go`, `cmd/walletctl/ledger.go`).
 
 ---
 
@@ -290,8 +290,10 @@ graph TD
 | Swagger & OpenAPI Unit Tests | `cmd/api-gateway/gateway_routes_unit_test.go` | ✅ Complete (DEV-01) |
 | Unified CLI Tool (`walletctl`) Core Subcommands (`health`, `token`, `failover`, `ledger`, `webhook`) | `cmd/walletctl/` | ✅ Complete (DEV-02) |
 | Unified CLI Full Concurrency & Race Detector Test Suite (`main_test.go`) | `cmd/walletctl/main_test.go` | ✅ Complete (DEV-02) |
-| Merkle Tree Batch Calculation & Proof Generation Engine | `pkg/merkle/` | ⏳ Pending (DEV-03) |
-| Ledger Merkle Periodic Checkpointing Worker | `cmd/ledger-service/merkle.go` | ⏳ Pending (DEV-03) |
+| Merkle Tree Batch Calculation & Proof Generation Engine | `pkg/merkle/` | ✅ Complete (DEV-03) |
+| Ledger Merkle Periodic Checkpointing Worker & Management Endpoints | `cmd/ledger-service/merkle.go`, `cmd/ledger-service/main.go` | ✅ Complete (DEV-03) |
+| API Gateway Merkle Proxy Routes & OpenAPI Specification | `cmd/api-gateway/main.go`, `cmd/api-gateway/openapi.json` | ✅ Complete (DEV-03) |
+| CLI Merkle Inspection & Proof Verification Subcommand (`walletctl ledger merkle`) | `cmd/walletctl/ledger.go`, `cmd/walletctl/main_test.go` | ✅ Complete (DEV-03) |
 | Architectural Documentation | `docs/PILLAR5_DEV_EXPERIENCE_TOOLING_GUIDE.md` | ✅ Complete |
 
 

@@ -681,6 +681,56 @@
         }
       }
     },
+    "/api/v1/ledger/merkle/latest": {
+      "get": {
+        "tags": ["Ledger & Auditing"],
+        "summary": "Get Latest Merkle Checkpoint Root",
+        "description": "Returns the latest immutable batch Merkle tree root and sequence boundaries for cryptographic auditing.",
+        "responses": {
+          "200": {
+            "description": "Latest Merkle checkpoint",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MerkleCheckpoint" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/ledger/merkle/proof": {
+      "get": {
+        "tags": ["Ledger & Auditing"],
+        "summary": "Get Cryptographic Inclusion Proof",
+        "description": "Generates an O(log N) cryptographic audit proof path proving that a specific transaction entry hash exists in the Merkle root.",
+        "parameters": [
+          {
+            "name": "entry_hash",
+            "in": "query",
+            "required": true,
+            "description": "SHA-256 hash of the transaction entry to prove",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "checkpoint_id",
+            "in": "query",
+            "required": false,
+            "description": "Optional specific checkpoint ID",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cryptographic inclusion proof",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MerkleProofResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/fx/currencies": {
       "get": {
         "tags": ["Foreign Exchange (FX)"],
@@ -1094,6 +1144,48 @@
             "type": "object",
             "additionalProperties": { "type": "number" },
             "example": { "EUR": 0.92, "GBP": 0.79, "JPY": 155.2 }
+          }
+        }
+      },
+      "MerkleCheckpoint": {
+        "type": "object",
+        "properties": {
+          "checkpoint_id": { "type": "string", "example": "mcp_1729600000_1_1000" },
+          "start_sequence": { "type": "integer", "example": 1 },
+          "end_sequence": { "type": "integer", "example": 1000 },
+          "merkle_root": { "type": "string", "example": "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b" },
+          "entry_count": { "type": "integer", "example": 1000 },
+          "created_at": { "type": "string", "format": "date-time" },
+          "leaf_hashes": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "MerkleProofStep": {
+        "type": "object",
+        "properties": {
+          "sibling_hash": { "type": "string", "example": "b5a2c6d4..." },
+          "is_right": { "type": "boolean", "example": true }
+        }
+      },
+      "MerkleProofResponse": {
+        "type": "object",
+        "properties": {
+          "entry_hash": { "type": "string", "example": "3b2f91a7..." },
+          "checkpoint_id": { "type": "string", "example": "mcp_1729600000_1_1000" },
+          "merkle_root": { "type": "string", "example": "4a5e1e4b..." },
+          "verified": { "type": "boolean", "example": true },
+          "proof": {
+            "type": "object",
+            "properties": {
+              "leaf_hash": { "type": "string" },
+              "root_hash": { "type": "string" },
+              "steps": {
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/MerkleProofStep" }
+              }
+            }
           }
         }
       },
