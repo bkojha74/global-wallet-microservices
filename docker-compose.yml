@@ -19,8 +19,8 @@ services:
       - LOGGING_RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - LOGGING_SPOOL_PATH=data/logging/ledger-service.jsonl
     ports:
-      - "50052:50052"
-      - "9092:9092"
+      - "127.0.0.1:50052:50052"
+      - "127.0.0.1:9092:9092"
     networks:
       - banking_net
 
@@ -56,8 +56,8 @@ services:
       - AI_FRAUD_ENFORCEMENT=${AI_FRAUD_ENFORCEMENT}
       - AI_INFERENCE_TIMEOUT_MS=${AI_INFERENCE_TIMEOUT_MS}
     ports:
-      - "50051:50051"
-      - "9094:9094"
+      - "127.0.0.1:50051:50051"
+      - "127.0.0.1:9094:9094"
     depends_on:
       - ledger-service
     networks:
@@ -95,8 +95,8 @@ services:
       - AI_FRAUD_ENFORCEMENT=${AI_FRAUD_ENFORCEMENT}
       - AI_INFERENCE_TIMEOUT_MS=${AI_INFERENCE_TIMEOUT_MS}
     ports:
-      - "50053:50053"
-      - "9093:9093"
+      - "127.0.0.1:50053:50053"
+      - "127.0.0.1:9093:9093"
     depends_on:
       - ledger-service
     networks:

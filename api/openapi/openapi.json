@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Global Wallet Microservices API",
-    "version": "1.5.0",
+    "version": "1.6.0",
     "description": "High-performance, distributed multi-currency digital wallet and core banking platform with zero-trust security, real-time FX, GAAP double-entry ledger settlement, velocity controls, payment rails simulation, and partner webhooks.",
     "contact": {
       "name": "Global Wallet Engineering Team",

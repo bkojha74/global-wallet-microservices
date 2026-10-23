@@ -831,6 +831,7 @@ Both Postman and Bruno test runners validate:
 | [.github/workflows/ci.yml](.github/workflows/ci.yml) | Automated GitHub Actions CI/CD pipeline: Protobuf verification, Go formatting/race test quality gates, Docker Hub matrix builds, and self-hosted deployment. |
 | [postman/](postman/) | Automated 28-test integration collection, environment, and BloomRPC JSON presets. |
 | [SECURITY.md](SECURITY.md) | Security policy, vulnerability reporting guidelines, and development boundaries. |
+| [docs/SECURITY_VULNERABILITIES_AND_LOOPHOLES.md](docs/SECURITY_VULNERABILITIES_AND_LOOPHOLES.md) | Prioritized catalog of 15 security vulnerabilities, financial bugs, and architectural loopholes with implementation fixes. |
 | [docs/AI_DEMO_GUIDE.md](docs/AI_DEMO_GUIDE.md) | Operations and integration guide for the Gemini AI Fraud Detection engine, including payload schemas and testing procedures. |
 
 

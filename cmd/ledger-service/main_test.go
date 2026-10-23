@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -768,5 +769,82 @@ func TestInitLedgerOutboxBranches(t *testing.T) {
 	o3, p3 := initLedgerOutbox(ctx, client)
 	if o3 == nil || p3 == nil {
 		t.Fatal("expected non-nil outbox and publisher when configured")
+	}
+}
+
+func TestConcurrentRecordTransactionHashChainIntegrityLive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	client, err := db.ConnectWithRetry(ctx, db.DefaultMongoURI(), 2)
+	if err != nil {
+		t.Skipf("MongoDB not reachable: %v", err)
+		return
+	}
+	defer func() { _ = client.Disconnect(ctx) }()
+
+	now := time.Now().UnixNano()
+	dbName := fmt.Sprintf("test_conc_ledger_%d", now)
+	testDB := client.Database(dbName)
+	_ = testDB.Drop(ctx)
+	defer func() { _ = testDB.Drop(ctx) }()
+
+	if err := db.EnsureLedgerIndexes(ctx, testDB); err != nil {
+		t.Fatalf("failed to ensure indexes: %v", err)
+	}
+
+	srv := &server{
+		mongoClient: client,
+		dbName:      dbName,
+		region:      "us-east-1",
+		logger:      observability.NewMemoryLogger(),
+	}
+
+	const numWorkers = 8
+	var wg sync.WaitGroup
+	errCh := make(chan error, numWorkers)
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			req := &ledgerv1.RecordTransactionRequest{
+				IdempotencyKey:      fmt.Sprintf("conc-hash-%d-%d", now, workerID),
+				SourceWalletId:      fmt.Sprintf("user_src_%d", workerID),
+				DestinationWalletId: fmt.Sprintf("user_dst_%d", workerID),
+				Amount:              int64(100 + workerID),
+				Currency:            "USD",
+			}
+			resp, recErr := srv.RecordTransaction(ctx, req)
+			if recErr != nil {
+				errCh <- fmt.Errorf("worker %d returned error: %w", workerID, recErr)
+				return
+			}
+			if resp == nil || !resp.Success {
+				errCh <- fmt.Errorf("worker %d failed to record: %+v", workerID, resp)
+				return
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for wErr := range errCh {
+		t.Fatalf("concurrent RecordTransaction failure: %v", wErr)
+	}
+
+	// Verify cryptographic hash chain integrity using VerifyAuditChain
+	col := testDB.Collection("ledger_entries")
+	auditResult, vErr := VerifyAuditChain(ctx, col)
+	if vErr != nil {
+		t.Fatalf("VerifyAuditChain failed: %v", vErr)
+	}
+	if auditResult.Status != "VERIFIED" {
+		t.Fatalf("Audit chain broken under concurrency: status=%s, err=%s, seq=%d",
+			auditResult.Status, auditResult.ErrorMessage, auditResult.TamperedEntrySeq)
+	}
+	if !auditResult.IsBalanced {
+		t.Fatalf("Trial balance unbalanced under concurrency: %+v", auditResult)
 	}
 }

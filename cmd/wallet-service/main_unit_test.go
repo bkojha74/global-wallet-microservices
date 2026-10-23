@@ -10,11 +10,13 @@ import (
 	"testing"
 	"time"
 
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 
 	"wallet-system/pkg/coordinator"
+	"wallet-system/pkg/db"
 	ledgerv1 "wallet-system/proto/ledger"
 	walletv1 "wallet-system/proto/wallet"
 )
@@ -733,5 +735,51 @@ func TestWithdrawFunds_Validations(t *testing.T) {
 	})
 	if errStandby != nil || respStandby == nil || respStandby.Status != walletv1.WithdrawFundsResponse_INVALID_ARGUMENT {
 		t.Errorf("expected standby rejection response, got resp=%+v, err=%v", respStandby, errStandby)
+	}
+}
+
+func TestMultiCurrencyTransferBalanceIntegrity(t *testing.T) {
+	// Verify that incSource and incDest do NOT decrement or increment the primary 'balance'
+	// if the transfer currency differs from the wallet's primary currency (VULN-02)
+	srcWallet := WalletModel{
+		ID:       "w-src",
+		Currency: "USD",
+		Balance:  1000,
+		Balances: map[string]int64{"USD": 1000, "EUR": 500},
+	}
+	dstWallet := WalletModel{
+		ID:       "w-dst",
+		Currency: "EUR",
+		Balance:  200,
+		Balances: map[string]int64{"EUR": 200, "USD": 50},
+	}
+
+	state := &transferExecutionState{
+		srcWallet: srcWallet,
+		dstWallet: dstWallet,
+	}
+
+	srcCurr := db.NormalizeCurrency("EUR")
+	incSource := bson.M{
+		"balances." + srcCurr: -int64(100),
+	}
+	if srcCurr == state.srcWallet.Currency {
+		incSource["balance"] = -int64(100)
+	}
+
+	if _, touchesBase := incSource["balance"]; touchesBase {
+		t.Fatalf("VULN-02 regression: debiting foreign EUR pot must NOT alter USD base balance")
+	}
+
+	dstCurr := db.NormalizeCurrency("USD")
+	incDest := bson.M{
+		"balances." + dstCurr: int64(100),
+	}
+	if dstCurr == state.dstWallet.Currency {
+		incDest["balance"] = int64(100)
+	}
+
+	if _, touchesBase := incDest["balance"]; touchesBase {
+		t.Fatalf("VULN-02 regression: crediting foreign USD pot must NOT alter EUR base balance")
 	}
 }

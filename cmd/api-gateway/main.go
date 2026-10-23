@@ -322,8 +322,17 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "source_wallet_id and destination_wallet_id are required", http.StatusBadRequest)
 		return
 	}
-	if req.IdempotencyKey != "" {
-		correlation.IdempotencyKey = req.IdempotencyKey
+	idempKey := strings.TrimSpace(req.IdempotencyKey)
+	if idempKey == "" {
+		idempKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	}
+	if idempKey == "" {
+		if os.Getenv("ENFORCE_CLIENT_IDEMPOTENCY") == "true" || r.Header.Get("X-Enforce-Idempotency") == "true" {
+			http.Error(w, "Idempotency-Key is required for financial mutations", http.StatusBadRequest)
+			return
+		}
+	} else {
+		correlation.IdempotencyKey = idempKey
 	}
 	if err := db.ValidateAmount(req.Amount, req.Currency); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -612,8 +621,8 @@ func (g *Gateway) handleUpdateWalletKYC(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
-		if err := ValidateWalletOwnership(claims, walletID); err != nil && !claims.HasRole(auth.RoleAdmin) {
-			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
+		if !claims.HasRole(auth.RoleAdmin) && !claims.HasScope("wallet:kyc:admin") {
+			writeAuthError(w, http.StatusForbidden, "Forbidden: KYC tier modification requires admin privileges or wallet:kyc:admin scope")
 			return
 		}
 	}
@@ -807,9 +816,13 @@ func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWal
 
 	idempKey := strings.TrimSpace(req.IdempotencyKey)
 	if idempKey == "" {
-		idempKey = r.Header.Get("Idempotency-Key")
+		idempKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	}
 	if idempKey == "" {
+		if os.Getenv("ENFORCE_CLIENT_IDEMPOTENCY") == "true" || r.Header.Get("X-Enforce-Idempotency") == "true" {
+			http.Error(w, "Idempotency-Key is required for financial mutations", http.StatusBadRequest)
+			return
+		}
 		idempKey = "idemp_dep_" + traceID
 	}
 	correlation.IdempotencyKey = idempKey
@@ -971,9 +984,13 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 
 	idempKey := strings.TrimSpace(req.IdempotencyKey)
 	if idempKey == "" {
-		idempKey = r.Header.Get("Idempotency-Key")
+		idempKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	}
 	if idempKey == "" {
+		if os.Getenv("ENFORCE_CLIENT_IDEMPOTENCY") == "true" || r.Header.Get("X-Enforce-Idempotency") == "true" {
+			http.Error(w, "Idempotency-Key is required for financial mutations", http.StatusBadRequest)
+			return
+		}
 		idempKey = "idemp_wth_" + traceID
 	}
 	correlation.IdempotencyKey = idempKey
@@ -1109,6 +1126,10 @@ func (g *Gateway) handleWebhookSubscriptions(w http.ResponseWriter, r *http.Requ
 			http.Error(w, "url is required", http.StatusBadRequest)
 			return
 		}
+		if err := webhook.ValidateWebhookURL(targetURL); err != nil {
+			http.Error(w, fmt.Sprintf("invalid webhook url: %v", err), http.StatusBadRequest)
+			return
+		}
 		if len(req.Events) == 0 {
 			req.Events = []string{"*"}
 		}
@@ -1238,8 +1259,8 @@ func (g *Gateway) handleWebhookTest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "url is required", http.StatusBadRequest)
 		return
 	}
-	if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
-		http.Error(w, "valid webhook url (http/https) is required", http.StatusBadRequest)
+	if err := webhook.ValidateWebhookURL(targetURL); err != nil {
+		http.Error(w, fmt.Sprintf("invalid webhook url: %v", err), http.StatusBadRequest)
 		return
 	}
 	if req.Secret == "" {
@@ -1631,11 +1652,16 @@ func buildAuthTokenClaims(sub, role, scope string) (auth.Claims, []string, []str
 	}, roles, scopes
 }
 
-// handleAuthToken provides backward-compatible token minting (/api/v1/auth/token)
-// supporting legacy Bruno/Postman collections and rapid development testing.
+// handleAuthToken provides development-only token minting (/api/v1/auth/token).
+// In production, this endpoint is strictly disabled (VULN-01 fix); clients must use /api/v1/auth/login.
 func (g *Gateway) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	if os.Getenv("ENABLE_DEV_TOKEN_ENDPOINT") != "true" {
+		writeAuthError(w, http.StatusForbidden, "Token minting endpoint /api/v1/auth/token is disabled. Set ENABLE_DEV_TOKEN_ENDPOINT=true in development or use /api/v1/auth/login.")
 		return
 	}
 
@@ -2054,7 +2080,6 @@ func wrapGatewayMiddleware(handler http.Handler, authClient authv1.AuthServiceCl
 		"/api-docs/openapi.json":            true,
 		"/api/v1/auth/login":                true,
 		"/api/v1/auth/refresh":              true,
-		"/api/v1/auth/token":                true,
 		"/api/v1/cluster/status":            true,
 		"/api/v1/ledger/merkle":             true,
 		"/api/v1/ledger/merkle/latest":      true,
@@ -2062,6 +2087,10 @@ func wrapGatewayMiddleware(handler http.Handler, authClient authv1.AuthServiceCl
 		"/api/v1/ledger/merkle/proof":       true,
 		"/api/v1/fx/currencies":             true,
 		"/api/v1/fx/rates":                  true,
+	}
+
+	if os.Getenv("ENABLE_DEV_TOKEN_ENDPOINT") == "true" {
+		publicPaths["/api/v1/auth/token"] = true
 	}
 
 	cacheFingerprintSecret := os.Getenv("CACHE_FINGERPRINT_SECRET")

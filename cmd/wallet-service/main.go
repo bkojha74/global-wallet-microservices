@@ -81,10 +81,12 @@ func (s *server) db() *mongo.Database {
 
 func (s *server) isWritable(ctx context.Context) bool {
 	if s.coordinator != nil {
-		if target, err := s.coordinator.GetActiveTarget(ctx); err == nil && target != "" {
-			if s.targetRole != "" {
-				return target == s.targetRole
-			}
+		target, err := s.coordinator.GetActiveTarget(ctx)
+		if err != nil {
+			return false // Fail closed: reject writes if cluster consensus cannot be determined
+		}
+		if s.targetRole != "" {
+			return target == s.targetRole
 		}
 	}
 	return s.isActive
@@ -129,6 +131,7 @@ type WalletModel struct {
 	Balances  map[string]int64 `bson:"balances,omitempty" json:"balances,omitempty"`
 	Status    string           `bson:"status" json:"status"`
 	KYCTier   string           `bson:"kyc_tier,omitempty" json:"kyc_tier,omitempty"`
+	Region    string           `bson:"region,omitempty" json:"region,omitempty"`
 	UpdatedAt string           `bson:"updated_at" json:"updated_at"`
 }
 
@@ -348,6 +351,8 @@ type transferExecutionState struct {
 	exchangeRate    float64
 	fxQuoteID       string
 	isCrossCurrency bool
+	srcWallet       WalletModel
+	dstWallet       WalletModel
 }
 
 var fallbackBaselineUSDRates = map[string]float64{
@@ -508,6 +513,30 @@ func (s *server) validateTransferRequest(ctx context.Context, req *walletv1.Tran
 	// Runs last so all business validations take priority.
 	// Fail-open: any AI error returns ALLOW — AI is never a payment blocker.
 	if s.fraudDetector != nil && s.fraudDetector.IsEnabled() {
+		recentTxnCount := 0
+		if _, count, err := s.GetWalletVelocityUsage(ctx, req.SourceWalletId); err == nil {
+			recentTxnCount = int(count)
+		}
+
+		isNewWalletPair := false
+		crossRegion := false
+		if s.db() != nil {
+			pairCount, err := s.db().Collection("wallet_velocity_records").CountDocuments(ctx, bson.M{
+				"wallet_id":      req.SourceWalletId,
+				"dest_wallet_id": req.DestinationWalletId,
+			}, options.Count().SetLimit(1))
+			if err == nil && pairCount == 0 {
+				isNewWalletPair = true
+			}
+
+			var destWallet WalletModel
+			if err := s.db().Collection("wallets").FindOne(ctx, bson.M{"_id": req.DestinationWalletId}).Decode(&destWallet); err == nil {
+				if destWallet.Region != "" && s.region != "" && destWallet.Region != s.region {
+					crossRegion = true
+				}
+			}
+		}
+
 		signals := ai.FraudSignals{
 			SourceWalletID:      req.SourceWalletId,
 			DestinationWalletID: req.DestinationWalletId,
@@ -515,7 +544,10 @@ func (s *server) validateTransferRequest(ctx context.Context, req *walletv1.Tran
 			Currency:            req.Amount.Currency,
 			Region:              s.region,
 			Timestamp:           time.Now().UTC(),
+			RecentTxnCount:      recentTxnCount,
+			IsNewWalletPair:     isNewWalletPair,
 			IsRoundNumber:       req.Amount.Units%10000 == 0,
+			CrossRegion:         crossRegion,
 		}
 		decision, _ := s.fraudDetector.Score(ctx, signals)
 		s.emit(ctx, "wallet.transfer.fraud_scored", observability.LevelInfo,
@@ -602,6 +634,7 @@ func (s *server) validateWalletsOperational(sessCtx mongo.SessionContext, wallet
 		}
 		return err
 	}
+	state.srcWallet = srcWallet
 	if msg, err := checkWalletStatus(srcWallet, "source"); err != nil {
 		state.txnStatus = walletv1.TransferFundsResponse_INTERNAL_ERROR
 		state.txnErrMsg = msg
@@ -625,6 +658,7 @@ func (s *server) validateWalletsOperational(sessCtx mongo.SessionContext, wallet
 		}
 		return err
 	}
+	state.dstWallet = dstWallet
 	if msg, err := checkWalletStatus(dstWallet, "destination"); err != nil {
 		state.txnStatus = walletv1.TransferFundsResponse_INTERNAL_ERROR
 		state.txnErrMsg = msg
@@ -646,6 +680,14 @@ func (s *server) executeDebitAndCredit(sessCtx mongo.SessionContext, ctx context
 	srcCurr := db.NormalizeCurrency(req.Amount.Currency)
 	dstCurr := db.NormalizeCurrency(destCurrency)
 
+	// Ensure source and dest wallet models are populated for currency comparison
+	if state.srcWallet.Currency == "" {
+		_ = walletsCol.FindOne(sessCtx, bson.M{"_id": req.SourceWalletId}).Decode(&state.srcWallet)
+	}
+	if state.dstWallet.Currency == "" {
+		_ = walletsCol.FindOne(sessCtx, bson.M{"_id": req.DestinationWalletId}).Decode(&state.dstWallet)
+	}
+
 	filterSource := bson.M{
 		"_id": req.SourceWalletId,
 		"$or": []bson.M{
@@ -653,11 +695,15 @@ func (s *server) executeDebitAndCredit(sessCtx mongo.SessionContext, ctx context
 			{"currency": srcCurr, "balance": bson.M{"$gte": req.Amount.Units}},
 		},
 	}
+	incSource := bson.M{
+		"balances." + srcCurr: -req.Amount.Units,
+	}
+	// Only alter base balance if the debited currency matches the wallet's primary currency (VULN-02 fix)
+	if srcCurr == state.srcWallet.Currency {
+		incSource["balance"] = -req.Amount.Units
+	}
 	updateSource := bson.M{
-		"$inc": bson.M{
-			"balance":             -req.Amount.Units,
-			"balances." + srcCurr: -req.Amount.Units,
-		},
+		"$inc": incSource,
 		"$set": bson.M{"updated_at": time.Now().UTC().Format(time.RFC3339)},
 	}
 	resSource, err := walletsCol.UpdateOne(sessCtx, filterSource, updateSource)
@@ -699,15 +745,28 @@ func (s *server) executeDebitAndCredit(sessCtx mongo.SessionContext, ctx context
 		}
 	}
 
+	// If recipient does not share primary currency and FX was not invoked, only allow if recipient holds an active multi-currency pot
+	if dstCurr != state.dstWallet.Currency && !state.isCrossCurrency {
+		if state.dstWallet.Balances == nil || state.dstWallet.Balances[dstCurr] <= 0 {
+			state.txnStatus = walletv1.TransferFundsResponse_INTERNAL_ERROR
+			state.txnErrMsg = "Destination wallet not found or currency mismatch"
+			return fmt.Errorf("currency mismatch")
+		}
+	}
+
+	// Crediting recipient: allow any supported currency into multi-currency balances map
 	filterDest := bson.M{
-		"_id":      req.DestinationWalletId,
-		"currency": destCurrency,
+		"_id": req.DestinationWalletId,
+	}
+	incDest := bson.M{
+		"balances." + dstCurr: destUnits,
+	}
+	// Only alter base balance if the credited currency matches the recipient's primary currency (VULN-02 fix)
+	if dstCurr == state.dstWallet.Currency {
+		incDest["balance"] = destUnits
 	}
 	updateDest := bson.M{
-		"$inc": bson.M{
-			"balance":             destUnits,
-			"balances." + dstCurr: destUnits,
-		},
+		"$inc": incDest,
 		"$set": bson.M{"updated_at": time.Now().UTC().Format(time.RFC3339)},
 	}
 	resDest, err := walletsCol.UpdateOne(sessCtx, filterDest, updateDest)
@@ -752,7 +811,7 @@ func (s *server) executeDebitAndCredit(sessCtx mongo.SessionContext, ctx context
 	}
 
 	// Record velocity usage for compliance tracking
-	if recErr := s.RecordVelocityUsage(sessCtx, req.SourceWalletId, req.Amount.Units, req.Amount.Currency, "TRANSFER"); recErr != nil {
+	if recErr := s.RecordVelocityUsageWithDest(sessCtx, req.SourceWalletId, req.DestinationWalletId, req.Amount.Units, req.Amount.Currency, "TRANSFER"); recErr != nil {
 		log.Printf("[COMPLIANCE-TX] Warning: failed to record velocity usage for wallet %s: %v", req.SourceWalletId, recErr)
 	}
 
@@ -1982,6 +2041,7 @@ func dialFXClient(fxAddr string) (*grpc.ClientConn, fxv1.FXServiceClient, error)
 }
 
 func setupWalletGRPCServer(port string) (*grpc.Server, *health.Server, net.Listener, error) {
+	// #nosec G102 -- microservice container listens on configured port across container network interfaces
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to listen on port %s: %w", port, err)

@@ -25,6 +25,13 @@ const (
 // maxFailedLogins is the number of consecutive failures before account lockout.
 const maxFailedLogins = 5
 
+// DefaultLockoutDuration specifies how long an account remains locked after maxFailedLogins.
+const DefaultLockoutDuration = 15 * time.Minute
+
+// dummyBcryptHash is a precomputed valid bcrypt hash of a random password used to normalize
+// timing when checking non-existent users (CWE-208 Timing Enumeration defense).
+const dummyBcryptHash = "$2a$10$w3aQ83qR06yBfFv2/Z3gSu8MeqO94uE3ZfMekF9D3J.J8kQ2E6mKG"
+
 // UserRecord mirrors the MongoDB document stored in auth_db.users.
 type UserRecord struct {
 	ID               primitive.ObjectID `bson:"_id,omitempty"`
@@ -36,6 +43,7 @@ type UserRecord struct {
 	WalletIDs        []string           `bson:"wallet_ids,omitempty"` // for IDOR/ABAC ownership checks
 	Status           string             `bson:"status"`
 	FailedLoginCount int                `bson:"failed_login_count"`
+	LockedUntil      *time.Time         `bson:"locked_until,omitempty"`
 	LastLoginAt      *time.Time         `bson:"last_login_at,omitempty"`
 	CreatedAt        time.Time          `bson:"created_at"`
 	UpdatedAt        time.Time          `bson:"updated_at"`
@@ -113,11 +121,28 @@ func (s *UserStore) Authenticate(ctx context.Context, username, password string)
 	}
 	user, err := s.FindByUsername(ctx, username)
 	if err != nil {
+		// Defense against timing user enumeration (VULN-12): run dummy bcrypt computation
+		_ = bcrypt.CompareHashAndPassword([]byte(dummyBcryptHash), []byte(password))
 		return nil, errors.New("invalid credentials")
 	}
 
 	if user.Status == UserStatusLocked {
-		return nil, errors.New("account locked due to too many failed attempts")
+		if user.LockedUntil != nil && time.Now().UTC().After(*user.LockedUntil) {
+			// Lockout duration expired: auto-unlock account
+			user.Status = UserStatusActive
+			user.FailedLoginCount = 0
+			user.LockedUntil = nil
+			if col := s.users(); col != nil {
+				_, _ = col.UpdateOne(ctx, bson.M{"username": username}, bson.M{"$set": bson.M{
+					"status":             UserStatusActive,
+					"failed_login_count": 0,
+					"locked_until":       nil,
+					"updated_at":         time.Now().UTC(),
+				}})
+			}
+		} else {
+			return nil, errors.New("account locked due to too many failed attempts")
+		}
 	}
 	if user.Status == UserStatusSuspended {
 		return nil, errors.New("account suspended")
@@ -126,13 +151,16 @@ func (s *UserStore) Authenticate(ctx context.Context, username, password string)
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
 		// Increment failure counter and lock if threshold exceeded
 		newCount := user.FailedLoginCount + 1
+		now := time.Now().UTC()
 		update := bson.M{"$set": bson.M{
 			"failed_login_count": newCount,
-			"updated_at":         time.Now().UTC(),
+			"updated_at":         now,
 		}}
 		if newCount >= maxFailedLogins {
+			lockExpiry := now.Add(DefaultLockoutDuration)
 			update["$set"].(bson.M)["status"] = UserStatusLocked
-			log.Printf("[AUTH-STORE] Account locked after %d failed attempts: %s", newCount, username)
+			update["$set"].(bson.M)["locked_until"] = lockExpiry
+			log.Printf("[AUTH-STORE] Account locked after %d failed attempts: %s (until %s)", newCount, username, lockExpiry.Format(time.RFC3339))
 		}
 		if col := s.users(); col != nil {
 			_, _ = col.UpdateOne(ctx, bson.M{"username": username}, update)
@@ -145,6 +173,7 @@ func (s *UserStore) Authenticate(ctx context.Context, username, password string)
 	if col := s.users(); col != nil {
 		_, _ = col.UpdateOne(ctx, bson.M{"username": username}, bson.M{"$set": bson.M{
 			"failed_login_count": 0,
+			"locked_until":       nil,
 			"last_login_at":      now,
 			"updated_at":         now,
 		}})
