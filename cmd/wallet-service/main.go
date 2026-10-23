@@ -2013,6 +2013,7 @@ func dialFXClient(fxAddr string) (*grpc.ClientConn, fxv1.FXServiceClient, error)
 }
 
 func setupWalletGRPCServer(port string) (*grpc.Server, *health.Server, net.Listener, error) {
+	// #nosec G102 -- microservice container listens on configured port across container network interfaces
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to listen on port %s: %w", port, err)

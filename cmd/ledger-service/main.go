@@ -641,6 +641,7 @@ func runLedgerServer(ctx context.Context) error {
 		defer func() { _ = shutdownTracer(context.Background()) }()
 	}
 
+	// #nosec G102 -- microservice container listens on configured port across container network interfaces
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)

@@ -152,6 +152,7 @@ func runAuthServer(ctx context.Context) error {
 	}
 
 	// ── gRPC Server ──────────────────────────────────────────────────────────
+	// #nosec G102 -- microservice container listens on configured port across container network interfaces
 	lis, err := net.Listen("tcp", ":"+cfg.port)
 	if err != nil {
 		return fmt.Errorf("[AUTH-SERVICE] Failed to listen on port %s: %w", cfg.port, err)
