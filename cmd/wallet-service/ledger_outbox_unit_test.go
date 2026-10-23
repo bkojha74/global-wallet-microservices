@@ -381,4 +381,3 @@ func TestLedgerRelay_MaxRetriesHeadOfLineUnblocking(t *testing.T) {
 		t.Fatalf("expected 1 task marked permanently failed, got %d", mockStore.PermanentlyFailedCount())
 	}
 }
-

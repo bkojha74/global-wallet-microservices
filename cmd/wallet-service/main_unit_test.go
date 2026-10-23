@@ -783,4 +783,3 @@ func TestMultiCurrencyTransferBalanceIntegrity(t *testing.T) {
 		t.Fatalf("VULN-02 regression: crediting foreign USD pot must NOT alter EUR base balance")
 	}
 }
-

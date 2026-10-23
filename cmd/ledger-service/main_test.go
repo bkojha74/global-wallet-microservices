@@ -848,4 +848,3 @@ func TestConcurrentRecordTransactionHashChainIntegrityLive(t *testing.T) {
 		t.Fatalf("Trial balance unbalanced under concurrency: %+v", auditResult)
 	}
 }
-
