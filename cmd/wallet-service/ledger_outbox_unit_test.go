@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ type mockLedgerTaskStore struct {
 	tasks         []LedgerTask
 	completedIDs  []primitive.ObjectID
 	failedIDs     []primitive.ObjectID
+	permFailedIDs []primitive.ObjectID
 	findErr       error
 	markCompErr   error
 	markFailedErr error
@@ -53,6 +55,16 @@ func (m *mockLedgerTaskStore) MarkFailed(_ context.Context, id primitive.ObjectI
 	return nil
 }
 
+func (m *mockLedgerTaskStore) MarkPermanentlyFailed(_ context.Context, id primitive.ObjectID, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.markFailedErr != nil {
+		return m.markFailedErr
+	}
+	m.permFailedIDs = append(m.permFailedIDs, id)
+	return nil
+}
+
 func (m *mockLedgerTaskStore) CompletedCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -63,6 +75,12 @@ func (m *mockLedgerTaskStore) FailedCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.failedIDs)
+}
+
+func (m *mockLedgerTaskStore) PermanentlyFailedCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.permFailedIDs)
 }
 
 func TestLedgerRelay_OfflineUnit(t *testing.T) {
@@ -332,3 +350,35 @@ func TestLedgerRelay_CalculateBackoff(t *testing.T) {
 		t.Errorf("Expected pollInterval when maxBackoff <= pollInterval, got %v", b)
 	}
 }
+
+func TestLedgerRelay_MaxRetriesHeadOfLineUnblocking(t *testing.T) {
+	poisonTask := LedgerTask{
+		ID:             primitive.NewObjectID(),
+		IdempotencyKey: "poison-task-1",
+		Retries:        DefaultMaxLedgerTaskRetries - 1, // Will reach max retries on this failure
+	}
+	mockClientFail := &mockLedgerClient{
+		recordErr: fmt.Errorf("ledger hard rejection"),
+	}
+
+	mockStore := &mockLedgerTaskStore{
+		tasks: []LedgerTask{poisonTask},
+	}
+	relay := &LedgerRelay{
+		store:        mockStore,
+		ledgerClient: mockClientFail,
+		batchSize:    10,
+	}
+
+	count, err := relay.ProcessBatch(context.Background())
+	if err == nil {
+		t.Fatalf("expected error from ProcessBatch when task fails")
+	}
+	if count != 0 {
+		t.Fatalf("expected 0 processed count, got %d", count)
+	}
+	if mockStore.PermanentlyFailedCount() != 1 {
+		t.Fatalf("expected 1 task marked permanently failed, got %d", mockStore.PermanentlyFailedCount())
+	}
+}
+

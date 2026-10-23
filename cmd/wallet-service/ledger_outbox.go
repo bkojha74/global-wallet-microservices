@@ -53,10 +53,14 @@ func AppendLedgerTask(sessCtx mongo.SessionContext, col *mongo.Collection, task 
 	return err
 }
 
+// DefaultMaxLedgerTaskRetries defines the maximum delivery attempts before marking an outbox task as permanently failed (VULN-04 fix).
+const DefaultMaxLedgerTaskRetries = 5
+
 type LedgerTaskStore interface {
 	FindPending(ctx context.Context, limit int64) ([]LedgerTask, error)
 	MarkCompleted(ctx context.Context, id primitive.ObjectID, processedAt time.Time) error
 	MarkFailed(ctx context.Context, id primitive.ObjectID, errMsg string) error
+	MarkPermanentlyFailed(ctx context.Context, id primitive.ObjectID, errMsg string) error
 }
 
 type mongoLedgerTaskStore struct {
@@ -108,6 +112,23 @@ func (m *mongoLedgerTaskStore) MarkFailed(ctx context.Context, id primitive.Obje
 		bson.M{
 			"$inc": bson.M{"retries": 1},
 			"$set": bson.M{"error": errMsg},
+		},
+	)
+	return err
+}
+
+func (m *mongoLedgerTaskStore) MarkPermanentlyFailed(ctx context.Context, id primitive.ObjectID, errMsg string) error {
+	if m.col == nil {
+		return nil
+	}
+	_, err := m.col.UpdateOne(ctx,
+		bson.M{"_id": id},
+		bson.M{
+			"$inc": bson.M{"retries": 1},
+			"$set": bson.M{
+				"status": LedgerTaskStatusFailed,
+				"error":  errMsg,
+			},
 		},
 	)
 	return err
@@ -525,7 +546,13 @@ func (r *LedgerRelay) ProcessBatch(ctx context.Context) (int, error) {
 			failedCount++
 			log.Printf("[LEDGER-RELAY] Failed to dispatch task %s (idemp: %s): %s", task.ID.Hex(), task.IdempotencyKey, errMsg)
 
-			_ = r.store.MarkFailed(ctx, task.ID, errMsg)
+			if task.Retries+1 >= DefaultMaxLedgerTaskRetries {
+				log.Printf("[LEDGER-RELAY] Task %s reached maximum retries (%d); marking as FAILED to prevent queue starvation",
+					task.ID.Hex(), DefaultMaxLedgerTaskRetries)
+				_ = r.store.MarkPermanentlyFailed(ctx, task.ID, errMsg)
+			} else {
+				_ = r.store.MarkFailed(ctx, task.ID, errMsg)
+			}
 			continue
 		}
 
