@@ -1,10 +1,8 @@
 # Global Multi-Currency Digital Wallet & Ledger Service
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/Release-v1.6.0_GA-success?logo=github&logoColor=white)](docs/RELEASE_NOTES_v1.6.0.md)
 [![CI/CD Pipeline](https://github.com/bkojha74/global-wallet-microservices/actions/workflows/ci.yml/badge.svg)](https://github.com/bkojha74/global-wallet-microservices/actions/workflows/ci.yml)
-[![Go Version](https://img.shields.io/badge/Go-1.26.10-00ADD8?logo=go&logoColor=white)](https://golang.org)
-[![OpenAPI 3.0](https://img.shields.io/badge/OpenAPI-3.0_Embedded_Swagger-85EA2D?logo=swagger&logoColor=black)](cmd/api-gateway/openapi.json)
+[![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go&logoColor=white)](https://golang.org)
 [![Microservices](https://img.shields.io/badge/Architecture-Event--Driven_Microservices-blueviolet)](README.md#key-architectural-pillars)
 [![Zero-Trust Security](https://img.shields.io/badge/Security-Zero--Trust_mTLS_%26_JWT-success?logo=security&logoColor=white)](SECURITY.md)
 [![gRPC](https://img.shields.io/badge/gRPC-Protobuf_v3-244c5a?logo=grpc&logoColor=white)](https://grpc.io)
@@ -62,9 +60,6 @@ The **Global Multi-Currency Digital Wallet & Ledger Service** is engineered to d
 * **Distributed Outbox Worker Lease**: Atomic leader election lease on MongoDB (`ledger_relay_lease`) via `FindOneAndUpdate` ensuring single-worker active outbox processing and immediate hot-standby failover without database lock contention.
 * **Resilience, Circuit Breaking & Graceful Fallback**: Client-side circuit breaking with `sony/gobreaker` across all microservice network boundaries (API Gateway and Wallet Service) with business-error passthrough, resilient FX stale fallback serving cached rates (`stale_quote: true`), and degraded observability alerts.
 * **Outbox Full-Jitter Exponential Backoff**: Cryptographically secure (`crypto/rand`, OWASP CWE-338 compliant) randomized exponential backoff on consecutive ledger dispatch errors preventing thundering herds.
-* **Embedded OpenAPI 3.0 & Swagger UI**: Zero-dependency interactive API exploration and client SDK generation embedded directly into the API Gateway (`/swagger/`, `/docs`, `/api-docs/openapi.json`) via Go `//go:embed`.
-* **Unified Operator CLI (`walletctl`)**: Standalone cross-platform CLI tool for SREs and developers providing health diagnostics, JWT token generation, regional failover drills, ledger verification, and partner webhook pings.
-* **Cryptographic Merkle Root Ledger Checkpoints**: Binary Merkle Tree (`pkg/merkle`) batch verification over immutable ledger journal entries producing $O(\log N)$ logarithmic inclusion proofs for mathematical regulatory attestation.
 * **Operational Tracing & Observability**: Correlation IDs (`association_id`, `idempotency_key`, `transaction_id`) propagated across gRPC metadata and HTTP headers, with a dedicated Log Query API, Prometheus metrics, and preconfigured Grafana dashboards.
 
 ---
@@ -833,11 +828,10 @@ Both Postman and Bruno test runners validate:
 | [docs/BLOOMRPC_GUIDE.md](docs/BLOOMRPC_GUIDE.md) | Instructions for interacting directly with gRPC microservices using BloomRPC or Postman gRPC client. |
 | [docs/KEYCLOAK_GUIDE.md](docs/KEYCLOAK_GUIDE.md) | Administrator and developer guide for Keycloak OIDC integration, login portals, user/role/client provisioning, and custom scopes. |
 | [docs/CICD_PIPELINE_GUIDE.md](docs/CICD_PIPELINE_GUIDE.md) | Comprehensive CI/CD pipeline implementation guide: quality gates, Docker Hub matrix builds, secret configuration, runner setup, and troubleshooting. |
-| [docs/PILLAR5_DEV_EXPERIENCE_TOOLING_GUIDE.md](docs/PILLAR5_DEV_EXPERIENCE_TOOLING_GUIDE.md) | Technical reference for Pillar 5: Embedded OpenAPI 3.0 & Swagger UI, unified `walletctl` CLI utility, and Merkle root ledger checkpoints. |
-| [docs/RELEASE_NOTES_v1.6.0.md](docs/RELEASE_NOTES_v1.6.0.md) | Comprehensive General Availability (GA) release notes for Release v1.6.0. |
 | [.github/workflows/ci.yml](.github/workflows/ci.yml) | Automated GitHub Actions CI/CD pipeline: Protobuf verification, Go formatting/race test quality gates, Docker Hub matrix builds, and self-hosted deployment. |
 | [postman/](postman/) | Automated 28-test integration collection, environment, and BloomRPC JSON presets. |
 | [SECURITY.md](SECURITY.md) | Security policy, vulnerability reporting guidelines, and development boundaries. |
+| [docs/SECURITY_VULNERABILITIES_AND_LOOPHOLES.md](docs/SECURITY_VULNERABILITIES_AND_LOOPHOLES.md) | Prioritized catalog of 15 security vulnerabilities, financial bugs, and architectural loopholes with implementation fixes. |
 | [docs/AI_DEMO_GUIDE.md](docs/AI_DEMO_GUIDE.md) | Operations and integration guide for the Gemini AI Fraud Detection engine, including payload schemas and testing procedures. |
 
 

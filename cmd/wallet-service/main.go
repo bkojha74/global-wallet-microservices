@@ -348,6 +348,8 @@ type transferExecutionState struct {
 	exchangeRate    float64
 	fxQuoteID       string
 	isCrossCurrency bool
+	srcWallet       WalletModel
+	dstWallet       WalletModel
 }
 
 var fallbackBaselineUSDRates = map[string]float64{
@@ -602,6 +604,7 @@ func (s *server) validateWalletsOperational(sessCtx mongo.SessionContext, wallet
 		}
 		return err
 	}
+	state.srcWallet = srcWallet
 	if msg, err := checkWalletStatus(srcWallet, "source"); err != nil {
 		state.txnStatus = walletv1.TransferFundsResponse_INTERNAL_ERROR
 		state.txnErrMsg = msg
@@ -625,6 +628,7 @@ func (s *server) validateWalletsOperational(sessCtx mongo.SessionContext, wallet
 		}
 		return err
 	}
+	state.dstWallet = dstWallet
 	if msg, err := checkWalletStatus(dstWallet, "destination"); err != nil {
 		state.txnStatus = walletv1.TransferFundsResponse_INTERNAL_ERROR
 		state.txnErrMsg = msg
@@ -646,6 +650,14 @@ func (s *server) executeDebitAndCredit(sessCtx mongo.SessionContext, ctx context
 	srcCurr := db.NormalizeCurrency(req.Amount.Currency)
 	dstCurr := db.NormalizeCurrency(destCurrency)
 
+	// Ensure source and dest wallet models are populated for currency comparison
+	if state.srcWallet.Currency == "" {
+		_ = walletsCol.FindOne(sessCtx, bson.M{"_id": req.SourceWalletId}).Decode(&state.srcWallet)
+	}
+	if state.dstWallet.Currency == "" {
+		_ = walletsCol.FindOne(sessCtx, bson.M{"_id": req.DestinationWalletId}).Decode(&state.dstWallet)
+	}
+
 	filterSource := bson.M{
 		"_id": req.SourceWalletId,
 		"$or": []bson.M{
@@ -653,11 +665,15 @@ func (s *server) executeDebitAndCredit(sessCtx mongo.SessionContext, ctx context
 			{"currency": srcCurr, "balance": bson.M{"$gte": req.Amount.Units}},
 		},
 	}
+	incSource := bson.M{
+		"balances." + srcCurr: -req.Amount.Units,
+	}
+	// Only alter base balance if the debited currency matches the wallet's primary currency (VULN-02 fix)
+	if srcCurr == state.srcWallet.Currency {
+		incSource["balance"] = -req.Amount.Units
+	}
 	updateSource := bson.M{
-		"$inc": bson.M{
-			"balance":             -req.Amount.Units,
-			"balances." + srcCurr: -req.Amount.Units,
-		},
+		"$inc": incSource,
 		"$set": bson.M{"updated_at": time.Now().UTC().Format(time.RFC3339)},
 	}
 	resSource, err := walletsCol.UpdateOne(sessCtx, filterSource, updateSource)
@@ -699,15 +715,28 @@ func (s *server) executeDebitAndCredit(sessCtx mongo.SessionContext, ctx context
 		}
 	}
 
+	// If recipient does not share primary currency and FX was not invoked, only allow if recipient holds an active multi-currency pot
+	if dstCurr != state.dstWallet.Currency && !state.isCrossCurrency {
+		if state.dstWallet.Balances == nil || state.dstWallet.Balances[dstCurr] <= 0 {
+			state.txnStatus = walletv1.TransferFundsResponse_INTERNAL_ERROR
+			state.txnErrMsg = "Destination wallet not found or currency mismatch"
+			return fmt.Errorf("currency mismatch")
+		}
+	}
+
+	// Crediting recipient: allow any supported currency into multi-currency balances map
 	filterDest := bson.M{
-		"_id":      req.DestinationWalletId,
-		"currency": destCurrency,
+		"_id": req.DestinationWalletId,
+	}
+	incDest := bson.M{
+		"balances." + dstCurr: destUnits,
+	}
+	// Only alter base balance if the credited currency matches the recipient's primary currency (VULN-02 fix)
+	if dstCurr == state.dstWallet.Currency {
+		incDest["balance"] = destUnits
 	}
 	updateDest := bson.M{
-		"$inc": bson.M{
-			"balance":             destUnits,
-			"balances." + dstCurr: destUnits,
-		},
+		"$inc": incDest,
 		"$set": bson.M{"updated_at": time.Now().UTC().Format(time.RFC3339)},
 	}
 	resDest, err := walletsCol.UpdateOne(sessCtx, filterDest, updateDest)

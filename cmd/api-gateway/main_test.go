@@ -936,7 +936,19 @@ func TestGatewayAuthEndpoints(t *testing.T) {
 		t.Fatalf("expected 200, got %d", recOutSuccess.Code)
 	}
 
-	// 12. handleAuthToken - Method Not Allowed
+	// 12. handleAuthToken - Disabled by default (VULN-01 fix)
+	t.Setenv("ENABLE_DEV_TOKEN_ENDPOINT", "")
+	reqTokenDisabled := httptest.NewRequest(http.MethodPost, "/api/v1/auth/token", nil)
+	recTokenDisabled := httptest.NewRecorder()
+	gw.handleAuthToken(recTokenDisabled, reqTokenDisabled)
+	if recTokenDisabled.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when ENABLE_DEV_TOKEN_ENDPOINT is unset, got %d", recTokenDisabled.Code)
+	}
+
+	// Enable for dev test verification
+	t.Setenv("ENABLE_DEV_TOKEN_ENDPOINT", "true")
+
+	// handleAuthToken - Method Not Allowed
 	reqTokenDel := httptest.NewRequest(http.MethodDelete, "/api/v1/auth/token", nil)
 	recTokenDel := httptest.NewRecorder()
 	gw.handleAuthToken(recTokenDel, reqTokenDel)

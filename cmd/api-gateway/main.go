@@ -1631,11 +1631,16 @@ func buildAuthTokenClaims(sub, role, scope string) (auth.Claims, []string, []str
 	}, roles, scopes
 }
 
-// handleAuthToken provides backward-compatible token minting (/api/v1/auth/token)
-// supporting legacy Bruno/Postman collections and rapid development testing.
+// handleAuthToken provides development-only token minting (/api/v1/auth/token).
+// In production, this endpoint is strictly disabled (VULN-01 fix); clients must use /api/v1/auth/login.
 func (g *Gateway) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	if os.Getenv("ENABLE_DEV_TOKEN_ENDPOINT") != "true" {
+		writeAuthError(w, http.StatusForbidden, "Token minting endpoint /api/v1/auth/token is disabled. Set ENABLE_DEV_TOKEN_ENDPOINT=true in development or use /api/v1/auth/login.")
 		return
 	}
 
@@ -2054,7 +2059,6 @@ func wrapGatewayMiddleware(handler http.Handler, authClient authv1.AuthServiceCl
 		"/api-docs/openapi.json":            true,
 		"/api/v1/auth/login":                true,
 		"/api/v1/auth/refresh":              true,
-		"/api/v1/auth/token":                true,
 		"/api/v1/cluster/status":            true,
 		"/api/v1/ledger/merkle":             true,
 		"/api/v1/ledger/merkle/latest":      true,
@@ -2062,6 +2066,10 @@ func wrapGatewayMiddleware(handler http.Handler, authClient authv1.AuthServiceCl
 		"/api/v1/ledger/merkle/proof":       true,
 		"/api/v1/fx/currencies":             true,
 		"/api/v1/fx/rates":                  true,
+	}
+
+	if os.Getenv("ENABLE_DEV_TOKEN_ENDPOINT") == "true" {
+		publicPaths["/api/v1/auth/token"] = true
 	}
 
 	cacheFingerprintSecret := os.Getenv("CACHE_FINGERPRINT_SECRET")

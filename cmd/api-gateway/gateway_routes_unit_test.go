@@ -227,6 +227,7 @@ func TestGatewayRouteValidationBranches(t *testing.T) {
 	}
 
 	// 1. handleAuthToken with POST body
+	t.Setenv("ENABLE_DEV_TOKEN_ENDPOINT", "true")
 	bodyAuth := `{"subject":"bob","roles":["admin"],"scopes":["read"]}`
 	reqAuth := httptest.NewRequest(http.MethodPost, "/api/v1/auth/token", bytes.NewBufferString(bodyAuth))
 	wAuth := httptest.NewRecorder()
