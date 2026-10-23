@@ -65,13 +65,30 @@ func TestNewTree_EdgeCases(t *testing.T) {
 			t.Fatal("expected non-empty root hash")
 		}
 
-		// Leaf 3 should be paired with itself at level 1
+		// Leaf 3 should be promoted directly without duplicate leaf collision (CVE-2012-2459)
 		p01 := HashPair(hashes[0], hashes[1])
-		p22 := HashPair(hashes[2], hashes[2])
-		expectedRoot := HashPair(p01, p22)
+		expectedRoot := HashPair(p01, hashes[2])
 
 		if tree.RootHash() != expectedRoot {
 			t.Fatalf("expected root %s, got %s", expectedRoot, tree.RootHash())
+		}
+	})
+
+	t.Run("prevent duplicate leaf collision CVE-2012-2459", func(t *testing.T) {
+		hashes3 := generateTestHashes(3)
+		hashes4 := []string{hashes3[0], hashes3[1], hashes3[2], hashes3[2]}
+
+		tree3, err := NewTree(hashes3)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		tree4, err := NewTree(hashes4)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if tree3.RootHash() == tree4.RootHash() {
+			t.Fatalf("vulnerable to CVE-2012-2459: tree with 3 leaves and tree with duplicated 4th leaf produced identical root: %s", tree3.RootHash())
 		}
 	})
 }

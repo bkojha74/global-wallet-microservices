@@ -42,21 +42,30 @@ type Tree struct {
 	Leaves []*Node
 }
 
-// HashPair computes the SHA-256 digest over the concatenation of two hexadecimal child hashes.
+// HashPair computes the SHA-256 digest over the concatenation of two hexadecimal child hashes,
+// using the RFC 6962 internal node domain separator (0x01) to prevent second-preimage attacks.
 func HashPair(leftHex, rightHex string) string {
-	combined := leftHex + rightHex
-	digest := sha256.Sum256([]byte(combined))
-	return hex.EncodeToString(digest[:])
+	h := sha256.New()
+	h.Write([]byte{0x01})
+	h.Write([]byte(leftHex))
+	h.Write([]byte(rightHex))
+	digest := h.Sum(nil)
+	return hex.EncodeToString(digest)
 }
 
-// HashLeaf computes the SHA-256 digest of raw data to form a leaf hash.
+// HashLeaf computes the SHA-256 digest of raw data to form a leaf hash,
+// using the RFC 6962 leaf domain separator (0x00).
 func HashLeaf(data []byte) string {
-	digest := sha256.Sum256(data)
-	return hex.EncodeToString(digest[:])
+	h := sha256.New()
+	h.Write([]byte{0x00})
+	h.Write(data)
+	digest := h.Sum(nil)
+	return hex.EncodeToString(digest)
 }
 
 // NewTree constructs a binary Merkle tree from a slice of leaf hashes.
-// If an odd number of nodes exists at any level, the last node is duplicated to maintain balance.
+// If an odd number of nodes exists at any level, the odd node is promoted directly
+// to the next level without duplication, preventing Bitcoin CVE-2012-2459 collision flaws.
 func NewTree(leafHashes []string) (*Tree, error) {
 	if len(leafHashes) == 0 {
 		return nil, ErrEmptyTree
@@ -78,28 +87,23 @@ func NewTree(leafHashes []string) (*Tree, error) {
 	currentLevel := leaves
 	for len(currentLevel) > 1 {
 		var nextLevel []*Node
+		numNodes := len(currentLevel)
 
-		// If odd number of nodes at this level, duplicate the last node
-		if len(currentLevel)%2 != 0 {
-			lastNode := currentLevel[len(currentLevel)-1]
-			dupNode := &Node{
-				Hash:  lastNode.Hash,
-				Left:  lastNode.Left,
-				Right: lastNode.Right,
+		for i := 0; i < numNodes; i += 2 {
+			if i+1 < numNodes {
+				left := currentLevel[i]
+				right := currentLevel[i+1]
+				parentHash := HashPair(left.Hash, right.Hash)
+				parentNode := &Node{
+					Hash:  parentHash,
+					Left:  left,
+					Right: right,
+				}
+				nextLevel = append(nextLevel, parentNode)
+			} else {
+				// Promote odd node directly to the next level without duplication
+				nextLevel = append(nextLevel, currentLevel[i])
 			}
-			currentLevel = append(currentLevel, dupNode)
-		}
-
-		for i := 0; i < len(currentLevel); i += 2 {
-			left := currentLevel[i]
-			right := currentLevel[i+1]
-			parentHash := HashPair(left.Hash, right.Hash)
-			parentNode := &Node{
-				Hash:  parentHash,
-				Left:  left,
-				Right: right,
-			}
-			nextLevel = append(nextLevel, parentNode)
 		}
 
 		currentLevel = nextLevel

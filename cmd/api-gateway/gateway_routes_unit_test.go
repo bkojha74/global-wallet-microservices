@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"wallet-system/pkg/auth"
 	"wallet-system/pkg/coordinator"
 	"wallet-system/pkg/webhook"
 	walletv1 "wallet-system/proto/wallet"
@@ -227,6 +228,7 @@ func TestGatewayRouteValidationBranches(t *testing.T) {
 	}
 
 	// 1. handleAuthToken with POST body
+	t.Setenv("ENABLE_DEV_TOKEN_ENDPOINT", "true")
 	bodyAuth := `{"subject":"bob","roles":["admin"],"scopes":["read"]}`
 	reqAuth := httptest.NewRequest(http.MethodPost, "/api/v1/auth/token", bytes.NewBufferString(bodyAuth))
 	wAuth := httptest.NewRecorder()
@@ -389,13 +391,47 @@ func TestHandleUpdateWalletKYC_Routes(t *testing.T) {
 		t.Fatalf("expected 400 for missing wallet_id, got %d", wNoWallet.Code)
 	}
 
-	// 3. Success (200)
-	bodySuccess := bytes.NewBufferString(`{"wallet_id":"alice","kyc_tier":"TIER_2"}`)
-	reqSuccess := httptest.NewRequest(http.MethodPut, "/api/v1/wallets/kyc", bodySuccess)
-	wSuccess := httptest.NewRecorder()
-	gw.handleUpdateWalletKYC(wSuccess, reqSuccess)
-	if wSuccess.Code != http.StatusOK {
-		t.Fatalf("expected 200 for successful KYC update, got %d (%s)", wSuccess.Code, wSuccess.Body.String())
+	// 3. User without admin role or scope rejected with 403 Forbidden (VULN-05)
+	bodyUser := bytes.NewBufferString(`{"wallet_id":"alice","kyc_tier":"TIER_3"}`)
+	reqUser := httptest.NewRequest(http.MethodPut, "/api/v1/wallets/kyc", bodyUser)
+	userClaims := &auth.Claims{
+		Subject: "alice",
+		Roles:   []string{auth.RoleUser},
+	}
+	reqUser = reqUser.WithContext(ContextWithClaims(reqUser.Context(), userClaims))
+	wUser := httptest.NewRecorder()
+	gw.handleUpdateWalletKYC(wUser, reqUser)
+	if wUser.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-admin KYC upgrade, got %d", wUser.Code)
+	}
+
+	// 4. Admin role accepted (200)
+	bodyAdmin := bytes.NewBufferString(`{"wallet_id":"alice","kyc_tier":"TIER_3"}`)
+	reqAdmin := httptest.NewRequest(http.MethodPut, "/api/v1/wallets/kyc", bodyAdmin)
+	adminClaims := &auth.Claims{
+		Subject: "admin-user",
+		Roles:   []string{auth.RoleAdmin},
+	}
+	reqAdmin = reqAdmin.WithContext(ContextWithClaims(reqAdmin.Context(), adminClaims))
+	wAdmin := httptest.NewRecorder()
+	gw.handleUpdateWalletKYC(wAdmin, reqAdmin)
+	if wAdmin.Code != http.StatusOK {
+		t.Fatalf("expected 200 for admin KYC update, got %d (%s)", wAdmin.Code, wAdmin.Body.String())
+	}
+
+	// 5. Compliance officer with wallet:kyc:admin scope accepted (200)
+	bodyScope := bytes.NewBufferString(`{"wallet_id":"alice","kyc_tier":"TIER_2"}`)
+	reqScope := httptest.NewRequest(http.MethodPut, "/api/v1/wallets/kyc", bodyScope)
+	scopeClaims := &auth.Claims{
+		Subject: "compliance-officer",
+		Roles:   []string{auth.RoleUser},
+		Scopes:  []string{"wallet:kyc:admin"},
+	}
+	reqScope = reqScope.WithContext(ContextWithClaims(reqScope.Context(), scopeClaims))
+	wScope := httptest.NewRecorder()
+	gw.handleUpdateWalletKYC(wScope, reqScope)
+	if wScope.Code != http.StatusOK {
+		t.Fatalf("expected 200 for scoped KYC update, got %d (%s)", wScope.Code, wScope.Body.String())
 	}
 }
 
@@ -565,7 +601,16 @@ func TestHandleWebhookSubscriptions(t *testing.T) {
 		t.Fatalf("expected 400 for bad URL, got %d", wBadURL.Code)
 	}
 
+	// 3b. POST with SSRF restricted loopback / metadata URL (VULN-06)
+	reqSSRF := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/subscriptions", bytes.NewBufferString(`{"target_url":"http://169.254.169.254/latest/meta-data/"}`))
+	wSSRF := httptest.NewRecorder()
+	gw.handleWebhookSubscriptions(wSSRF, reqSSRF)
+	if wSSRF.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for SSRF metadata URL, got %d", wSSRF.Code)
+	}
+
 	// 4. POST successful subscription creation
+	t.Setenv("ALLOW_LOCAL_WEBHOOKS", "true")
 	reqCreate := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/subscriptions", bytes.NewBufferString(`{"target_url":"https://partner.example.com/webhook","events":["transfer.completed","fraud.flagged"]}`))
 	wCreate := httptest.NewRecorder()
 	gw.handleWebhookSubscriptions(wCreate, reqCreate)
@@ -640,7 +685,17 @@ func TestHandleWebhookTest(t *testing.T) {
 		t.Fatalf("expected 400 for invalid url, got %d", wBadURL.Code)
 	}
 
-	// 4. Ping test endpoint success
+	// 3b. SSRF restricted loopback URL rejected without ALLOW_LOCAL_WEBHOOKS (VULN-06)
+	bodyBlocked := bytes.NewBufferString(`{"target_url":"` + mockServer.URL + `","secret":"sec_test123"}`)
+	reqBlocked := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/test", bodyBlocked)
+	wBlocked := httptest.NewRecorder()
+	gw.handleWebhookTest(wBlocked, reqBlocked)
+	if wBlocked.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for SSRF target without ALLOW_LOCAL_WEBHOOKS, got %d", wBlocked.Code)
+	}
+
+	// 4. Ping test endpoint success with ALLOW_LOCAL_WEBHOOKS=true
+	t.Setenv("ALLOW_LOCAL_WEBHOOKS", "true")
 	bodyPing := bytes.NewBufferString(`{"target_url":"` + mockServer.URL + `","secret":"sec_test123"}`)
 	reqPing := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/test", bodyPing)
 	wPing := httptest.NewRecorder()

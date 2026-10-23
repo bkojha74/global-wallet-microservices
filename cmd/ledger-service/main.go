@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -35,10 +36,23 @@ import (
 type server struct {
 	ledgerv1.UnimplementedLedgerServiceServer
 	mongoClient *mongo.Client
+	dbName      string
 	region      string
 	logger      observability.Logger
 	// Phase 5 (GAP-10): outbox for ledger AUDIT events.
 	outbox *observability.MongoOutbox // nil when outbox is disabled
+	seqMu  sync.Mutex                 // VULN-03: Serializes sequence number assignment & hash chaining per instance
+}
+
+func (s *server) db() *mongo.Database {
+	if s.mongoClient == nil {
+		return nil
+	}
+	name := s.dbName
+	if name == "" {
+		name = "banking_db"
+	}
+	return s.mongoClient.Database(name)
 }
 
 func (s *server) emit(ctx context.Context, eventType, level, message string, attributes map[string]any) {
@@ -177,10 +191,10 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 		}
 	}
 
-	if s.mongoClient == nil {
+	if s.db() == nil {
 		return nil, status.Errorf(codes.Unavailable, "database unavailable")
 	}
-	col := s.mongoClient.Database("banking_db").Collection("ledger_entries")
+	col := s.db().Collection("ledger_entries")
 
 	// Idempotency check: if entry exists, return it
 	if resp, isDup := s.checkDuplicateTransaction(ctx, col, req.IdempotencyKey, startTime); isDup {
@@ -205,33 +219,70 @@ func (s *server) RecordTransaction(ctx context.Context, req *ledgerv1.RecordTran
 		return nil, status.Errorf(codes.InvalidArgument, "double-entry validation failed: %v", postErr)
 	}
 
-	// Cryptographic Hash Chaining (GAP-FIN-02): find the previous entry
-	seqNumber, prevHash := s.getPreviousSequenceAndHash(ctx, col)
-	now := time.Now().UTC()
-	entryHash := ComputeEntryHash(prevHash, seqNumber, docID.Hex(), req.IdempotencyKey, now, postings)
+	// Cryptographic Hash Chaining (GAP-FIN-02 & VULN-03):
+	// Concurrency-safe sequence assignment and hash chaining with optimistic retry loop
+	const maxInsertRetries = 5
+	var doc LedgerDocument
+	var insertErr error
 
-	doc := LedgerDocument{
-		ID:                  docID,
-		SequenceNumber:      seqNumber,
-		IdempotencyKey:      req.IdempotencyKey,
-		SourceWalletID:      req.SourceWalletId,
-		DestinationWalletID: req.DestinationWalletId,
-		Amount:              req.Amount,
-		Currency:            req.Currency,
-		DestinationAmount:   req.DestinationAmount,
-		DestinationCurrency: req.DestinationCurrency,
-		ExchangeRate:        req.ExchangeRate,
-		FXQuoteID:           req.FxQuoteId,
-		Region:              s.region,
-		Timestamp:           now,
-		Postings:            postings,
-		PreviousHash:        prevHash,
-		EntryHash:           entryHash,
+	for attempt := 0; attempt < maxInsertRetries; attempt++ {
+		s.seqMu.Lock()
+		seqNumber, prevHash := s.getPreviousSequenceAndHash(ctx, col)
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		entryHash := ComputeEntryHash(prevHash, seqNumber, docID.Hex(), req.IdempotencyKey, now, postings)
+
+		doc = LedgerDocument{
+			ID:                  docID,
+			SequenceNumber:      seqNumber,
+			IdempotencyKey:      req.IdempotencyKey,
+			SourceWalletID:      req.SourceWalletId,
+			DestinationWalletID: req.DestinationWalletId,
+			Amount:              req.Amount,
+			Currency:            req.Currency,
+			DestinationAmount:   req.DestinationAmount,
+			DestinationCurrency: req.DestinationCurrency,
+			ExchangeRate:        req.ExchangeRate,
+			FXQuoteID:           req.FxQuoteId,
+			Region:              s.region,
+			Timestamp:           now,
+			Postings:            postings,
+			PreviousHash:        prevHash,
+			EntryHash:           entryHash,
+		}
+
+		_, err := col.InsertOne(ctx, doc)
+		s.seqMu.Unlock()
+
+		if err == nil {
+			insertErr = nil
+			break
+		}
+
+		if mongo.IsDuplicateKeyError(err) {
+			// 1. If duplicate idempotency_key, transaction was already recorded (idempotent replay)
+			var dupDoc LedgerDocument
+			if findErr := col.FindOne(ctx, bson.M{"idempotency_key": req.IdempotencyKey}).Decode(&dupDoc); findErr == nil {
+				durationMS := time.Since(startTime).Milliseconds()
+				s.emitTerminal(ctx, "ledger.transaction.duplicate", observability.LevelInfo, "Duplicate ledger transaction detected", durationMS, true, map[string]any{"transaction_id": dupDoc.ID.Hex()})
+				return &ledgerv1.RecordTransactionResponse{
+					TransactionId: dupDoc.ID.Hex(),
+					Success:       true,
+				}, nil
+			}
+
+			// 2. Duplicate is on sequence_number due to multi-pod concurrent insertion: retry with new sequence & hash
+			log.Printf("[LEDGER] Sequence number %d collision detected on attempt %d/%d, retrying with latest head...", seqNumber, attempt+1, maxInsertRetries)
+			insertErr = err
+			time.Sleep(time.Duration(15*(attempt+1)) * time.Millisecond)
+			continue
+		}
+
+		// Non-duplicate insertion failure
+		return s.handleInsertError(ctx, col, req, err, startTime)
 	}
 
-	_, err := col.InsertOne(ctx, doc)
-	if err != nil {
-		return s.handleInsertError(ctx, col, req, err, startTime)
+	if insertErr != nil {
+		return s.handleInsertError(ctx, col, req, insertErr, startTime)
 	}
 
 	durationMS := time.Since(startTime).Milliseconds()
@@ -329,10 +380,10 @@ func (s *server) GetLedgerEntries(ctx context.Context, req *ledgerv1.GetLedgerRe
 		return nil, status.Errorf(codes.InvalidArgument, "wallet_id is required")
 	}
 
-	if s.mongoClient == nil {
+	if s.db() == nil {
 		return nil, status.Errorf(codes.Unavailable, "database unavailable")
 	}
-	col := s.mongoClient.Database("banking_db").Collection("ledger_entries")
+	col := s.db().Collection("ledger_entries")
 	filter := bson.M{
 		"$or": []bson.M{
 			{"source_wallet_id": req.WalletId},
@@ -590,6 +641,7 @@ func runLedgerServer(ctx context.Context) error {
 		defer func() { _ = shutdownTracer(context.Background()) }()
 	}
 
+	// #nosec G102 -- microservice container listens on configured port across container network interfaces
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)

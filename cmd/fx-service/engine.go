@@ -589,14 +589,39 @@ func (e *FXEngine) ConvertCurrency(ctx context.Context, req *fxv1.ConvertCurrenc
 			return nil, fmt.Errorf("quote source_amount mismatch: quote=%d request=%d", qDoc.SourceAmount, req.SourceAmount)
 		}
 
-		// Mark quote as EXECUTED
-		qDoc.Status = QuoteStatusExecuted
-		e.mu.Lock()
-		e.quotesMem[quoteID] = qDoc
-		e.mu.Unlock()
+		// Atomic CAS execution in DB (if backed by MongoDB)
 		if e.fxDB != nil {
-			_, _ = e.fxDB.Collection("fx_quotes").UpdateOne(ctx, bson.M{"_id": quoteID}, bson.M{"$set": bson.M{"status": QuoteStatusExecuted}})
+			now := time.Now().UTC()
+			res, err := e.fxDB.Collection("fx_quotes").UpdateOne(ctx,
+				bson.M{"_id": quoteID, "status": QuoteStatusActive, "expires_at": bson.M{"$gt": now}},
+				bson.M{"$set": bson.M{"status": QuoteStatusExecuted, "updated_at": now}},
+			)
+			if err != nil {
+				return nil, fmt.Errorf("failed to execute quote %s: %w", quoteID, err)
+			}
+			if res.MatchedCount == 0 {
+				return nil, fmt.Errorf("quote %s is expired or already executed", quoteID)
+			}
 		}
+
+		// Atomic CAS in memory cache
+		e.mu.Lock()
+		if memDoc, ok := e.quotesMem[quoteID]; ok {
+			if memDoc.Status == QuoteStatusExecuted {
+				e.mu.Unlock()
+				return nil, fmt.Errorf("quote %s has already been executed", quoteID)
+			}
+			if memDoc.Status == QuoteStatusExpired || time.Now().UTC().After(memDoc.ExpiresAt) {
+				e.mu.Unlock()
+				return nil, fmt.Errorf("quote %s has expired", quoteID)
+			}
+			memDoc.Status = QuoteStatusExecuted
+			e.quotesMem[quoteID] = memDoc
+		} else {
+			qDoc.Status = QuoteStatusExecuted
+			e.quotesMem[quoteID] = qDoc
+		}
+		e.mu.Unlock()
 
 		base = qDoc.BaseCurrency
 		target = qDoc.TargetCurrency

@@ -96,6 +96,7 @@ func TestSubscriptionEventMatching(t *testing.T) {
 }
 
 func TestDispatcherSendAndVerifyWithHTTPServer(t *testing.T) {
+	t.Setenv("ALLOW_LOCAL_WEBHOOKS", "true")
 	var receivedHeader string
 	var receivedEvent string
 	var receivedDelivery string
@@ -188,6 +189,34 @@ func TestRegisterSubscriptionValidation(t *testing.T) {
 	}
 	if sub.Secret == "" || !sub.IsActive {
 		t.Errorf("expected auto-generated secret and active status")
+	}
+}
+
+func TestValidateWebhookURL_SSRF(t *testing.T) {
+	// Blocked targets
+	blockedURLs := []string{
+		"http://127.0.0.1:8080/callback",
+		"http://127.0.0.1/admin",
+		"http://localhost:9090",
+		"http://169.254.169.254/latest/meta-data/",
+		"http://10.0.0.1/internal",
+		"http://172.16.0.5/api",
+		"http://192.168.1.100:8080/webhook",
+		"ftp://evil.com/webhook",
+		"",
+		"http://0.0.0.0:8080",
+	}
+
+	for _, u := range blockedURLs {
+		if err := ValidateWebhookURL(u); err == nil {
+			t.Errorf("expected ValidateWebhookURL to reject SSRF target %q, but got nil", u)
+		}
+	}
+
+	// Allowed when ALLOW_LOCAL_WEBHOOKS=true
+	t.Setenv("ALLOW_LOCAL_WEBHOOKS", "true")
+	if err := ValidateWebhookURL("http://127.0.0.1:8080/callback"); err != nil {
+		t.Errorf("expected loopback to be allowed when ALLOW_LOCAL_WEBHOOKS=true, got %v", err)
 	}
 }
 

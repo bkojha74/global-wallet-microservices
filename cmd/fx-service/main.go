@@ -363,6 +363,7 @@ func runFXServer(ctx context.Context) error {
 	}
 
 	// 1. Setup gRPC Server (:50055)
+	// #nosec G102 -- microservice container listens on configured port across container network interfaces
 	lis, err := net.Listen("tcp", ":"+cfg.grpcPort)
 	if err != nil {
 		return fmt.Errorf("failed to listen on gRPC port %s: %w", cfg.grpcPort, err)

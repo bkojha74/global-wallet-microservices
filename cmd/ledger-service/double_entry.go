@@ -232,7 +232,7 @@ func ComputeEntryHash(previousHash string, sequenceNumber int64, txID, idempKey 
 		sequenceNumber,
 		txID,
 		idempKey,
-		ts.UTC().UnixNano(),
+		ts.UTC().Truncate(time.Millisecond).UnixNano(),
 		string(postingsBytes),
 	)
 

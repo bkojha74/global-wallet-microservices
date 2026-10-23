@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -243,16 +244,52 @@ func RateLimitMiddleware(limiter *RateLimiter, next http.Handler) http.Handler {
 	})
 }
 
+// isTrustedProxy checks if the immediate connection IP originates from a trusted reverse proxy,
+// loopback, or configured CIDR before trusting client-supplied forwarding headers.
+func isTrustedProxy(remoteIP string) bool {
+	if os.Getenv("TRUST_PROXY") == "true" {
+		return true
+	}
+	trustedProxiesEnv := os.Getenv("TRUSTED_PROXIES")
+	if trustedProxiesEnv != "" {
+		for _, item := range strings.Split(trustedProxiesEnv, ",") {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			if _, ipNet, err := net.ParseCIDR(item); err == nil {
+				if parsed := net.ParseIP(remoteIP); parsed != nil && ipNet.Contains(parsed) {
+					return true
+				}
+			} else if item == remoteIP {
+				return true
+			}
+		}
+		return false
+	}
+	ip := net.ParseIP(remoteIP)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback()
+}
+
 func extractClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
-	}
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		remoteIP = r.RemoteAddr
 	}
-	return ip
+
+	if isTrustedProxy(remoteIP) {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			clientIP := strings.TrimSpace(parts[0])
+			if net.ParseIP(clientIP) != nil {
+				return clientIP
+			}
+		}
+	}
+	return remoteIP
 }
 
 // AuthMiddleware validates JWT Bearer tokens by delegating to the auth-service via gRPC.
