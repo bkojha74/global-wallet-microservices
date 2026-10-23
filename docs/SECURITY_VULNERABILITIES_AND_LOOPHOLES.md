@@ -570,18 +570,18 @@ Populate the missing historical context from `wallet_velocity_records` before in
 
 | ID | Issue | Target Component | Status | Est. Effort |
 |---|---|---|---|---|
-| **#1** | Disable `/api/v1/auth/token` backdoor | `cmd/api-gateway/main.go` | Planned | 0.5 Day |
-| **#2** | Fix transfer multi-currency balance debit & filter | `cmd/wallet-service/main.go` | Planned | 1 Day |
-| **#3** | Implement atomic sequence generator for ledger | `cmd/ledger-service/main.go` | Planned | 1.5 Days |
-| **#4** | Add DLQ and max retries to outbox relay | `cmd/wallet-service/ledger_outbox.go` | Planned | 1 Day |
-| **#5** | Require Admin role for KYC tier updates | `cmd/api-gateway/main.go` | Planned | 0.5 Day |
-| **#6** | Add private IP/DNS validation for webhooks | `pkg/webhook/dispatcher.go` | Planned | 1 Day |
-| **#7** | Restrict internal gRPC container ports & add auth | `docker-compose.yml`, `cmd/wallet-service` | Planned | 1 Day |
-| **#8** | Implement atomic CAS for FX quote execution | `cmd/fx-service/engine.go` | Planned | 0.5 Day |
+| **#1** | Disable `/api/v1/auth/token` backdoor | `cmd/api-gateway/main.go` | **Resolved** | 0.5 Day |
+| **#2** | Fix transfer multi-currency balance debit & filter | `cmd/wallet-service/main.go` | **Resolved** | 1 Day |
+| **#3** | Implement atomic sequence generator for ledger | `cmd/ledger-service/main.go` | **Resolved** | 1.5 Days |
+| **#4** | Add DLQ and max retries to outbox relay | `cmd/wallet-service/ledger_outbox.go` | **Resolved** | 1 Day |
+| **#5** | Require Admin role for KYC tier updates | `cmd/api-gateway/main.go` | **Resolved** | 0.5 Day |
+| **#6** | Add private IP/DNS validation for webhooks | `pkg/webhook/dispatcher.go` | **Resolved** | 1 Day |
+| **#7** | Restrict internal gRPC container ports & add auth | `docker-compose.yml`, `cmd/wallet-service` | **Resolved** | 1 Day |
+| **#8** | Implement atomic CAS for FX quote execution | `cmd/fx-service/engine.go` | **Resolved** | 0.5 Day |
 | **#9** | Validate trusted proxies for `X-Forwarded-For` | `cmd/api-gateway/middleware.go` | Planned | 0.5 Day |
 | **#10** | Require client idempotency keys on mutations | `cmd/api-gateway/main.go` | Planned | 0.5 Day |
-| **#11** | Fail-closed on coordinator network errors | `cmd/wallet-service/main.go` | Planned | 0.5 Day |
+| **#11** | Fail-closed on coordinator network errors | `cmd/wallet-service/main.go` | **Resolved** | 0.5 Day |
 | **#12** | Normalize auth timing & add temporary lock expiration | `cmd/auth-service/user_store.go` | Planned | 0.5 Day |
 | **#13** | Fix Merkle duplicate odd leaves & add domain prefix | `pkg/merkle/tree.go` | Planned | 0.5 Day |
-| **#14** | Expand currency velocity rate conversion catalog | `cmd/wallet-service/compliance.go` | Planned | 0.5 Day |
+| **#14** | Expand currency velocity rate conversion catalog | `cmd/wallet-service/compliance.go` | **Resolved** | 0.5 Day |
 | **#15** | Populate historical velocity signals for AI fraud checks | `cmd/wallet-service/main.go` | Planned | 0.5 Day |

@@ -612,8 +612,8 @@ func (g *Gateway) handleUpdateWalletKYC(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
-		if err := ValidateWalletOwnership(claims, walletID); err != nil && !claims.HasRole(auth.RoleAdmin) {
-			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
+		if !claims.HasRole(auth.RoleAdmin) && !claims.HasScope("wallet:kyc:admin") {
+			writeAuthError(w, http.StatusForbidden, "Forbidden: KYC tier modification requires admin privileges or wallet:kyc:admin scope")
 			return
 		}
 	}
@@ -1109,6 +1109,10 @@ func (g *Gateway) handleWebhookSubscriptions(w http.ResponseWriter, r *http.Requ
 			http.Error(w, "url is required", http.StatusBadRequest)
 			return
 		}
+		if err := webhook.ValidateWebhookURL(targetURL); err != nil {
+			http.Error(w, fmt.Sprintf("invalid webhook url: %v", err), http.StatusBadRequest)
+			return
+		}
 		if len(req.Events) == 0 {
 			req.Events = []string{"*"}
 		}
@@ -1238,8 +1242,8 @@ func (g *Gateway) handleWebhookTest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "url is required", http.StatusBadRequest)
 		return
 	}
-	if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
-		http.Error(w, "valid webhook url (http/https) is required", http.StatusBadRequest)
+	if err := webhook.ValidateWebhookURL(targetURL); err != nil {
+		http.Error(w, fmt.Sprintf("invalid webhook url: %v", err), http.StatusBadRequest)
 		return
 	}
 	if req.Secret == "" {

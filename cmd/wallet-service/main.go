@@ -81,10 +81,12 @@ func (s *server) db() *mongo.Database {
 
 func (s *server) isWritable(ctx context.Context) bool {
 	if s.coordinator != nil {
-		if target, err := s.coordinator.GetActiveTarget(ctx); err == nil && target != "" {
-			if s.targetRole != "" {
-				return target == s.targetRole
-			}
+		target, err := s.coordinator.GetActiveTarget(ctx)
+		if err != nil {
+			return false // Fail closed: reject writes if cluster consensus cannot be determined
+		}
+		if s.targetRole != "" {
+			return target == s.targetRole
 		}
 	}
 	return s.isActive

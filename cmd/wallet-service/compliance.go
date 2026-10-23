@@ -84,6 +84,9 @@ func normalizeToUSDUnits(amount int64, currency string) int64 {
 		"CHF": 1.1210,
 		"CAD": 0.7350,
 		"AUD": 0.6550,
+		"SGD": 0.7450,
+		"INR": 0.0120,
+		"BHD": 2.6525,
 	}
 	rate, ok := ratesToUSD[curr]
 	if !ok {

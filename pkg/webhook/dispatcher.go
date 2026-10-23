@@ -6,10 +6,14 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +32,60 @@ const (
 	CollectionSubscriptions = "webhook_subscriptions"
 	CollectionDeliveries    = "webhook_deliveries"
 )
+
+// ValidateWebhookURL validates that targetURL is a valid HTTP/HTTPS URL and prevents
+// Server-Side Request Forgery (SSRF) by blocking internal, loopback, private, and cloud-metadata addresses.
+func ValidateWebhookURL(targetURL string) error {
+	trimmed := strings.TrimSpace(targetURL)
+	if trimmed == "" {
+		return errors.New("webhook url is required")
+	}
+
+	u, err := url.Parse(trimmed)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
+		return errors.New("valid webhook url (http/https) is required")
+	}
+
+	host := u.Hostname()
+	if host == "" {
+		return errors.New("invalid webhook host")
+	}
+
+	// Allow loopback/private addresses only when explicitly permitted in dev/test environments
+	if os.Getenv("ALLOW_LOCAL_WEBHOOKS") == "true" {
+		return nil
+	}
+
+	// Block localhost and numeric forms
+	if strings.EqualFold(host, "localhost") {
+		return errors.New("webhook destination targets restricted private/loopback IP")
+	}
+
+	// If host is a literal IP address
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			return errors.New("webhook destination targets restricted private/loopback IP")
+		}
+		return nil
+	}
+
+	// Resolve host IPs to defend against DNS rebinding & private IP targeting
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return fmt.Errorf("failed to resolve webhook host %q: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return fmt.Errorf("no IP addresses found for webhook host %q", host)
+	}
+
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			return errors.New("webhook destination targets restricted private/loopback IP")
+		}
+	}
+
+	return nil
+}
 
 // Dispatcher manages outbound partner webhook subscriptions, deliveries, and retries.
 type Dispatcher struct {
@@ -71,8 +129,8 @@ func (d *Dispatcher) RegisterSubscription(ctx context.Context, sub *WebhookSubsc
 		return fmt.Errorf("subscription is required")
 	}
 	u := strings.TrimSpace(sub.URL)
-	if u == "" || (!strings.HasPrefix(u, "https://") && !strings.HasPrefix(u, "http://")) {
-		return fmt.Errorf("valid webhook url (http/https) is required")
+	if err := ValidateWebhookURL(u); err != nil {
+		return err
 	}
 	sub.URL = u
 
@@ -402,6 +460,9 @@ func (d *Dispatcher) StartRetryWorker(ctx context.Context, interval time.Duratio
 
 // TestEndpoint dispatches a synchronous test ping event to an endpoint and returns the status and latency.
 func (d *Dispatcher) TestEndpoint(ctx context.Context, targetURL, secret string) (int, time.Duration, error) {
+	if err := ValidateWebhookURL(targetURL); err != nil {
+		return 0, 0, err
+	}
 	start := time.Now()
 	testPayload := WebhookPayload{
 		ID:        newEventID(),
