@@ -60,13 +60,14 @@ func GetTierConfig(tier string) KYCTierConfig {
 
 // VelocityRecord logs individual transactions to calculate rolling compliance limits.
 type VelocityRecord struct {
-	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
-	WalletID  string             `bson:"wallet_id" json:"wallet_id"`
-	Amount    int64              `bson:"amount" json:"amount"`
-	Currency  string             `bson:"currency" json:"currency"`
-	USDUnits  int64              `bson:"usd_units" json:"usd_units"`
-	TxnType   string             `bson:"txn_type" json:"txn_type"`
-	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
+	ID           primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	WalletID     string             `bson:"wallet_id" json:"wallet_id"`
+	DestWalletID string             `bson:"dest_wallet_id,omitempty" json:"dest_wallet_id,omitempty"`
+	Amount       int64              `bson:"amount" json:"amount"`
+	Currency     string             `bson:"currency" json:"currency"`
+	USDUnits     int64              `bson:"usd_units" json:"usd_units"`
+	TxnType      string             `bson:"txn_type" json:"txn_type"`
+	CreatedAt    time.Time          `bson:"created_at" json:"created_at"`
 }
 
 // normalizeToUSDUnits converts an amount in any supported currency to USD minor units (cents)
@@ -180,18 +181,24 @@ func (s *server) CheckVelocityLimits(ctx context.Context, wallet WalletModel, am
 
 // RecordVelocityUsage appends a completed transaction to the velocity log collection.
 func (s *server) RecordVelocityUsage(sessCtx mongo.SessionContext, walletID string, amount int64, currency, txnType string) error {
+	return s.RecordVelocityUsageWithDest(sessCtx, walletID, "", amount, currency, txnType)
+}
+
+// RecordVelocityUsageWithDest appends a completed transaction with destination wallet to the velocity log collection.
+func (s *server) RecordVelocityUsageWithDest(sessCtx mongo.SessionContext, walletID, destWalletID string, amount int64, currency, txnType string) error {
 	if s.db() == nil {
 		return nil
 	}
 	col := s.db().Collection("wallet_velocity_records")
 	rec := VelocityRecord{
-		ID:        primitive.NewObjectID(),
-		WalletID:  walletID,
-		Amount:    amount,
-		Currency:  db.NormalizeCurrency(currency),
-		USDUnits:  normalizeToUSDUnits(amount, currency),
-		TxnType:   txnType,
-		CreatedAt: time.Now().UTC(),
+		ID:           primitive.NewObjectID(),
+		WalletID:     walletID,
+		DestWalletID: destWalletID,
+		Amount:       amount,
+		Currency:     db.NormalizeCurrency(currency),
+		USDUnits:     normalizeToUSDUnits(amount, currency),
+		TxnType:      txnType,
+		CreatedAt:    time.Now().UTC(),
 	}
 	_, err := col.InsertOne(sessCtx, rec)
 	return err

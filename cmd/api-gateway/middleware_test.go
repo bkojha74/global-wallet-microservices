@@ -298,3 +298,37 @@ func TestValidateWalletOwnershipIDOR(t *testing.T) {
 		t.Fatalf("expected t1 invalidated")
 	}
 }
+
+func TestExtractClientIP_TrustedProxies(t *testing.T) {
+	// 1. Untrusted remote IP with spoofed X-Forwarded-For -> ignores header
+	reqUntrusted := httptest.NewRequest(http.MethodGet, "/", nil)
+	reqUntrusted.RemoteAddr = "198.51.100.25:12345"
+	reqUntrusted.Header.Set("X-Forwarded-For", "203.0.113.195")
+	if ip := extractClientIP(reqUntrusted); ip != "198.51.100.25" {
+		t.Fatalf("expected extractClientIP to ignore spoofed X-Forwarded-For from untrusted IP, got %q", ip)
+	}
+
+	// 2. Loopback remote IP (trusted proxy) -> honors X-Forwarded-For
+	reqLoopback := httptest.NewRequest(http.MethodGet, "/", nil)
+	reqLoopback.RemoteAddr = "127.0.0.1:54321"
+	reqLoopback.Header.Set("X-Forwarded-For", "203.0.113.195, 10.0.0.1")
+	if ip := extractClientIP(reqLoopback); ip != "203.0.113.195" {
+		t.Fatalf("expected extractClientIP to honor X-Forwarded-For from loopback proxy, got %q", ip)
+	}
+
+	// 3. TRUST_PROXY=true override -> honors header
+	t.Setenv("TRUST_PROXY", "true")
+	if ip := extractClientIP(reqUntrusted); ip != "203.0.113.195" {
+		t.Fatalf("expected extractClientIP to honor header when TRUST_PROXY=true, got %q", ip)
+	}
+
+	// 4. TRUSTED_PROXIES CIDR match
+	t.Setenv("TRUST_PROXY", "false")
+	t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8, 172.16.0.0/12")
+	reqCIDR := httptest.NewRequest(http.MethodGet, "/", nil)
+	reqCIDR.RemoteAddr = "10.1.2.3:8080"
+	reqCIDR.Header.Set("X-Forwarded-For", "198.51.100.99")
+	if ip := extractClientIP(reqCIDR); ip != "198.51.100.99" {
+		t.Fatalf("expected extractClientIP to honor header from trusted CIDR proxy, got %q", ip)
+	}
+}

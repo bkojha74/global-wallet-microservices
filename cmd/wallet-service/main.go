@@ -131,6 +131,7 @@ type WalletModel struct {
 	Balances  map[string]int64 `bson:"balances,omitempty" json:"balances,omitempty"`
 	Status    string           `bson:"status" json:"status"`
 	KYCTier   string           `bson:"kyc_tier,omitempty" json:"kyc_tier,omitempty"`
+	Region    string           `bson:"region,omitempty" json:"region,omitempty"`
 	UpdatedAt string           `bson:"updated_at" json:"updated_at"`
 }
 
@@ -512,6 +513,30 @@ func (s *server) validateTransferRequest(ctx context.Context, req *walletv1.Tran
 	// Runs last so all business validations take priority.
 	// Fail-open: any AI error returns ALLOW — AI is never a payment blocker.
 	if s.fraudDetector != nil && s.fraudDetector.IsEnabled() {
+		recentTxnCount := 0
+		if _, count, err := s.GetWalletVelocityUsage(ctx, req.SourceWalletId); err == nil {
+			recentTxnCount = int(count)
+		}
+
+		isNewWalletPair := false
+		crossRegion := false
+		if s.db() != nil {
+			pairCount, err := s.db().Collection("wallet_velocity_records").CountDocuments(ctx, bson.M{
+				"wallet_id":      req.SourceWalletId,
+				"dest_wallet_id": req.DestinationWalletId,
+			}, options.Count().SetLimit(1))
+			if err == nil && pairCount == 0 {
+				isNewWalletPair = true
+			}
+
+			var destWallet WalletModel
+			if err := s.db().Collection("wallets").FindOne(ctx, bson.M{"_id": req.DestinationWalletId}).Decode(&destWallet); err == nil {
+				if destWallet.Region != "" && s.region != "" && destWallet.Region != s.region {
+					crossRegion = true
+				}
+			}
+		}
+
 		signals := ai.FraudSignals{
 			SourceWalletID:      req.SourceWalletId,
 			DestinationWalletID: req.DestinationWalletId,
@@ -519,7 +544,10 @@ func (s *server) validateTransferRequest(ctx context.Context, req *walletv1.Tran
 			Currency:            req.Amount.Currency,
 			Region:              s.region,
 			Timestamp:           time.Now().UTC(),
+			RecentTxnCount:      recentTxnCount,
+			IsNewWalletPair:     isNewWalletPair,
 			IsRoundNumber:       req.Amount.Units%10000 == 0,
+			CrossRegion:         crossRegion,
 		}
 		decision, _ := s.fraudDetector.Score(ctx, signals)
 		s.emit(ctx, "wallet.transfer.fraud_scored", observability.LevelInfo,
@@ -783,7 +811,7 @@ func (s *server) executeDebitAndCredit(sessCtx mongo.SessionContext, ctx context
 	}
 
 	// Record velocity usage for compliance tracking
-	if recErr := s.RecordVelocityUsage(sessCtx, req.SourceWalletId, req.Amount.Units, req.Amount.Currency, "TRANSFER"); recErr != nil {
+	if recErr := s.RecordVelocityUsageWithDest(sessCtx, req.SourceWalletId, req.DestinationWalletId, req.Amount.Units, req.Amount.Currency, "TRANSFER"); recErr != nil {
 		log.Printf("[COMPLIANCE-TX] Warning: failed to record velocity usage for wallet %s: %v", req.SourceWalletId, recErr)
 	}
 

@@ -578,10 +578,10 @@ Populate the missing historical context from `wallet_velocity_records` before in
 | **#6** | Add private IP/DNS validation for webhooks | `pkg/webhook/dispatcher.go` | **Resolved** | 1 Day |
 | **#7** | Restrict internal gRPC container ports & add auth | `docker-compose.yml`, `cmd/wallet-service` | **Resolved** | 1 Day |
 | **#8** | Implement atomic CAS for FX quote execution | `cmd/fx-service/engine.go` | **Resolved** | 0.5 Day |
-| **#9** | Validate trusted proxies for `X-Forwarded-For` | `cmd/api-gateway/middleware.go` | Planned | 0.5 Day |
-| **#10** | Require client idempotency keys on mutations | `cmd/api-gateway/main.go` | Planned | 0.5 Day |
+| **#9** | Validate trusted proxies for `X-Forwarded-For` | `cmd/api-gateway/middleware.go` | **Resolved** | 0.5 Day |
+| **#10** | Require client idempotency keys on mutations | `cmd/api-gateway/main.go` | **Resolved** | 0.5 Day |
 | **#11** | Fail-closed on coordinator network errors | `cmd/wallet-service/main.go` | **Resolved** | 0.5 Day |
-| **#12** | Normalize auth timing & add temporary lock expiration | `cmd/auth-service/user_store.go` | Planned | 0.5 Day |
+| **#12** | Normalize auth timing & add temporary lock expiration | `cmd/auth-service/user_store.go` | **Resolved** | 0.5 Day |
 | **#13** | Fix Merkle duplicate odd leaves & add domain prefix | `pkg/merkle/tree.go` | Planned | 0.5 Day |
 | **#14** | Expand currency velocity rate conversion catalog | `cmd/wallet-service/compliance.go` | **Resolved** | 0.5 Day |
-| **#15** | Populate historical velocity signals for AI fraud checks | `cmd/wallet-service/main.go` | Planned | 0.5 Day |
+| **#15** | Populate historical velocity signals for AI fraud checks | `cmd/wallet-service/main.go` | **Resolved** | 0.5 Day |

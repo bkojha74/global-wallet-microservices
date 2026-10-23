@@ -322,8 +322,17 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "source_wallet_id and destination_wallet_id are required", http.StatusBadRequest)
 		return
 	}
-	if req.IdempotencyKey != "" {
-		correlation.IdempotencyKey = req.IdempotencyKey
+	idempKey := strings.TrimSpace(req.IdempotencyKey)
+	if idempKey == "" {
+		idempKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	}
+	if idempKey == "" {
+		if os.Getenv("ENFORCE_CLIENT_IDEMPOTENCY") == "true" || r.Header.Get("X-Enforce-Idempotency") == "true" {
+			http.Error(w, "Idempotency-Key is required for financial mutations", http.StatusBadRequest)
+			return
+		}
+	} else {
+		correlation.IdempotencyKey = idempKey
 	}
 	if err := db.ValidateAmount(req.Amount, req.Currency); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -807,9 +816,13 @@ func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWal
 
 	idempKey := strings.TrimSpace(req.IdempotencyKey)
 	if idempKey == "" {
-		idempKey = r.Header.Get("Idempotency-Key")
+		idempKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	}
 	if idempKey == "" {
+		if os.Getenv("ENFORCE_CLIENT_IDEMPOTENCY") == "true" || r.Header.Get("X-Enforce-Idempotency") == "true" {
+			http.Error(w, "Idempotency-Key is required for financial mutations", http.StatusBadRequest)
+			return
+		}
 		idempKey = "idemp_dep_" + traceID
 	}
 	correlation.IdempotencyKey = idempKey
@@ -971,9 +984,13 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 
 	idempKey := strings.TrimSpace(req.IdempotencyKey)
 	if idempKey == "" {
-		idempKey = r.Header.Get("Idempotency-Key")
+		idempKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	}
 	if idempKey == "" {
+		if os.Getenv("ENFORCE_CLIENT_IDEMPOTENCY") == "true" || r.Header.Get("X-Enforce-Idempotency") == "true" {
+			http.Error(w, "Idempotency-Key is required for financial mutations", http.StatusBadRequest)
+			return
+		}
 		idempKey = "idemp_wth_" + traceID
 	}
 	correlation.IdempotencyKey = idempKey
