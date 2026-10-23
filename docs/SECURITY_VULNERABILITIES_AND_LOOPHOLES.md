@@ -582,6 +582,6 @@ Populate the missing historical context from `wallet_velocity_records` before in
 | **#10** | Require client idempotency keys on mutations | `cmd/api-gateway/main.go` | **Resolved** | 0.5 Day |
 | **#11** | Fail-closed on coordinator network errors | `cmd/wallet-service/main.go` | **Resolved** | 0.5 Day |
 | **#12** | Normalize auth timing & add temporary lock expiration | `cmd/auth-service/user_store.go` | **Resolved** | 0.5 Day |
-| **#13** | Fix Merkle duplicate odd leaves & add domain prefix | `pkg/merkle/tree.go` | Planned | 0.5 Day |
+| **#13** | Fix Merkle duplicate odd leaves & add domain prefix | `pkg/merkle/tree.go` | **Resolved** | 0.5 Day |
 | **#14** | Expand currency velocity rate conversion catalog | `cmd/wallet-service/compliance.go` | **Resolved** | 0.5 Day |
 | **#15** | Populate historical velocity signals for AI fraud checks | `cmd/wallet-service/main.go` | **Resolved** | 0.5 Day |
