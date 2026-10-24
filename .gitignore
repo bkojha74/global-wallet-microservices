@@ -99,5 +99,8 @@ postman/
 *.postman_collection.json
 BloomRPC_Test_Presets.json
 
+# Bruno test files
+/bruno
+
 # Documents, resumes and PDF files
-*.pdf
+*.pdf
