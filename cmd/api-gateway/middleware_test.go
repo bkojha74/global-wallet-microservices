@@ -258,17 +258,29 @@ func TestValidateWalletOwnershipIDOR(t *testing.T) {
 
 	// Alice acting on Alice's wallet -> Allowed
 	if err := ValidateWalletOwnership(aliceClaims, "alice"); err != nil {
-		t.Fatalf("expected ownership valid, got: %v", err)
+		t.Fatalf("expected ownership valid for exact match, got: %v", err)
+	}
+
+	// Alice acting on multi-currency or prefixed wallets -> Allowed
+	for _, validWallet := range []string{"alice_usd", "alice_eur", "alice-usd", "Alice_USD", "w-alice-01", "w-alice_usd"} {
+		if err := ValidateWalletOwnership(aliceClaims, validWallet); err != nil {
+			t.Fatalf("expected ownership valid for %s, got: %v", validWallet, err)
+		}
 	}
 
 	// Alice acting on Bob's wallet -> IDOR Blocked!
-	if err := ValidateWalletOwnership(aliceClaims, "bob"); err != auth.ErrIDORViolation {
-		t.Fatalf("expected IDOR violation for Alice acting on Bob, got: %v", err)
+	for _, blockedWallet := range []string{"bob", "bob_eur", "alicebob", "w-bob-01", ""} {
+		if err := ValidateWalletOwnership(aliceClaims, blockedWallet); err != auth.ErrIDORViolation {
+			t.Fatalf("expected IDOR violation for %s, got: %v", blockedWallet, err)
+		}
 	}
 
 	// Admin acting on Bob's wallet -> Allowed
 	if err := ValidateWalletOwnership(adminClaims, "bob"); err != nil {
 		t.Fatalf("expected admin allowed on any wallet, got: %v", err)
+	}
+	if err := ValidateWalletOwnership(adminClaims, "bob_eur"); err != nil {
+		t.Fatalf("expected admin allowed on bob_eur, got: %v", err)
 	}
 
 	// Nil claims -> Insufficient perms

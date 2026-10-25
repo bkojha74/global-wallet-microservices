@@ -384,6 +384,8 @@ func RequireScope(scope string, next http.HandlerFunc) http.HandlerFunc {
 }
 
 // ValidateWalletOwnership verifies that the token's subject owns the specified wallet or is an admin.
+// A subject owns a wallet if the wallet ID matches the subject, or if the wallet ID is
+// prefixed by the subject followed by a delimiter (e.g., "alice_usd", "alice_eur", "alice-usd", "w-alice-01").
 func ValidateWalletOwnership(claims *auth.Claims, walletID string) error {
 	if claims == nil {
 		return auth.ErrInsufficientPerms
@@ -391,10 +393,20 @@ func ValidateWalletOwnership(claims *auth.Claims, walletID string) error {
 	if claims.HasRole(auth.RoleAdmin) {
 		return nil
 	}
-	if claims.Subject != walletID {
+	sub := strings.ToLower(strings.TrimSpace(claims.Subject))
+	target := strings.ToLower(strings.TrimSpace(walletID))
+	if sub == "" || target == "" {
 		return auth.ErrIDORViolation
 	}
-	return nil
+
+	if sub == target ||
+		strings.HasPrefix(target, sub+"_") ||
+		strings.HasPrefix(target, sub+"-") ||
+		strings.HasPrefix(target, "w-"+sub+"-") ||
+		strings.HasPrefix(target, "w-"+sub+"_") {
+		return nil
+	}
+	return auth.ErrIDORViolation
 }
 
 func writeAuthError(w http.ResponseWriter, statusCode int, message string) {
