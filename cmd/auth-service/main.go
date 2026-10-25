@@ -346,18 +346,4 @@ func seedDefaultAdmin(ctx context.Context, store *UserStore) {
 			log.Printf("[AUTH-SERVICE] Default admin user seeded: username=%s", adminUser)
 		}
 	}
-
-	// In local/dev environments, also seed demo customer accounts if they don't exist
-	if os.Getenv("ENVIRONMENT") == "local" || os.Getenv("ENVIRONMENT") == "" {
-		if _, err := store.FindByUsername(ctx, "alice"); err != nil {
-			aliceScopes := []string{auth.ScopeWalletRead, auth.ScopeWalletTransfer}
-			_ = store.CreateUser(ctx, "alice", "alice@wallet.local", "password123", []string{auth.RoleUser}, aliceScopes)
-			log.Println("[AUTH-SERVICE] Demo user seeded: username=alice")
-		}
-		if _, err := store.FindByUsername(ctx, "bob"); err != nil {
-			bobScopes := []string{auth.ScopeWalletRead, auth.ScopeWalletTransfer}
-			_ = store.CreateUser(ctx, "bob", "bob@wallet.local", "password123", []string{auth.RoleUser}, bobScopes)
-			log.Println("[AUTH-SERVICE] Demo user seeded: username=bob")
-		}
-	}
 }
