@@ -152,23 +152,6 @@
       "realmRoles": [
         "admin"
       ]
-    },
-    {
-      "username": "alice",
-      "enabled": true,
-      "email": "alice@wallet.local",
-      "firstName": "Alice",
-      "lastName": "Smith",
-      "credentials": [
-        {
-          "type": "password",
-          "value": "alice123",
-          "temporary": false
-        }
-      ],
-      "realmRoles": [
-        "user"
-      ]
     }
   ]
 }

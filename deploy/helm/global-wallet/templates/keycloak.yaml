@@ -70,13 +70,6 @@ data:
           "email": "admin@wallet.local",
           "credentials": [{ "type": "password", "value": "admin123", "temporary": false }],
           "realmRoles": ["admin"]
-        },
-        {
-          "username": "alice",
-          "enabled": true,
-          "email": "alice@wallet.local",
-          "credentials": [{ "type": "password", "value": "alice123", "temporary": false }],
-          "realmRoles": ["user"]
         }
       ]
     }

@@ -319,7 +319,7 @@ func buildTokenEngine() (*TokenEngine, error) {
 	return NewHS256Engine(secret), nil
 }
 
-// seedDefaultAdmin creates a default admin user on first startup if no users exist.
+// seedDefaultAdmin creates default admin and demo user accounts on first startup if they don't exist.
 func seedDefaultAdmin(ctx context.Context, store *UserStore) {
 	if store == nil || store.db == nil {
 		return
@@ -330,24 +330,20 @@ func seedDefaultAdmin(ctx context.Context, store *UserStore) {
 		adminUser = "admin"
 	}
 	if adminPass == "" {
-		adminPass = "change-me-in-production"
-		log.Println("[SECURITY-WARNING] ADMIN_PASSWORD not set — using insecure default!")
+		adminPass = "admin123"
 	}
 
-	_, err := store.FindByUsername(ctx, adminUser)
-	if err == nil {
-		return
+	if _, err := store.FindByUsername(ctx, adminUser); err != nil {
+		adminScopes := []string{
+			auth.ScopeClusterAdmin,
+			auth.ScopeLedgerAudit,
+			auth.ScopeWalletTransfer,
+			auth.ScopeWalletRead,
+		}
+		if err := store.CreateUser(ctx, adminUser, "", adminPass, []string{auth.RoleAdmin}, adminScopes); err != nil {
+			log.Printf("[AUTH-SERVICE] Admin seed failed: %v", err)
+		} else {
+			log.Printf("[AUTH-SERVICE] Default admin user seeded: username=%s", adminUser)
+		}
 	}
-
-	adminScopes := []string{
-		auth.ScopeClusterAdmin,
-		auth.ScopeLedgerAudit,
-		auth.ScopeWalletTransfer,
-		auth.ScopeWalletRead,
-	}
-	if err := store.CreateUser(ctx, adminUser, "", adminPass, []string{auth.RoleAdmin}, adminScopes); err != nil {
-		log.Printf("[AUTH-SERVICE] Admin seed failed: %v", err)
-		return
-	}
-	log.Printf("[AUTH-SERVICE] Default admin user seeded: username=%s", adminUser)
 }

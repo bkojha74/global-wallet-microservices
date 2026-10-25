@@ -296,6 +296,31 @@ graph TD
 | CLI Merkle Inspection & Proof Verification Subcommand (`walletctl ledger merkle`) | `cmd/walletctl/ledger.go`, `cmd/walletctl/main_test.go` | ✅ Complete (DEV-03) |
 | Architectural Documentation | `docs/PILLAR5_DEV_EXPERIENCE_TOOLING_GUIDE.md` | ✅ Complete |
 
+---
+
+## 12. Current Execution Status: Track 6 (Enterprise Security Remediation & Hardening)
+
+| Vulnerability / Control ID | File Path | Status |
+|---|---|:---:|
+| **SEC-01 (VULN-01)**: Deactivate Mock Token Backdoor (`/api/v1/auth/token`) | `cmd/api-gateway/main.go` | ✅ Complete (P0) |
+| **SEC-02 (VULN-02)**: Multi-Currency Pot Debit Isolation & Zero Balance Wipe | `cmd/wallet-service/main.go` | ✅ Complete (P0) |
+| **SEC-03 (VULN-03)**: Atomic Sequence Generator & Ledger Hash Chain Concurrency | `cmd/ledger-service/main.go` | ✅ Complete (P0) |
+| **SEC-04 (VULN-04)**: Outbox Relay Max Retries (`DefaultMaxLedgerTaskRetries=5`) & DLQ | `cmd/wallet-service/ledger_outbox.go` | ✅ Complete (P1) |
+| **SEC-05 (VULN-05)**: Admin Role / `wallet:kyc:admin` Enforcement on KYC Tier Upgrades | `cmd/api-gateway/main.go` | ✅ Complete (P1) |
+| **SEC-06 (VULN-06)**: Webhook Dispatcher SSRF Defense (Loopback, RFC 1918, Cloud Metadata) | `pkg/webhook/dispatcher.go` | ✅ Complete (P1) |
+| **SEC-07 (VULN-07)**: Restrict Host-Exposed gRPC & Metrics Ports to `127.0.0.1` | `docker-compose.yml` | ✅ Complete (P1) |
+| **SEC-08 (VULN-08)**: Atomic CAS Execution for Fixed-Rate FX Quotes (TOCTOU Defense) | `cmd/fx-service/engine.go` | ✅ Complete (P2) |
+| **SEC-09 (VULN-09)**: Trusted Proxy CIDR Validation for `X-Forwarded-For` Spoofing Defense | `cmd/api-gateway/middleware.go` | ✅ Complete (P2) |
+| **SEC-10 (VULN-10)**: Mandatory Client Idempotency Keys on Mutations (`/transfer`, `/deposit`, `/withdraw`) | `cmd/api-gateway/main.go` | ✅ Complete (P2) |
+| **SEC-11 (VULN-11)**: Split-Brain Fail-Closed Consensus Fencing on Coordinator Network Partitions | `cmd/wallet-service/main.go` | ✅ Complete (P2) |
+| **SEC-12 (VULN-12)**: Auth Dummy Bcrypt Timing Equalization & 15m Lockout Auto-Expiration | `cmd/auth-service/user_store.go` | ✅ Complete (P2) |
+| **SEC-13 (VULN-13)**: Merkle Tree Odd Leaf Promotion & RFC 6962 Domain Separation (CVE-2012-2459) | `pkg/merkle/tree.go` | ✅ Complete (P3) |
+| **SEC-14 (VULN-14)**: Currency Velocity Catalog Expansion (Real Rates for `SGD`, `INR`, `BHD`) | `cmd/wallet-service/compliance.go` | ✅ Complete (P3) |
+| **SEC-15 (VULN-15)**: Populate Historical Velocity Signals (`RecentTxnCount`, `IsNewWalletPair`, `CrossRegion`) for AI Fraud Checks | `cmd/wallet-service/main.go` | ✅ Complete (P3) |
+| **SEC-16 (SAST)**: GoSec `G102` Listener Socket Annotations Across All Microservices | All Microservice Listeners | ✅ Complete (SAST) |
+| **SEC-17 (CI/CD)**: Pipeline Branch Triggers Extended to `bugfix/*` for Full Deployment | `.github/workflows/ci.yml` | ✅ Complete (CI/CD) |
+| Comprehensive Vulnerability Catalog & Implementation Reference | `docs/SECURITY_VULNERABILITIES_AND_LOOPHOLES.md` | ✅ Complete |
+
 
 
 

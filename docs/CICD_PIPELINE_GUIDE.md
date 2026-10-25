@@ -27,8 +27,8 @@ The pipeline consists of 9 sequential and parallelized enterprise stages execute
 ```mermaid
 flowchart TD
     subgraph Triggers["Trigger Mechanisms"]
-        PR["Pull Request<br/>(main, develop)"]
-        Push["Git Push<br/>(main, develop)"]
+        PR["Pull Request<br/>(main, develop, feature/*, bugfix/*)"]
+        Push["Git Push<br/>(main, develop, feature/*, bugfix/*)"]
         Tag["Release Tag<br/>(v*)"]
         Manual["workflow_dispatch<br/>(Manual Trigger)"]
     end
@@ -82,7 +82,7 @@ The pipeline is configured in [`.github/workflows/ci.yml`](../.github/workflows/
 ```yaml
 on:
   push:
-    branches: [main, develop, 'feature/*']
+    branches: [main, develop, 'feature/*', 'bugfix/*']
     tags: ['v*']
     paths-ignore:
       - '**.md'
@@ -92,7 +92,7 @@ on:
       - '.gitignore'
       - 'postman/**'
   pull_request:
-    branches: [main, develop, 'feature/*']
+    branches: [main, develop, 'feature/*', 'bugfix/*']
     paths-ignore:
       - '**.md'
       - 'docs/**'
@@ -107,8 +107,8 @@ on:
 
 | Event | Branches / Tags | Stages Executed | Purpose |
 |---|---|---|---|
-| `pull_request` | `main`, `develop`, `feature/*` | Stages 1 through 7 (`env-setup-check` $\rightarrow$ `docker-publish`) | Full quality, SAST security, and test verification gate before code merge |
-| `push` | `feature/*` | Stages 1 through 9 (`env-setup-check` $\rightarrow$ `post-deploy-smoke`) | Continuous verification on active feature branch |
+| `pull_request` | `main`, `develop`, `feature/*`, `bugfix/*` | Stages 1 through 7 (`env-setup-check` $\rightarrow$ `docker-publish`) | Full quality, SAST security, and test verification gate before code merge |
+| `push` | `feature/*`, `bugfix/*` | Stages 1 through 9 (`env-setup-check` $\rightarrow$ `post-deploy-smoke`) | Continuous verification, container publication, and deployment on active feature & bugfix branches |
 | `push` | `develop` | Stages 1 through 9 (`env-setup-check` $\rightarrow$ `post-deploy-smoke`) | Continuous verification on active integration branch |
 | `push` | `main` | Stages 1 through 9 (`env-setup-check` $\rightarrow$ `post-deploy-smoke`) | Full production verification, container packaging, and local rolling deployment |
 | `push` (tag) | `refs/tags/v*` | Stages 1 through 9 (`env-setup-check` $\rightarrow$ `post-deploy-smoke`) | Release creation with semantic version container tagging |
