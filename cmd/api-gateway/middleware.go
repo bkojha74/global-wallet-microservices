@@ -410,12 +410,12 @@ func ValidateWalletOwnership(claims *auth.Claims, walletID string) error {
 }
 
 // ValidateWalletCreationOwnership checks ownership during wallet creation.
-// 1. If caller is admin, any walletID and ownerID can be created.
-// 2. If an explicit ownerID is provided, it must match the authenticated subject.
-// 3. The walletID must either:
-//    a) Follow the caller's namespace (e.g., "alice", "alice_usd", "alice-usd", "w-alice-01"), OR
-//    b) Be a system/opaque identifier (e.g., prefixed with "wal_", "acc_", or a 36-char UUID) where ownerID matches the caller.
-// 4. Any attempt by a caller to create a wallet for another user (e.g., walletID="bob" or "bob_eur") is blocked.
+//  1. If caller is admin, any walletID and ownerID can be created.
+//  2. If an explicit ownerID is provided, it must match the authenticated subject.
+//  3. The walletID must either:
+//     a) Follow the caller's namespace (e.g., "alice", "alice_usd", "alice-usd", "w-alice-01"), OR
+//     b) Be a system/opaque identifier (e.g., prefixed with "wal_", "acc_", or a 36-char UUID) where ownerID matches the caller.
+//  4. Any attempt by a caller to create a wallet for another user (e.g., walletID="bob" or "bob_eur") is blocked.
 func ValidateWalletCreationOwnership(claims *auth.Claims, walletID, ownerID string) error {
 	if claims == nil {
 		return auth.ErrInsufficientPerms
