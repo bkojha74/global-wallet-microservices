@@ -136,6 +136,20 @@ func EnsureWalletIndexes(ctx context.Context, db *mongo.Database) error {
 	}
 	log.Printf("[DB-INDEX] Ensured wallet_velocity_records indexes: %v", velocityNames)
 
+	// 4. Wallets collection index for data-layer IDOR / BOLA ownership lookup
+	walletsCol := db.Collection("wallets")
+	walletIndexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{bson.E{Key: "owner_id", Value: 1}},
+			Options: options.Index().SetName("idx_wallets_owner_id").SetSparse(true),
+		},
+	}
+	if wNames, wErr := walletsCol.Indexes().CreateMany(ctx, walletIndexes); wErr != nil {
+		log.Printf("[DB-INDEX] Warning: failed to create wallets indexes: %v", wErr)
+	} else {
+		log.Printf("[DB-INDEX] Ensured wallets indexes: %v", wNames)
+	}
+
 	return nil
 }
 

@@ -25,6 +25,7 @@ message CreateWalletRequest {
   string currency = 2;
   int64 initial_balance = 3;
   string kyc_tier = 4;
+  string owner_id = 5;
 }
 
 message CreateWalletResponse {
