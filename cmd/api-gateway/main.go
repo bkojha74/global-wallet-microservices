@@ -326,14 +326,14 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		IdempotencyKey      string `json:"idempotency_key"`
-		SourceWalletID      string `json:"source_wallet_id"`
-		SourceWallet        string `json:"source_wallet"`
-		DestinationWalletID string `json:"destination_wallet_id"`
-		DestWallet          string `json:"dest_wallet"`
-		Amount              int64  `json:"amount"`
-		Currency            string `json:"currency"`
-		FXQuoteID           string `json:"fx_quote_id"`
+		IdempotencyKey      string          `json:"idempotency_key"`
+		SourceWalletID      string          `json:"source_wallet_id"`
+		SourceWallet        string          `json:"source_wallet"`
+		DestinationWalletID string          `json:"destination_wallet_id"`
+		DestWallet          string          `json:"dest_wallet"`
+		Amount              json.RawMessage `json:"amount"`
+		Currency            string          `json:"currency"`
+		FXQuoteID           string          `json:"fx_quote_id"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		log.Printf("[TRACE] trace_id=%s step=http_json_decode_failed error=%v", traceID, err)
@@ -352,6 +352,17 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "source_wallet_id and destination_wallet_id are required", http.StatusBadRequest)
 		return
 	}
+	amountUnits, currExtracted, err := parseAmountAndCurrency(req.Amount, req.Currency)
+	if err != nil {
+		log.Printf("[TRACE] trace_id=%s step=http_amount_decode_failed error=%v", traceID, err)
+		http.Error(w, fmt.Sprintf("invalid amount format: %v", err), http.StatusBadRequest)
+		return
+	}
+	transferCurrency := db.NormalizeCurrency(currExtracted)
+	if transferCurrency == "" {
+		http.Error(w, "currency is required", http.StatusBadRequest)
+		return
+	}
 	idempKey := strings.TrimSpace(req.IdempotencyKey)
 	if idempKey == "" {
 		idempKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
@@ -364,7 +375,7 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	} else {
 		correlation.IdempotencyKey = idempKey
 	}
-	if err := db.ValidateAmount(req.Amount, req.Currency); err != nil {
+	if err := db.ValidateAmount(amountUnits, transferCurrency); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -381,17 +392,17 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		"operation":     "transfer",
 		"source_wallet": sourceWallet,
 		"dest_wallet":   destWallet,
-		"amount":        req.Amount,
-		"currency":      req.Currency,
+		"amount":        amountUnits,
+		"currency":      transferCurrency,
 		"fx_quote_id":   req.FXQuoteID,
 	})
 	traceID = correlation.AssociationID
-	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=transfer source=%s destination=%s amount=%d currency=%s", traceID, sourceWallet, destWallet, req.Amount, req.Currency)
+	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=transfer source=%s destination=%s amount=%d currency=%s", traceID, sourceWallet, destWallet, amountUnits, transferCurrency)
 	protoReq := &walletv1.TransferFundsRequest{
 		IdempotencyKey:      req.IdempotencyKey,
 		SourceWalletId:      sourceWallet,
 		DestinationWalletId: destWallet,
-		Amount:              &walletv1.Money{Currency: req.Currency, Units: req.Amount},
+		Amount:              &walletv1.Money{Currency: transferCurrency, Units: amountUnits},
 		FxQuoteId:           strings.TrimSpace(req.FXQuoteID),
 	}
 	logProto(traceID, "http_json_to_wallet_proto_request", protoReq)
@@ -737,6 +748,37 @@ func (g *Gateway) handleGetWalletLimits(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func parseAmountAndCurrency(raw json.RawMessage, fallbackCurrency string) (int64, string, error) {
+	if len(raw) == 0 {
+		return 0, fallbackCurrency, nil
+	}
+	// Try parsing as scalar int64 (e.g. 500000)
+	var units int64
+	if err := json.Unmarshal(raw, &units); err == nil {
+		return units, fallbackCurrency, nil
+	}
+	// Try parsing as Money object: {"units": 500000, "currency": "USD"} or {"amount": 500000, "currency": "USD"}
+	var obj struct {
+		Units    int64  `json:"units"`
+		Amount   int64  `json:"amount"`
+		Currency string `json:"currency"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		curr := strings.TrimSpace(obj.Currency)
+		if curr == "" {
+			curr = fallbackCurrency
+		}
+		if obj.Units != 0 {
+			return obj.Units, curr, nil
+		}
+		if obj.Amount != 0 {
+			return obj.Amount, curr, nil
+		}
+		return 0, curr, nil
+	}
+	return 0, fallbackCurrency, errors.New("invalid amount format: expected integer or money object")
+}
+
 func parseProtoPaymentRail(railStr string) walletv1.PaymentRail {
 	switch strings.ToUpper(strings.TrimSpace(railStr)) {
 	case "CARD":
@@ -755,7 +797,7 @@ func parseProtoPaymentRail(railStr string) walletv1.PaymentRail {
 func (gw *Gateway) handleWalletSubroutes(w http.ResponseWriter, r *http.Request) {
 	path := strings.Trim(r.URL.Path, "/")
 	parts := strings.Split(path, "/")
-	// /api/v1/wallets/{id}/deposit or /api/v1/wallets/{id}/withdraw
+	// /api/v1/wallets/{id}/deposit, /api/v1/wallets/{id}/withdraw, or /api/v1/wallets/{id}/balance
 	if len(parts) >= 5 && parts[0] == "api" && parts[1] == "v1" && parts[2] == "wallets" {
 		walletID := parts[3]
 		action := parts[4]
@@ -767,6 +809,22 @@ func (gw *Gateway) handleWalletSubroutes(w http.ResponseWriter, r *http.Request)
 			gw.executeWithdraw(w, r, walletID)
 			return
 		}
+		if action == "balance" {
+			q := r.URL.Query()
+			q.Set("id", walletID)
+			r.URL.RawQuery = q.Encode()
+			gw.handleGetBalance(w, r)
+			return
+		}
+	}
+	// /api/v1/wallets/{id}
+	if len(parts) == 4 && parts[0] == "api" && parts[1] == "v1" && parts[2] == "wallets" && r.Method == http.MethodGet {
+		walletID := parts[3]
+		q := r.URL.Query()
+		q.Set("id", walletID)
+		r.URL.RawQuery = q.Encode()
+		gw.handleGetBalance(w, r)
+		return
 	}
 	http.Error(w, "Not Found", http.StatusNotFound)
 }
@@ -796,17 +854,30 @@ func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWal
 	}
 
 	var req struct {
-		IdempotencyKey string `json:"idempotency_key"`
-		WalletID       string `json:"wallet_id"`
-		Amount         int64  `json:"amount"`
-		Currency       string `json:"currency"`
-		PaymentRail    string `json:"payment_rail"`
-		Reference      string `json:"reference"`
+		IdempotencyKey string          `json:"idempotency_key"`
+		WalletID       string          `json:"wallet_id"`
+		Amount         json.RawMessage `json:"amount"`
+		Currency       string          `json:"currency"`
+		PaymentRail    string          `json:"payment_rail"`
+		Rail           string          `json:"rail"`
+		Reference      string          `json:"reference"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		log.Printf("[TRACE] trace_id=%s step=http_json_decode_failed error=%v", traceID, err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	amountUnits, currExtracted, err := parseAmountAndCurrency(req.Amount, req.Currency)
+	if err != nil {
+		log.Printf("[TRACE] trace_id=%s step=http_amount_decode_failed error=%v", traceID, err)
+		http.Error(w, fmt.Sprintf("invalid amount format: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	paymentRail := strings.TrimSpace(req.PaymentRail)
+	if paymentRail == "" {
+		paymentRail = strings.TrimSpace(req.Rail)
 	}
 
 	walletID := strings.TrimSpace(pathWalletID)
@@ -824,21 +895,21 @@ func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWal
 		return
 	}
 
-	curr := db.NormalizeCurrency(req.Currency)
+	curr := db.NormalizeCurrency(currExtracted)
 	if curr == "" {
 		http.Error(w, "currency is required", http.StatusBadRequest)
 		return
 	}
-	if req.Amount <= 0 {
+	if amountUnits <= 0 {
 		http.Error(w, "amount must be strictly positive", http.StatusBadRequest)
 		return
 	}
-	if err := db.ValidateAmount(req.Amount, curr); err != nil {
+	if err := db.ValidateAmount(amountUnits, curr); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	railProto := parseProtoPaymentRail(req.PaymentRail)
+	railProto := parseProtoPaymentRail(paymentRail)
 	if railProto == walletv1.PaymentRail_PAYMENT_RAIL_UNSPECIFIED {
 		http.Error(w, "payment_rail must be one of CARD, ACH, SEPA, WIRE", http.StatusBadRequest)
 		return
@@ -870,8 +941,8 @@ func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWal
 		"operation":    "deposit_funds",
 		"wallet_id":    walletID,
 		"currency":     curr,
-		"amount":       req.Amount,
-		"payment_rail": req.PaymentRail,
+		"amount":       amountUnits,
+		"payment_rail": paymentRail,
 		"reference":    req.Reference,
 	})
 
@@ -880,7 +951,7 @@ func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWal
 		WalletId:       walletID,
 		Amount: &walletv1.Money{
 			Currency: curr,
-			Units:    req.Amount,
+			Units:    amountUnits,
 		},
 		PaymentRail: railProto,
 		Reference:   req.Reference,
@@ -914,8 +985,8 @@ func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWal
 		"transaction_id": resp.TransactionId,
 		"wallet_id":      walletID,
 		"currency":       curr,
-		"amount":         req.Amount,
-		"payment_rail":   req.PaymentRail,
+		"amount":         amountUnits,
+		"payment_rail":   paymentRail,
 	})
 
 	if d := g.getWebhookDispatcher(); d != nil {
@@ -964,17 +1035,30 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 	}
 
 	var req struct {
-		IdempotencyKey     string `json:"idempotency_key"`
-		WalletID           string `json:"wallet_id"`
-		Amount             int64  `json:"amount"`
-		Currency           string `json:"currency"`
-		PaymentRail        string `json:"payment_rail"`
-		BeneficiaryDetails string `json:"beneficiary_details"`
+		IdempotencyKey     string          `json:"idempotency_key"`
+		WalletID           string          `json:"wallet_id"`
+		Amount             json.RawMessage `json:"amount"`
+		Currency           string          `json:"currency"`
+		PaymentRail        string          `json:"payment_rail"`
+		Rail               string          `json:"rail"`
+		BeneficiaryDetails string          `json:"beneficiary_details"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		log.Printf("[TRACE] trace_id=%s step=http_json_decode_failed error=%v", traceID, err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	amountUnits, currExtracted, err := parseAmountAndCurrency(req.Amount, req.Currency)
+	if err != nil {
+		log.Printf("[TRACE] trace_id=%s step=http_amount_decode_failed error=%v", traceID, err)
+		http.Error(w, fmt.Sprintf("invalid amount format: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	paymentRail := strings.TrimSpace(req.PaymentRail)
+	if paymentRail == "" {
+		paymentRail = strings.TrimSpace(req.Rail)
 	}
 
 	walletID := strings.TrimSpace(pathWalletID)
@@ -992,21 +1076,21 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 		return
 	}
 
-	curr := db.NormalizeCurrency(req.Currency)
+	curr := db.NormalizeCurrency(currExtracted)
 	if curr == "" {
 		http.Error(w, "currency is required", http.StatusBadRequest)
 		return
 	}
-	if req.Amount <= 0 {
+	if amountUnits <= 0 {
 		http.Error(w, "amount must be strictly positive", http.StatusBadRequest)
 		return
 	}
-	if err := db.ValidateAmount(req.Amount, curr); err != nil {
+	if err := db.ValidateAmount(amountUnits, curr); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	railProto := parseProtoPaymentRail(req.PaymentRail)
+	railProto := parseProtoPaymentRail(paymentRail)
 	if railProto == walletv1.PaymentRail_PAYMENT_RAIL_UNSPECIFIED {
 		http.Error(w, "payment_rail must be one of CARD, ACH, SEPA, WIRE", http.StatusBadRequest)
 		return
@@ -1038,8 +1122,8 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 		"operation":           "withdraw_funds",
 		"wallet_id":           walletID,
 		"currency":            curr,
-		"amount":              req.Amount,
-		"payment_rail":        req.PaymentRail,
+		"amount":              amountUnits,
+		"payment_rail":        paymentRail,
 		"beneficiary_details": req.BeneficiaryDetails,
 	})
 
@@ -1048,7 +1132,7 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 		WalletId:       walletID,
 		Amount: &walletv1.Money{
 			Currency: curr,
-			Units:    req.Amount,
+			Units:    amountUnits,
 		},
 		PaymentRail:        railProto,
 		BeneficiaryDetails: req.BeneficiaryDetails,
@@ -1089,8 +1173,8 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 		"transaction_id": resp.TransactionId,
 		"wallet_id":      walletID,
 		"currency":       curr,
-		"amount":         req.Amount,
-		"payment_rail":   req.PaymentRail,
+		"amount":         amountUnits,
+		"payment_rail":   paymentRail,
 	})
 
 	if d := g.getWebhookDispatcher(); d != nil {
