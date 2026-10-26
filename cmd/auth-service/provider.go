@@ -279,13 +279,7 @@ func (h *HybridProvider) Name() string {
 }
 
 func (h *HybridProvider) Authenticate(ctx context.Context, username, password string, requestedScopes []string) (*UnifiedClaims, *TokenPair, error) {
-	// First attempt local user store authentication
-	uClaims, pair, err := h.local.Authenticate(ctx, username, password, requestedScopes)
-	if err == nil {
-		return uClaims, pair, nil
-	}
-
-	// If local authentication failed and external provider is configured, attempt Keycloak Direct Grant
+	// First attempt Keycloak Direct Grant when external provider is configured
 	if h.external != nil {
 		extClaims, extPair, extErr := h.external.Authenticate(ctx, username, password, requestedScopes)
 		if extErr == nil {
@@ -293,7 +287,8 @@ func (h *HybridProvider) Authenticate(ctx context.Context, username, password st
 		}
 	}
 
-	return nil, nil, err
+	// Fallback to local user store authentication
+	return h.local.Authenticate(ctx, username, password, requestedScopes)
 }
 
 func (h *HybridProvider) ValidateToken(ctx context.Context, tokenStr string) (*UnifiedClaims, error) {

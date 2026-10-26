@@ -241,8 +241,7 @@ func setupIdentityProvider(mode string, local *LocalProvider) IdentityProvider {
 		if mode == "keycloak" {
 			log.Println("[AUTH-SERVICE] Operating in degraded Keycloak mode (will retry on incoming requests)")
 		} else {
-			log.Println("[AUTH-SERVICE] Keycloak unreachable at startup; falling back to local provider")
-			return local
+			log.Printf("[AUTH-SERVICE] Keycloak temporarily unreachable at startup (%v); continuing in hybrid fallback mode", err)
 		}
 	}
 
@@ -260,12 +259,21 @@ func setupIdentityProvider(mode string, local *LocalProvider) IdentityProvider {
 }
 
 func initKeycloakProvider(mode, issuerURL, clientID, clientSecret, explicitJWKS string) (*KeycloakProvider, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	oidcClient, err := NewOIDCClient(ctx, issuerURL, clientID, clientSecret, explicitJWKS)
+	var oidcClient *OIDCClient
+	var err error
+	for attempt := 1; attempt <= 10; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		oidcClient, err = NewOIDCClient(ctx, issuerURL, clientID, clientSecret, explicitJWKS)
+		cancel()
+		if err == nil {
+			break
+		}
+		if attempt < 10 {
+			time.Sleep(1 * time.Second)
+		}
+	}
 	if err != nil {
-		log.Printf("[AUTH-SERVICE] WARNING: OIDC client init failed for %s: %v", issuerURL, err)
+		log.Printf("[AUTH-SERVICE] WARNING: OIDC client init failed for %s after retries: %v", issuerURL, err)
 	}
 
 	jwksURL := explicitJWKS
@@ -344,6 +352,34 @@ func seedDefaultAdmin(ctx context.Context, store *UserStore) {
 			log.Printf("[AUTH-SERVICE] Admin seed failed: %v", err)
 		} else {
 			log.Printf("[AUTH-SERVICE] Default admin user seeded: username=%s", adminUser)
+		}
+	}
+
+	// Seed demo users for local fallback resilience
+	demoUsers := []struct {
+		username string
+		password string
+		roles    []string
+		scopes   []string
+	}{
+		{
+			username: "alice",
+			password: "password123",
+			roles:    []string{auth.RoleUser},
+			scopes:   []string{auth.ScopeWalletTransfer, auth.ScopeWalletRead},
+		},
+		{
+			username: "bob",
+			password: "password123",
+			roles:    []string{auth.RoleUser},
+			scopes:   []string{auth.ScopeWalletTransfer, auth.ScopeWalletRead},
+		},
+	}
+	for _, du := range demoUsers {
+		if _, err := store.FindByUsername(ctx, du.username); err != nil {
+			if err := store.CreateUser(ctx, du.username, du.username+"@wallet.local", du.password, du.roles, du.scopes); err == nil {
+				log.Printf("[AUTH-SERVICE] Demo user seeded in local store: %s", du.username)
+			}
 		}
 	}
 }

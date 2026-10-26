@@ -30,6 +30,15 @@ func (m *mockWalletClient) HealthCheck(ctx context.Context, in *walletv1.HealthR
 	return &walletv1.HealthResponse{Status: "SERVING"}, nil
 }
 
+func (m *mockWalletClient) GetBalance(ctx context.Context, in *walletv1.GetBalanceRequest, opts ...grpc.CallOption) (*walletv1.GetBalanceResponse, error) {
+	return &walletv1.GetBalanceResponse{
+		WalletId:        in.WalletId,
+		Balances:        []*walletv1.Money{{Currency: "USD", Units: 1000}},
+		Status:          "ACTIVE",
+		HandledByRegion: "us-test-1",
+	}, nil
+}
+
 func (m *mockWalletClient) ExchangeCurrency(ctx context.Context, in *walletv1.ExchangeCurrencyRequest, opts ...grpc.CallOption) (*walletv1.ExchangeCurrencyResponse, error) {
 	if in.FromAmount <= 0 {
 		return nil, status.Errorf(codes.InvalidArgument, "amount must be positive")
@@ -516,6 +525,23 @@ func TestHandleDepositFunds_Routes(t *testing.T) {
 	gw.handleWalletSubroutes(wSubroute, reqSubroute)
 	if wSubroute.Code != http.StatusOK {
 		t.Fatalf("expected 200 for subroute deposit, got %d (%s)", wSubroute.Code, wSubroute.Body.String())
+	}
+
+	// 6. Success via object amount and rail alias
+	bodyObjectAmount := bytes.NewBufferString(`{"wallet_id":"alice","amount":{"units":500000,"currency":"USD"},"rail":"ACH","reference":"Payroll"}`)
+	reqObjectAmount := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/deposit", bodyObjectAmount)
+	wObjectAmount := httptest.NewRecorder()
+	gw.handleDepositFunds(wObjectAmount, reqObjectAmount)
+	if wObjectAmount.Code != http.StatusOK {
+		t.Fatalf("expected 200 for object amount deposit, got %d (%s)", wObjectAmount.Code, wObjectAmount.Body.String())
+	}
+
+	// 7. Success via subroute /api/v1/wallets/{id}/balance
+	reqBalanceSubroute := httptest.NewRequest(http.MethodGet, "/api/v1/wallets/alice/balance", nil)
+	wBalanceSubroute := httptest.NewRecorder()
+	gw.handleWalletSubroutes(wBalanceSubroute, reqBalanceSubroute)
+	if wBalanceSubroute.Code != http.StatusOK {
+		t.Fatalf("expected 200 for subroute balance, got %d (%s)", wBalanceSubroute.Code, wBalanceSubroute.Body.String())
 	}
 }
 
