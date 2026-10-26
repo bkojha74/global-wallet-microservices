@@ -384,6 +384,8 @@ func RequireScope(scope string, next http.HandlerFunc) http.HandlerFunc {
 }
 
 // ValidateWalletOwnership verifies that the token's subject owns the specified wallet or is an admin.
+// A subject owns a wallet if the wallet ID matches the subject, or if the wallet ID is
+// prefixed by the subject followed by a delimiter (e.g., "alice_usd", "alice_eur", "alice-usd", "w-alice-01").
 func ValidateWalletOwnership(claims *auth.Claims, walletID string) error {
 	if claims == nil {
 		return auth.ErrInsufficientPerms
@@ -391,10 +393,68 @@ func ValidateWalletOwnership(claims *auth.Claims, walletID string) error {
 	if claims.HasRole(auth.RoleAdmin) {
 		return nil
 	}
-	if claims.Subject != walletID {
+	sub := strings.ToLower(strings.TrimSpace(claims.Subject))
+	target := strings.ToLower(strings.TrimSpace(walletID))
+	if sub == "" || target == "" {
 		return auth.ErrIDORViolation
 	}
-	return nil
+
+	if sub == target ||
+		strings.HasPrefix(target, sub+"_") ||
+		strings.HasPrefix(target, sub+"-") ||
+		strings.HasPrefix(target, "w-"+sub+"-") ||
+		strings.HasPrefix(target, "w-"+sub+"_") {
+		return nil
+	}
+	return auth.ErrIDORViolation
+}
+
+// ValidateWalletCreationOwnership checks ownership during wallet creation.
+//  1. If caller is admin, any walletID and ownerID can be created.
+//  2. If an explicit ownerID is provided, it must match the authenticated subject.
+//  3. The walletID must either:
+//     a) Follow the caller's namespace (e.g., "alice", "alice_usd", "alice-usd", "w-alice-01"), OR
+//     b) Be a system/opaque identifier (e.g., prefixed with "wal_", "acc_", or a 36-char UUID) where ownerID matches the caller.
+//  4. Any attempt by a caller to create a wallet for another user (e.g., walletID="bob" or "bob_eur") is blocked.
+func ValidateWalletCreationOwnership(claims *auth.Claims, walletID, ownerID string) error {
+	if claims == nil {
+		return auth.ErrInsufficientPerms
+	}
+	if claims.HasRole(auth.RoleAdmin) {
+		return nil
+	}
+	sub := strings.ToLower(strings.TrimSpace(claims.Subject))
+	owner := strings.ToLower(strings.TrimSpace(ownerID))
+	target := strings.ToLower(strings.TrimSpace(walletID))
+	if sub == "" || target == "" {
+		return auth.ErrIDORViolation
+	}
+
+	// Explicit owner must match caller
+	if owner != "" && owner != sub {
+		return auth.ErrIDORViolation
+	}
+
+	// Caller's own namespace
+	if sub == target ||
+		strings.HasPrefix(target, sub+"_") ||
+		strings.HasPrefix(target, sub+"-") ||
+		strings.HasPrefix(target, "w-"+sub+"-") ||
+		strings.HasPrefix(target, "w-"+sub+"_") {
+		return nil
+	}
+
+	// Opaque / UUID format allowed if owner matches caller
+	if owner == sub && (strings.HasPrefix(target, "wal_") || strings.HasPrefix(target, "acc_") || isOpaqueID(target)) {
+		return nil
+	}
+
+	return auth.ErrIDORViolation
+}
+
+func isOpaqueID(id string) bool {
+	// Standard UUID format: 8-4-4-4-12 hex chars (36 chars with hyphens)
+	return len(id) == 36 && id[8] == '-' && id[13] == '-' && id[18] == '-' && id[23] == '-'
 }
 
 func writeAuthError(w http.ResponseWriter, statusCode int, message string) {

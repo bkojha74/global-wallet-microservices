@@ -11,6 +11,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"wallet-system/pkg/db"
@@ -667,5 +668,37 @@ func TestCrossCurrencyTransferFXEngine(t *testing.T) {
 	}
 	if len(dstBal.Balances) == 0 || dstBal.Balances[0].Units != 14200 {
 		t.Fatalf("expected dest EUR balance 14200 (5000 + 9200), got %+v", dstBal.Balances)
+	}
+}
+
+func TestVerifyWalletAccessByWalletID(t *testing.T) {
+	srv := &server{}
+
+	// 1. Unauthenticated/internal context (no x-user-id metadata) -> Allowed
+	if err := srv.verifyWalletAccessByWalletID(context.Background(), "bob"); err != nil {
+		t.Fatalf("expected internal context allowed, got: %v", err)
+	}
+
+	// 2. Admin caller -> Allowed on any wallet
+	adminCtx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-user-id", "admin", "x-user-roles", "admin,user"))
+	if err := srv.verifyWalletAccessByWalletID(adminCtx, "bob_eur"); err != nil {
+		t.Fatalf("expected admin allowed on any wallet, got: %v", err)
+	}
+
+	// 3. User alice acting on alice's multi-currency wallets -> Allowed
+	aliceCtx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-user-id", "alice", "x-user-roles", "user"))
+	for _, walletID := range []string{"alice", "alice_usd", "alice-eur", "w-alice-01", "Alice_USD"} {
+		if err := srv.verifyWalletAccessByWalletID(aliceCtx, walletID); err != nil {
+			t.Fatalf("expected alice allowed on %s, got: %v", walletID, err)
+		}
+	}
+
+	// 4. User alice acting on bob's wallet without matching DB -> Blocked with codes.PermissionDenied
+	err := srv.verifyWalletAccessByWalletID(aliceCtx, "bob_eur")
+	if err == nil {
+		t.Fatalf("expected permission denied for cross-user access, got nil")
+	}
+	if st, ok := status.FromError(err); !ok || st.Code() != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied code, got: %v", err)
 	}
 }

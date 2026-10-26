@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -126,6 +127,7 @@ const (
 
 type WalletModel struct {
 	ID        string           `bson:"_id" json:"id"`
+	OwnerID   string           `bson:"owner_id,omitempty" json:"owner_id,omitempty"`
 	Currency  string           `bson:"currency,omitempty" json:"currency,omitempty"`
 	Balance   int64            `bson:"balance,omitempty" json:"balance,omitempty"`
 	Balances  map[string]int64 `bson:"balances,omitempty" json:"balances,omitempty"`
@@ -133,6 +135,89 @@ type WalletModel struct {
 	KYCTier   string           `bson:"kyc_tier,omitempty" json:"kyc_tier,omitempty"`
 	Region    string           `bson:"region,omitempty" json:"region,omitempty"`
 	UpdatedAt string           `bson:"updated_at" json:"updated_at"`
+}
+
+type callerContext struct {
+	UserID string
+	Roles  []string
+}
+
+func callerFromContext(ctx context.Context) callerContext {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return callerContext{}
+	}
+	userID := ""
+	if vals := md.Get("x-user-id"); len(vals) > 0 {
+		userID = strings.TrimSpace(vals[0])
+	}
+	var roles []string
+	if vals := md.Get("x-user-roles"); len(vals) > 0 {
+		for _, r := range strings.Split(vals[0], ",") {
+			rClean := strings.TrimSpace(r)
+			if rClean != "" {
+				roles = append(roles, rClean)
+			}
+		}
+	}
+	return callerContext{UserID: userID, Roles: roles}
+}
+
+func (c callerContext) HasRole(role string) bool {
+	for _, r := range c.Roles {
+		if strings.EqualFold(r, role) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c callerContext) IsAdmin() bool {
+	return c.HasRole("admin")
+}
+
+func extractOwnerFromWalletID(walletID string) string {
+	w := strings.TrimSpace(walletID)
+	if strings.HasPrefix(strings.ToLower(w), "w-") {
+		w = w[2:]
+	}
+	if idx := strings.IndexAny(w, "_-"); idx > 0 {
+		return w[:idx]
+	}
+	return w
+}
+
+func (s *server) verifyWalletAccessByWalletID(ctx context.Context, walletID string) error {
+	caller := callerFromContext(ctx)
+	if caller.UserID == "" || caller.IsAdmin() {
+		return nil
+	}
+	callerID := strings.ToLower(caller.UserID)
+	target := strings.ToLower(walletID)
+
+	// Fast path: matches caller prefix
+	if target == callerID ||
+		strings.HasPrefix(target, callerID+"_") ||
+		strings.HasPrefix(target, callerID+"-") ||
+		strings.HasPrefix(target, "w-"+callerID+"-") ||
+		strings.HasPrefix(target, "w-"+callerID+"_") {
+		return nil
+	}
+
+	// Data-layer lookup: query DB for wallet's owner_id
+	if s.db() == nil {
+		return status.Errorf(codes.PermissionDenied, "forbidden: caller %s does not have access to wallet %s", caller.UserID, walletID)
+	}
+	col := s.db().Collection("wallets")
+	var doc struct {
+		OwnerID string `bson:"owner_id"`
+	}
+	err := col.FindOne(ctx, bson.M{"_id": walletID}).Decode(&doc)
+	if err == nil && doc.OwnerID != "" && strings.EqualFold(doc.OwnerID, caller.UserID) {
+		return nil
+	}
+
+	return status.Errorf(codes.PermissionDenied, "forbidden: caller %s does not have access to wallet %s", caller.UserID, walletID)
 }
 
 func (w *WalletModel) EffectiveStatus() string {
@@ -263,8 +348,19 @@ func (s *server) CreateWallet(ctx context.Context, req *walletv1.CreateWalletReq
 		return nil, status.Errorf(codes.InvalidArgument, "invalid kyc_tier: %s (must be TIER_1, TIER_2, or TIER_3)", kycTier)
 	}
 
+	ownerID := strings.TrimSpace(req.OwnerId)
+	if ownerID == "" {
+		caller := callerFromContext(ctx)
+		if caller.UserID != "" {
+			ownerID = caller.UserID
+		} else {
+			ownerID = extractOwnerFromWalletID(req.WalletId)
+		}
+	}
+
 	model := WalletModel{
 		ID:        req.WalletId,
+		OwnerID:   ownerID,
 		Currency:  curr,
 		Balance:   req.InitialBalance,
 		Balances:  map[string]int64{curr: req.InitialBalance},
@@ -301,6 +397,9 @@ func (s *server) GetBalance(ctx context.Context, req *walletv1.GetBalanceRequest
 	}
 
 	walletID := strings.TrimSpace(req.WalletId)
+	if err := s.verifyWalletAccessByWalletID(ctx, walletID); err != nil {
+		return nil, err
+	}
 
 	// Check high-speed in-memory read-through cache first
 	if c := s.cache(); c != nil {
@@ -971,6 +1070,10 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 		return resp, err
 	}
 
+	if err := s.verifyWalletAccessByWalletID(ctx, req.SourceWalletId); err != nil {
+		return nil, err
+	}
+
 	correlation := observability.FromIncomingContext(ctx)
 	if correlation.IdempotencyKey == "" {
 		correlation.IdempotencyKey = req.IdempotencyKey
@@ -1056,6 +1159,9 @@ func (s *server) ExchangeCurrency(ctx context.Context, req *walletv1.ExchangeCur
 	}
 	if walletID == "" {
 		return nil, status.Errorf(codes.InvalidArgument, errWalletIDRequired)
+	}
+	if err := s.verifyWalletAccessByWalletID(ctx, walletID); err != nil {
+		return nil, err
 	}
 	if fromCurr == "" || toCurr == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "from_currency and to_currency are required")
@@ -1352,6 +1458,9 @@ func (s *server) DepositFunds(ctx context.Context, req *walletv1.DepositFundsReq
 	if walletID == "" {
 		return nil, status.Errorf(codes.InvalidArgument, errWalletIDRequired)
 	}
+	if err := s.verifyWalletAccessByWalletID(ctx, walletID); err != nil {
+		return nil, err
+	}
 	if req.Amount == nil || req.Amount.Units <= 0 {
 		return nil, status.Errorf(codes.InvalidArgument, "amount units must be strictly positive")
 	}
@@ -1545,6 +1654,9 @@ func (s *server) WithdrawFunds(ctx context.Context, req *walletv1.WithdrawFundsR
 	}
 	if walletID == "" {
 		return nil, status.Errorf(codes.InvalidArgument, errWalletIDRequired)
+	}
+	if err := s.verifyWalletAccessByWalletID(ctx, walletID); err != nil {
+		return nil, err
 	}
 	if req.Amount == nil || req.Amount.Units <= 0 {
 		return nil, status.Errorf(codes.InvalidArgument, "amount units must be strictly positive")

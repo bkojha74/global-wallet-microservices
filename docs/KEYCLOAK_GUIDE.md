@@ -258,8 +258,10 @@ In a clean production environment, no customer accounts (`alice`, `bob`, `charli
 1. In the left navigation menu, click **Users** (under *Manage*).
 2. Click **Add user**.
 3. Fill in the user profile:
-   * **Username**: e.g. `user1` or customer identifier
-   * **Email**: e.g. `user1@example.com`
+   * **Username**: e.g. `alice` or customer identifier
+   * **Email**: e.g. `alice@wallet.local`
+   * **First name**: e.g. `Alice` *(Mandatory in Keycloak 26! If left blank, login fails with "Account is not fully set up")*
+   * **Last name**: e.g. `Smith` *(Mandatory in Keycloak 26!)*
    * **Email verified**: Toggle to **ON**
    * Click **Create**.
 4. Click on the **Credentials** tab:
@@ -465,6 +467,7 @@ To capture changes made via the Web Console and commit them to Git:
 | :--- | :--- | :--- |
 | **`wallet-realm` missing on startup** | Realm file not mounted or `--import-realm` missing | Verify volume mount `./deploy/keycloak/wallet-realm-realm.json:/opt/keycloak/data/import/wallet-realm-realm.json:ro` and command `start-dev --import-realm`. |
 | **`401 Unauthorized: Invalid user credentials`** | Password incorrect or user not yet onboarded | Verify user exists in `wallet-realm` &rarr; **Users**; verify password under **Credentials**; ensure **Temporary** is toggled **OFF**. |
+| **`Account is not fully set up`** | First Name or Last Name left blank during user creation | In Keycloak 26 User Profile, `First name` and `Last name` are mandatory. Go to **Users** &rarr; select user &rarr; fill in **First name** and **Last name** &rarr; click **Save**. |
 | **`403 Forbidden: missing scope`** | Requested scope was not assigned to client | Open Client `wallet-api` &rarr; **Client scopes** tab &rarr; add the missing scope as Default or Optional. |
 | **`403 Forbidden: subject does not own wallet`** | IDOR ownership check failed | User subject (`preferred_username`) must match the wallet owner or user must possess the `admin` role. |
 | **Port 8085 unreachable** | Keycloak container still booting or stopped | Keycloak takes ~15 seconds to augment Quarkus; run `docker ps` and check logs with `docker logs -f wallet_keycloak`. |

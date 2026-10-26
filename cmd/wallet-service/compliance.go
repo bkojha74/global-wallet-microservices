@@ -272,6 +272,10 @@ func (s *server) GetWalletLimits(ctx context.Context, req *walletv1.GetWalletLim
 		return nil, fmt.Errorf("wallet_id is required")
 	}
 
+	if err := s.verifyWalletAccessByWalletID(ctx, req.WalletId); err != nil {
+		return nil, err
+	}
+
 	if s.db() == nil {
 		return nil, fmt.Errorf("database unavailable")
 	}
