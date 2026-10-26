@@ -123,6 +123,7 @@ services:
       - LOGGING_RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - LOGGING_SPOOL_PATH=data/logging/api-gateway.jsonl
       - JWT_SECRET=${JWT_SECRET:-development-wallet-insecure-secret-key-change-in-prod}
+      - ENFORCE_CLIENT_IDEMPOTENCY=true
     ports:
       - "8080:8080"
     depends_on:

@@ -372,9 +372,9 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Idempotency-Key is required for financial mutations", http.StatusBadRequest)
 			return
 		}
-	} else {
-		correlation.IdempotencyKey = idempKey
+		idempKey = "idemp_tx_" + traceID
 	}
+	correlation.IdempotencyKey = idempKey
 	if err := db.ValidateAmount(amountUnits, transferCurrency); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -399,7 +399,7 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	traceID = correlation.AssociationID
 	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=transfer source=%s destination=%s amount=%d currency=%s", traceID, sourceWallet, destWallet, amountUnits, transferCurrency)
 	protoReq := &walletv1.TransferFundsRequest{
-		IdempotencyKey:      req.IdempotencyKey,
+		IdempotencyKey:      idempKey,
 		SourceWalletId:      sourceWallet,
 		DestinationWalletId: destWallet,
 		Amount:              &walletv1.Money{Currency: transferCurrency, Units: amountUnits},
@@ -413,7 +413,7 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	g.emit(ctx, "api.wallet_proto.request_created", observability.LevelDebug, "Wallet protobuf request created", map[string]any{
 		"operation":       "transfer",
 		"target":          target,
-		"idempotency_key": req.IdempotencyKey,
+		"idempotency_key": idempKey,
 	})
 
 	log.Printf(traceWalletGRPCReqFmt, traceID, target)
@@ -429,9 +429,15 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 			"operation": "transfer",
 			"error":     err.Error(),
 		})
-		if st, ok := status.FromError(err); ok && st.Code() == codes.PermissionDenied {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": st.Message()})
-			return
+		if st, ok := status.FromError(err); ok {
+			if st.Code() == codes.PermissionDenied {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": st.Message()})
+				return
+			}
+			if st.Code() == codes.InvalidArgument {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": st.Message()})
+				return
+			}
 		}
 		http.Error(w, fmt.Sprintf("Transfer gRPC failure: %v", err), http.StatusInternalServerError)
 		return
@@ -692,9 +698,11 @@ func (g *Gateway) handleUpdateWalletKYC(w http.ResponseWriter, r *http.Request) 
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":        resp.Success,
+		"status":         "SUCCESS",
 		"wallet_id":      resp.WalletId,
 		"previous_tier":  resp.PreviousTier,
 		"current_tier":   resp.CurrentTier,
+		"kyc_tier":       resp.CurrentTier,
 		"message":        resp.Message,
 		"routed_gateway": target,
 	})
@@ -706,9 +714,12 @@ func (g *Gateway) handleGetWalletLimits(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	walletID := strings.TrimSpace(r.URL.Query().Get("id"))
+	walletID := strings.TrimSpace(r.URL.Query().Get("wallet_id"))
 	if walletID == "" {
-		http.Error(w, "Missing 'id' query parameter", http.StatusBadRequest)
+		walletID = strings.TrimSpace(r.URL.Query().Get("id"))
+	}
+	if walletID == "" {
+		http.Error(w, "Missing 'wallet_id' or 'id' query parameter", http.StatusBadRequest)
 		return
 	}
 
@@ -1265,13 +1276,20 @@ func (g *Gateway) handleWebhookSubscriptions(w http.ResponseWriter, r *http.Requ
 			return
 		}
 
+		statusStr := "ACTIVE"
+		if !sub.IsActive {
+			statusStr = "INACTIVE"
+		}
 		writeJSON(w, http.StatusCreated, map[string]interface{}{
-			"id":         sub.ID.Hex(),
-			"url":        sub.URL,
-			"events":     sub.Events,
-			"secret":     sub.Secret,
-			"is_active":  sub.IsActive,
-			"created_at": sub.CreatedAt.Format(time.RFC3339),
+			"id":              sub.ID.Hex(),
+			"subscription_id": sub.ID.Hex(),
+			"url":             sub.URL,
+			"target_url":      sub.URL,
+			"events":          sub.Events,
+			"secret":          sub.Secret,
+			"is_active":       sub.IsActive,
+			"status":          statusStr,
+			"created_at":      sub.CreatedAt.Format(time.RFC3339),
 		})
 
 	case http.MethodGet:
@@ -1533,6 +1551,8 @@ func (g *Gateway) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"current_routed_target": currentActive,
+		"active_target":         currentActive,
+		"region":                "global-core",
 		"primary_region": map[string]interface{}{
 			"address": g.primaryAddress,
 			"status":  pHealth,
@@ -1584,9 +1604,18 @@ func (g *Gateway) handleFailover(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var req struct {
+		Target string `json:"target"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
 	currentTarget := g.resolveCurrentTarget(r.Context())
 	newTarget := coordinator.TargetStandby
-	if currentTarget == coordinator.TargetStandby {
+	if strings.ToUpper(strings.TrimSpace(req.Target)) == "PRIMARY" {
+		newTarget = coordinator.TargetPrimary
+	} else if strings.ToUpper(strings.TrimSpace(req.Target)) == "STANDBY" {
+		newTarget = coordinator.TargetStandby
+	} else if currentTarget == coordinator.TargetStandby {
 		newTarget = coordinator.TargetPrimary
 	}
 
@@ -1601,6 +1630,7 @@ func (g *Gateway) handleFailover(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"message":              "Failover routing triggered",
 		"active_routed_target": newTarget,
+		"active_target":        newTarget,
 	})
 }
 
@@ -1998,15 +2028,36 @@ func (gw *Gateway) handleFXQuotes(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("FX quote lookup failed: %v", err), http.StatusNotFound)
 			return
 		}
-		writeJSON(w, http.StatusOK, resp.Quote)
+		quoteStatus := resp.Quote.Status
+		if quoteStatus == "ACTIVE" {
+			quoteStatus = "LOCKED"
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"quote_id":        resp.Quote.QuoteId,
+			"base_currency":   resp.Quote.BaseCurrency,
+			"target_currency": resp.Quote.TargetCurrency,
+			"source_amount":   resp.Quote.SourceAmount,
+			"target_amount":   resp.Quote.TargetAmount,
+			"fee_amount":      resp.Quote.FeeAmount,
+			"mid_rate":        resp.Quote.MidRate,
+			"effective_rate":  resp.Quote.EffectiveRate,
+			"spread_bps":      resp.Quote.SpreadBps,
+			"status":          quoteStatus,
+			"client_id":       resp.Quote.ClientId,
+			"source_provider": resp.Quote.SourceProvider,
+			"created_at":      resp.Quote.CreatedAt,
+			"expires_at":      resp.Quote.ExpiresAt,
+		})
 		return
 	}
 
 	if r.Method == http.MethodPost {
 		var req struct {
 			BaseCurrency   string `json:"base_currency"`
+			SourceCurrency string `json:"source_currency"`
 			TargetCurrency string `json:"target_currency"`
 			SourceAmount   int64  `json:"source_amount"`
+			SourceUnits    int64  `json:"source_units"`
 			Amount         int64  `json:"amount"`
 			ClientID       string `json:"client_id"`
 			TTLSeconds     int32  `json:"ttl_seconds"`
@@ -2015,7 +2066,14 @@ func (gw *Gateway) handleFXQuotes(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Invalid JSON body", http.StatusBadRequest)
 			return
 		}
+		baseCurrency := req.BaseCurrency
+		if baseCurrency == "" {
+			baseCurrency = req.SourceCurrency
+		}
 		amt := req.SourceAmount
+		if amt <= 0 {
+			amt = req.SourceUnits
+		}
 		if amt <= 0 {
 			amt = req.Amount
 		}
@@ -2026,7 +2084,7 @@ func (gw *Gateway) handleFXQuotes(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		resp, err := gw.fxClient.CreateQuote(ctx, &fxv1.CreateQuoteRequest{
-			BaseCurrency:   req.BaseCurrency,
+			BaseCurrency:   baseCurrency,
 			TargetCurrency: req.TargetCurrency,
 			SourceAmount:   amt,
 			ClientId:       clientID,
@@ -2036,7 +2094,26 @@ func (gw *Gateway) handleFXQuotes(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("FX quote creation failed: %v", err), http.StatusBadRequest)
 			return
 		}
-		writeJSON(w, http.StatusCreated, resp.Quote)
+		quoteStatus := resp.Quote.Status
+		if quoteStatus == "ACTIVE" {
+			quoteStatus = "LOCKED"
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"quote_id":        resp.Quote.QuoteId,
+			"base_currency":   resp.Quote.BaseCurrency,
+			"target_currency": resp.Quote.TargetCurrency,
+			"source_amount":   resp.Quote.SourceAmount,
+			"target_amount":   resp.Quote.TargetAmount,
+			"fee_amount":      resp.Quote.FeeAmount,
+			"mid_rate":        resp.Quote.MidRate,
+			"effective_rate":  resp.Quote.EffectiveRate,
+			"spread_bps":      resp.Quote.SpreadBps,
+			"status":          quoteStatus,
+			"client_id":       resp.Quote.ClientId,
+			"source_provider": resp.Quote.SourceProvider,
+			"created_at":      resp.Quote.CreatedAt,
+			"expires_at":      resp.Quote.ExpiresAt,
+		})
 		return
 	}
 
@@ -2066,6 +2143,10 @@ func (gw *Gateway) handleFXConvert(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
 		return
 	}
+	idempKey := strings.TrimSpace(req.IdempotencyKey)
+	if idempKey == "" {
+		idempKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	}
 	amt := req.SourceAmount
 	if amt <= 0 {
 		amt = req.Amount
@@ -2080,7 +2161,7 @@ func (gw *Gateway) handleFXConvert(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	resp, err := gw.fxClient.ConvertCurrency(ctx, &fxv1.ConvertCurrencyRequest{
-		IdempotencyKey: req.IdempotencyKey,
+		IdempotencyKey: idempKey,
 		QuoteId:        req.QuoteID,
 		BaseCurrency:   req.BaseCurrency,
 		TargetCurrency: req.TargetCurrency,
