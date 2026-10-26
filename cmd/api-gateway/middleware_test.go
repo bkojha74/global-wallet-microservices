@@ -284,8 +284,29 @@ func TestValidateWalletOwnershipIDOR(t *testing.T) {
 	}
 
 	// Nil claims -> Insufficient perms
-	if err := ValidateWalletOwnership(nil, "bob"); err != auth.ErrInsufficientPerms {
+	if err := ValidateWalletCreationOwnership(nil, "bob", "bob"); err != auth.ErrInsufficientPerms {
 		t.Fatalf("expected ErrInsufficientPerms for nil claims, got: %v", err)
+	}
+
+	// ValidateWalletCreationOwnership:
+	// Alice creating custom opaque ID with owner_id="alice" -> Allowed!
+	if err := ValidateWalletCreationOwnership(aliceClaims, "wal_custom_savings_99", "alice"); err != nil {
+		t.Fatalf("expected custom wallet allowed when owner_id matches subject, got: %v", err)
+	}
+	// Alice creating custom opaque ID with owner_id="bob" -> Blocked!
+	if err := ValidateWalletCreationOwnership(aliceClaims, "wal_custom_savings_99", "bob"); err != auth.ErrIDORViolation {
+		t.Fatalf("expected IDOR violation when alice specifies bob as owner, got: %v", err)
+	}
+	// Admin creating wallet for bob -> Allowed!
+	if err := ValidateWalletCreationOwnership(adminClaims, "wal_custom_savings_99", "bob"); err != nil {
+		t.Fatalf("expected admin allowed to create wallet for bob, got: %v", err)
+	}
+	// Fallback to prefix if owner_id is empty:
+	if err := ValidateWalletCreationOwnership(aliceClaims, "alice_usd", ""); err != nil {
+		t.Fatalf("expected prefix allowed when owner_id is empty, got: %v", err)
+	}
+	if err := ValidateWalletCreationOwnership(aliceClaims, "bob_usd", ""); err != auth.ErrIDORViolation {
+		t.Fatalf("expected IDOR violation when owner_id is empty and prefix mismatches, got: %v", err)
 	}
 
 	// tokenErrorMessage helper

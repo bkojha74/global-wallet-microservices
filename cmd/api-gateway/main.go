@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -134,6 +135,17 @@ const (
 	traceWalletGRPCRespFmt  = "[TRACE] trace_id=%s step=wallet_grpc_response error=%v"
 )
 
+func withOutgoingAuthContext(ctx context.Context) context.Context {
+	if claims, ok := ClaimsFromContext(ctx); ok && claims != nil {
+		pairs := []string{"x-user-id", claims.Subject}
+		if len(claims.Roles) > 0 {
+			pairs = append(pairs, "x-user-roles", strings.Join(claims.Roles, ","))
+		}
+		return metadata.AppendToOutgoingContext(ctx, pairs...)
+	}
+	return ctx
+}
+
 func parseCreateWalletRequest(r *http.Request, traceID string) (*walletv1.CreateWalletRequest, error) {
 	body, err := readClientJSON(traceID, r.Body)
 	if err != nil {
@@ -141,6 +153,7 @@ func parseCreateWalletRequest(r *http.Request, traceID string) (*walletv1.Create
 	}
 	var req struct {
 		WalletID       string `json:"wallet_id"`
+		OwnerID        string `json:"owner_id"`
 		Currency       string `json:"currency"`
 		InitialBalance int64  `json:"initial_balance"`
 		KYCTier        string `json:"kyc_tier"`
@@ -155,18 +168,23 @@ func parseCreateWalletRequest(r *http.Request, traceID string) (*walletv1.Create
 	if req.InitialBalance < 0 {
 		return nil, errors.New("initial balance cannot be negative")
 	}
+	ownerID := strings.TrimSpace(req.OwnerID)
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
-		if err := ValidateWalletOwnership(claims, req.WalletID); err != nil {
-			log.Printf("[SECURITY] IDOR blocked: subject %s tried to create wallet for %s", claims.Subject, req.WalletID)
+		if ownerID == "" {
+			ownerID = claims.Subject
+		}
+		if err := ValidateWalletCreationOwnership(claims, req.WalletID, ownerID); err != nil {
+			log.Printf("[SECURITY] IDOR blocked: subject %s tried to create wallet for %s (owner: %s)", claims.Subject, req.WalletID, ownerID)
 			return nil, fmt.Errorf("forbidden: %w", err)
 		}
 	}
-	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=create_wallet wallet_id=%s kyc_tier=%s", traceID, req.WalletID, req.KYCTier)
+	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=create_wallet wallet_id=%s owner_id=%s kyc_tier=%s", traceID, req.WalletID, ownerID, req.KYCTier)
 	return &walletv1.CreateWalletRequest{
 		WalletId:       req.WalletID,
 		Currency:       req.Currency,
 		InitialBalance: req.InitialBalance,
 		KycTier:        req.KYCTier,
+		OwnerId:        ownerID,
 	}, nil
 }
 
@@ -212,7 +230,7 @@ func (g *Gateway) handleCreateWallet(w http.ResponseWriter, r *http.Request) {
 	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	callCtx = withOutgoingAuthContext(observability.WithOutgoingMetadata(callCtx, correlation))
 	resp, err := client.CreateWallet(callCtx, protoReq)
 	if err != nil {
 		log.Printf(traceWalletGRPCRespFmt, traceID, err)
@@ -261,7 +279,7 @@ func (g *Gateway) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	callCtx = withOutgoingAuthContext(observability.WithOutgoingMetadata(callCtx, correlation))
 	resp, err := client.GetBalance(callCtx, protoReq)
 	if err != nil {
 		log.Printf(traceWalletGRPCRespFmt, traceID, err)
@@ -379,7 +397,7 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	callCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
-	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	callCtx = withOutgoingAuthContext(observability.WithOutgoingMetadata(callCtx, correlation))
 	resp, err := client.TransferFunds(callCtx, protoReq)
 	durationMS := time.Since(startTime).Milliseconds()
 	if err != nil {
@@ -539,7 +557,7 @@ func (g *Gateway) handleWalletExchange(w http.ResponseWriter, r *http.Request) {
 	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	callCtx = withOutgoingAuthContext(observability.WithOutgoingMetadata(callCtx, correlation))
 	resp, err := client.ExchangeCurrency(callCtx, protoReq)
 	if err != nil {
 		log.Printf(traceWalletGRPCRespFmt, traceID, err)
@@ -632,7 +650,7 @@ func (g *Gateway) handleUpdateWalletKYC(w http.ResponseWriter, r *http.Request) 
 	callCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
 
-	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	callCtx = withOutgoingAuthContext(observability.WithOutgoingMetadata(callCtx, correlation))
 	resp, err := client.UpdateWalletKYC(callCtx, &walletv1.UpdateWalletKYCRequest{
 		WalletId: walletID,
 		KycTier:  tier,
@@ -684,7 +702,7 @@ func (g *Gateway) handleGetWalletLimits(w http.ResponseWriter, r *http.Request) 
 	callCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
 
-	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	callCtx = withOutgoingAuthContext(observability.WithOutgoingMetadata(callCtx, correlation))
 	resp, err := client.GetWalletLimits(callCtx, &walletv1.GetWalletLimitsRequest{
 		WalletId: walletID,
 	})
@@ -860,7 +878,7 @@ func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWal
 	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	callCtx = withOutgoingAuthContext(observability.WithOutgoingMetadata(callCtx, correlation))
 	resp, err := client.DepositFunds(callCtx, protoReq)
 	if err != nil {
 		log.Printf(traceWalletGRPCRespFmt, traceID, err)
@@ -1028,7 +1046,7 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	callCtx = withOutgoingAuthContext(observability.WithOutgoingMetadata(callCtx, correlation))
 	resp, err := client.WithdrawFunds(callCtx, protoReq)
 	if err != nil {
 		log.Printf(traceWalletGRPCRespFmt, traceID, err)
@@ -1319,7 +1337,7 @@ func (g *Gateway) handleLedger(w http.ResponseWriter, r *http.Request) {
 	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	callCtx = withOutgoingAuthContext(observability.WithOutgoingMetadata(callCtx, correlation))
 	resp, err := g.ledgerClient.GetLedgerEntries(callCtx, &ledgerv1.GetLedgerRequest{
 		WalletId:  walletID,
 		Limit:     limit,
@@ -1400,7 +1418,7 @@ func (g *Gateway) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	callCtx = observability.WithOutgoingMetadata(callCtx, correlation)
+	callCtx = withOutgoingAuthContext(observability.WithOutgoingMetadata(callCtx, correlation))
 	pHealth, _ := g.primaryClient.HealthCheck(callCtx, &walletv1.HealthRequest{})
 	sHealth, _ := g.standbyClient.HealthCheck(callCtx, &walletv1.HealthRequest{})
 
