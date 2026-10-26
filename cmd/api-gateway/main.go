@@ -169,7 +169,9 @@ func parseCreateWalletRequest(r *http.Request, traceID string) (*walletv1.Create
 		return nil, errors.New("initial balance cannot be negative")
 	}
 	ownerID := strings.TrimSpace(req.OwnerID)
+	createdBy := ""
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		createdBy = claims.Subject
 		if ownerID == "" {
 			ownerID = claims.Subject
 		}
@@ -178,13 +180,14 @@ func parseCreateWalletRequest(r *http.Request, traceID string) (*walletv1.Create
 			return nil, fmt.Errorf("forbidden: %w", err)
 		}
 	}
-	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=create_wallet wallet_id=%s owner_id=%s kyc_tier=%s", traceID, req.WalletID, ownerID, req.KYCTier)
+	log.Printf("[TRACE] trace_id=%s step=http_json_decoded operation=create_wallet wallet_id=%s owner_id=%s created_by=%s kyc_tier=%s", traceID, req.WalletID, ownerID, createdBy, req.KYCTier)
 	return &walletv1.CreateWalletRequest{
 		WalletId:       req.WalletID,
 		Currency:       req.Currency,
 		InitialBalance: req.InitialBalance,
 		KycTier:        req.KYCTier,
 		OwnerId:        ownerID,
+		CreatedBy:      createdBy,
 	}, nil
 }
 
@@ -238,11 +241,20 @@ func (g *Gateway) handleCreateWallet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logProto(traceID, "wallet_proto_response_received", resp)
-	g.emit(ctx, eventAPIResponseSent, observability.LevelInfo, "Wallet creation response sent", map[string]any{"operation": "create_wallet", "routed_target": target})
+	g.emit(ctx, eventAPIResponseSent, observability.LevelInfo, "Wallet creation response sent", map[string]any{
+		"operation":     "create_wallet",
+		"routed_target": target,
+		"wallet_id":     protoReq.WalletId,
+		"owner_id":      protoReq.OwnerId,
+		"created_by":    protoReq.CreatedBy,
+	})
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":        resp.Success,
 		"message":        resp.Message,
+		"wallet_id":      protoReq.WalletId,
+		"owner_id":       protoReq.OwnerId,
+		"created_by":     protoReq.CreatedBy,
 		"routed_gateway": target,
 		"handled_region": resp.HandledByRegion,
 	})

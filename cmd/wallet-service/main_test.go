@@ -14,6 +14,8 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"go.mongodb.org/mongo-driver/bson"
+
 	"wallet-system/pkg/db"
 	"wallet-system/pkg/observability"
 	fxv1 "wallet-system/proto/fx"
@@ -604,12 +606,12 @@ func TestCrossCurrencyTransferFXEngine(t *testing.T) {
 	}
 	defer func() { _ = mClient.Disconnect(ctx) }()
 
-	_ = mClient.Database("banking_db").Collection("wallets").Drop(ctx)
-	_ = mClient.Database("banking_db").Collection("idempotency_records").Drop(ctx)
-	_ = mClient.Database("banking_db").Collection("ledger_tasks").Drop(ctx)
+	testDB := mClient.Database("banking_db_test_fx")
+	defer func() { _ = testDB.Drop(ctx) }()
 
 	srv := &server{
 		mongoClient: mClient,
+		dbName:      "banking_db_test_fx",
 		fxClient:    &fakeFXServiceClient{},
 		region:      "US_EAST",
 		isActive:    true,
@@ -700,5 +702,54 @@ func TestVerifyWalletAccessByWalletID(t *testing.T) {
 	}
 	if st, ok := status.FromError(err); !ok || st.Code() != codes.PermissionDenied {
 		t.Fatalf("expected PermissionDenied code, got: %v", err)
+	}
+}
+
+func TestCreateWalletProvenanceAndAudit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	mClient, err := db.ConnectWithRetry(ctx, db.DefaultMongoURI(), 1)
+	if err != nil {
+		t.Skip("skipping integration test: MongoDB not available")
+	}
+	defer mClient.Disconnect(ctx)
+
+	testDB := mClient.Database("banking_db_test_provenance")
+	defer testDB.Drop(ctx)
+
+	srv := &server{
+		mongoClient: mClient,
+		dbName:      "banking_db_test_provenance",
+		region:      "us-east-1 (Primary Active)",
+		isActive:    true,
+	}
+
+	adminCtx := metadata.NewIncomingContext(ctx, metadata.Pairs("x-user-id", "admin", "x-user-roles", "admin"))
+	req := &walletv1.CreateWalletRequest{
+		WalletId:       "prov_bob_eur",
+		Currency:       "EUR",
+		InitialBalance: 500,
+		OwnerId:        "bob",
+		CreatedBy:      "admin",
+	}
+
+	resp, err := srv.CreateWallet(adminCtx, req)
+	if err != nil {
+		t.Fatalf("CreateWallet failed: %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("expected success, got %v", resp)
+	}
+
+	var model WalletModel
+	if err := testDB.Collection("wallets").FindOne(ctx, bson.M{"_id": "prov_bob_eur"}).Decode(&model); err != nil {
+		t.Fatalf("failed to find created wallet: %v", err)
+	}
+	if model.OwnerID != "bob" {
+		t.Fatalf("expected OwnerID=bob, got %s", model.OwnerID)
+	}
+	if model.CreatedBy != "admin" {
+		t.Fatalf("expected CreatedBy=admin, got %s", model.CreatedBy)
 	}
 }

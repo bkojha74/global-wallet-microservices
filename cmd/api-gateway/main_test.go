@@ -202,6 +202,44 @@ func TestHandleCreateWalletReturns409WhenWalletAlreadyExists(t *testing.T) {
 	}
 }
 
+func TestHandleCreateWalletCreatedByProvenance(t *testing.T) {
+	client := &fakeWalletClient{
+		createWalletResponse: &walletv1.CreateWalletResponse{
+			Success:         true,
+			Message:         "created",
+			HandledByRegion: "test-region",
+		},
+	}
+	gateway := &Gateway{activeTarget: "PRIMARY", primaryClient: client}
+	adminClaims := &auth.Claims{
+		Subject: "admin",
+		Roles:   []string{"admin"},
+	}
+	ctx := ContextWithClaims(context.Background(), adminClaims)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/wallets", strings.NewReader(`{"wallet_id":"bob_eur","currency":"EUR","owner_id":"bob"}`)).WithContext(ctx)
+	response := httptest.NewRecorder()
+
+	gateway.handleCreateWallet(response, req)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", response.Code, response.Body.String())
+	}
+	if client.createWalletRequest == nil {
+		t.Fatal("expected wallet protobuf request")
+	}
+	if client.createWalletRequest.WalletId != "bob_eur" || client.createWalletRequest.OwnerId != "bob" || client.createWalletRequest.CreatedBy != "admin" {
+		t.Fatalf("unexpected protobuf request: %+v", client.createWalletRequest)
+	}
+
+	var body map[string]interface{}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response JSON: %v", err)
+	}
+	if body["created_by"] != "admin" || body["owner_id"] != "bob" || body["wallet_id"] != "bob_eur" {
+		t.Fatalf("expected provenance fields in response JSON, got: %v", body)
+	}
+}
+
 func TestHandleTransferConvertsJSONToProtoAndResponseToJSON(t *testing.T) {
 	client := &fakeWalletClient{
 		transferFundsResponse: &walletv1.TransferFundsResponse{

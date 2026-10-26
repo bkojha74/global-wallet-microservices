@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -458,6 +459,7 @@ func isOpaqueID(id string) bool {
 }
 
 func writeAuthError(w http.ResponseWriter, statusCode int, message string) {
+	log.Printf("[AUTH] Authentication error (%d): %s", statusCode, message)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	_ = json.NewEncoder(w).Encode(map[string]string{
