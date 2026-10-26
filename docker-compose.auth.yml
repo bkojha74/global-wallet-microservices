@@ -13,6 +13,12 @@ services:
       - ./deploy/keycloak/wallet-realm-realm.json:/opt/keycloak/data/import/wallet-realm-realm.json:ro
     ports:
       - "8085:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e 'GET /realms/wallet-realm HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"]
+      interval: 3s
+      timeout: 3s
+      retries: 25
+      start_period: 10s
     networks:
       wallet_shared_net:
         aliases:
@@ -51,7 +57,8 @@ services:
       - "50054:50054"
       - "9095:9095"
     depends_on:
-      - keycloak
+      keycloak:
+        condition: service_healthy
     networks:
       wallet_shared_net:
         aliases:

@@ -103,6 +103,40 @@
       "realmRoles": [
         "admin"
       ]
+    },
+    {
+      "username": "alice",
+      "enabled": true,
+      "email": "alice@wallet.local",
+      "firstName": "Alice",
+      "lastName": "Customer",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "password123",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "user"
+      ]
+    },
+    {
+      "username": "bob",
+      "enabled": true,
+      "email": "bob@wallet.local",
+      "firstName": "Bob",
+      "lastName": "Customer",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "password123",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "user"
+      ]
     }
   ]
 }
