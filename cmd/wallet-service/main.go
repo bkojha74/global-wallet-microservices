@@ -128,6 +128,7 @@ const (
 type WalletModel struct {
 	ID        string           `bson:"_id" json:"id"`
 	OwnerID   string           `bson:"owner_id,omitempty" json:"owner_id,omitempty"`
+	CreatedBy string           `bson:"created_by,omitempty" json:"created_by,omitempty"`
 	Currency  string           `bson:"currency,omitempty" json:"currency,omitempty"`
 	Balance   int64            `bson:"balance,omitempty" json:"balance,omitempty"`
 	Balances  map[string]int64 `bson:"balances,omitempty" json:"balances,omitempty"`
@@ -319,7 +320,11 @@ func (s *server) CreateWallet(ctx context.Context, req *walletv1.CreateWalletReq
 	}
 	correlation := observability.FromIncomingContext(ctx)
 	ctx = observability.WithCorrelation(ctx, correlation)
-	s.emit(ctx, "wallet.create.request_received", observability.LevelInfo, "Create wallet request received", map[string]any{"wallet_id": req.WalletId})
+	s.emit(ctx, "wallet.create.request_received", observability.LevelInfo, "Create wallet request received", map[string]any{
+		"wallet_id":  req.WalletId,
+		"owner_id":   req.OwnerId,
+		"created_by": req.CreatedBy,
+	})
 	log.Printf("[WALLET] CreateWallet proto received: wallet_id=%s currency=%s initial_balance=%d region=%s", req.WalletId, req.Currency, req.InitialBalance, s.region)
 
 	if !db.IsValidCurrency(req.Currency) {
@@ -348,9 +353,9 @@ func (s *server) CreateWallet(ctx context.Context, req *walletv1.CreateWalletReq
 		return nil, status.Errorf(codes.InvalidArgument, "invalid kyc_tier: %s (must be TIER_1, TIER_2, or TIER_3)", kycTier)
 	}
 
+	caller := callerFromContext(ctx)
 	ownerID := strings.TrimSpace(req.OwnerId)
 	if ownerID == "" {
-		caller := callerFromContext(ctx)
 		if caller.UserID != "" {
 			ownerID = caller.UserID
 		} else {
@@ -358,9 +363,19 @@ func (s *server) CreateWallet(ctx context.Context, req *walletv1.CreateWalletReq
 		}
 	}
 
+	createdBy := strings.TrimSpace(req.CreatedBy)
+	if createdBy == "" {
+		if caller.UserID != "" {
+			createdBy = caller.UserID
+		} else {
+			createdBy = ownerID
+		}
+	}
+
 	model := WalletModel{
 		ID:        req.WalletId,
 		OwnerID:   ownerID,
+		CreatedBy: createdBy,
 		Currency:  curr,
 		Balance:   req.InitialBalance,
 		Balances:  map[string]int64{curr: req.InitialBalance},
@@ -381,8 +396,17 @@ func (s *server) CreateWallet(ctx context.Context, req *walletv1.CreateWalletReq
 		c.Invalidate(req.WalletId)
 	}
 
-	log.Printf("[WALLET] Wallet initialized: ID=%s, Currency=%s, Balance=%d (Region: %s)",
-		req.WalletId, curr, req.InitialBalance, s.region)
+	s.emit(ctx, "wallet.created", observability.LevelAudit, "Wallet created successfully", map[string]any{
+		"wallet_id":  req.WalletId,
+		"owner_id":   ownerID,
+		"created_by": createdBy,
+		"currency":   curr,
+		"balance":    req.InitialBalance,
+		"kyc_tier":   kycTier,
+	})
+
+	log.Printf("[WALLET] Wallet initialized: ID=%s, Owner=%s, CreatedBy=%s, Currency=%s, Balance=%d (Region: %s)",
+		req.WalletId, ownerID, createdBy, curr, req.InitialBalance, s.region)
 
 	return &walletv1.CreateWalletResponse{
 		Success:         true,
