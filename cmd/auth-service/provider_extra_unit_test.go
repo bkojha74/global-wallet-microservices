@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -117,5 +118,98 @@ func TestKeycloakAndHybridProvider_Unit(t *testing.T) {
 	issExt, kidExt := peekTokenMetadata(mockExtToken)
 	if issExt != server.URL || kidExt != "key-1" {
 		t.Errorf("Expected iss=%q kid=%q, got iss=%q kid=%q", server.URL, "key-1", issExt, kidExt)
+	}
+}
+
+func TestOIDCProvider_SelfHealingPoller(t *testing.T) {
+	// Server starts healthy
+	var mu sync.RWMutex
+	isUp := true
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.RLock()
+		up := isUp
+		mu.RUnlock()
+		if !up {
+			http.Error(w, "down", http.StatusServiceUnavailable)
+			return
+		}
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"issuer":                 "http://localhost/issuer",
+				"authorization_endpoint": "http://localhost/auth",
+				"token_endpoint":         "http://localhost/token",
+				"jwks_uri":               server.URL + "/jwks",
+			})
+		case "/jwks":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"keys": []interface{}{},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	// 1. Initial creation with provider healthy
+	prov := NewKeycloakProvider(nil, nil, "client-1", server.URL)
+	prov.SetConfig("secret-1", server.URL+"/jwks")
+	if prov.IsHealthy() {
+		t.Error("expected initially unhealthy when oidcClient is nil")
+	}
+
+	// 2. Ping succeeds when server is up
+	ctx := context.Background()
+	if err := prov.Ping(ctx); err != nil {
+		t.Fatalf("Ping failed when server is up: %v", err)
+	}
+
+	// 3. Reconnect succeeds
+	if err := prov.Reconnect(ctx); err != nil {
+		t.Fatalf("Reconnect failed: %v", err)
+	}
+	if !prov.IsHealthy() {
+		t.Error("expected provider to be healthy after reconnect")
+	}
+
+	// 4. Test Background Poller detects server down and recovers
+	prov.StartHealthPoller(20 * time.Millisecond)
+	defer prov.StopHealthPoller()
+
+	// Simulate outage
+	mu.Lock()
+	isUp = false
+	mu.Unlock()
+
+	degraded := false
+	for i := 0; i < 30; i++ {
+		time.Sleep(20 * time.Millisecond)
+		if !prov.IsHealthy() {
+			degraded = true
+			break
+		}
+	}
+	if !degraded {
+		t.Error("expected provider to be marked degraded after server goes down")
+	}
+
+	// Simulate recovery
+	mu.Lock()
+	isUp = true
+	mu.Unlock()
+
+	healed := false
+	for i := 0; i < 30; i++ {
+		time.Sleep(25 * time.Millisecond)
+		if prov.IsHealthy() {
+			healed = true
+			break
+		}
+	}
+	if !healed {
+		t.Error("expected provider to automatically self-heal and reconnect when server comes back up")
 	}
 }
