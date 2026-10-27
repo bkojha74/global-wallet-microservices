@@ -293,7 +293,12 @@ func initKeycloakProvider(mode, issuerURL, clientID, clientSecret, explicitJWKS 
 		}
 	}()
 
-	return NewKeycloakProvider(oidcClient, jwksCache, clientID, issuerURL), err
+	provider := NewKeycloakProvider(oidcClient, jwksCache, clientID, issuerURL)
+	provider.SetConfig(clientSecret, explicitJWKS)
+	// Start background self-healing poller (pings every 5 seconds, auto-reconnects when Keycloak/OIDC recovers)
+	provider.StartHealthPoller(5 * time.Second)
+
+	return provider, err
 }
 
 // buildTokenEngine configures the internal token signing engine based on environment variables.
