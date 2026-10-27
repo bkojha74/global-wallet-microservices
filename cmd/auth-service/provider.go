@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"wallet-system/pkg/auth"
@@ -173,21 +175,30 @@ func (p *LocalProvider) RefreshToken(ctx context.Context, refreshToken string) (
 
 // ── KeycloakProvider ─────────────────────────────────────────────────────────
 
-// KeycloakProvider validates tokens using Keycloak's JWKS and normalizes Keycloak claims.
+// KeycloakProvider validates tokens using an external OIDC provider's JWKS and normalizes claims.
+// It is general enough to support Keycloak, Google Identity, Okta, or any OpenID Connect compliant provider.
 type KeycloakProvider struct {
-	oidcClient *OIDCClient
-	jwksCache  *JWKSCache
-	clientID   string
-	issuer     string
+	mu           sync.RWMutex
+	oidcClient   *OIDCClient
+	jwksCache    *JWKSCache
+	clientID     string
+	clientSecret string
+	issuer       string
+	explicitJWKS string
+	isHealthy    bool
+	stopPoller   chan struct{}
 }
 
-// NewKeycloakProvider creates a new KeycloakProvider.
+// NewKeycloakProvider creates a new KeycloakProvider / OIDC provider.
 func NewKeycloakProvider(oidcClient *OIDCClient, jwksCache *JWKSCache, clientID, issuer string) *KeycloakProvider {
+	healthy := (oidcClient != nil)
 	return &KeycloakProvider{
 		oidcClient: oidcClient,
 		jwksCache:  jwksCache,
 		clientID:   clientID,
 		issuer:     strings.TrimRight(issuer, "/"),
+		isHealthy:  healthy,
+		stopPoller: make(chan struct{}),
 	}
 }
 
@@ -195,19 +206,166 @@ func (p *KeycloakProvider) Name() string {
 	return "keycloak"
 }
 
-func (p *KeycloakProvider) Authenticate(ctx context.Context, username, password string, requestedScopes []string) (*UnifiedClaims, *TokenPair, error) {
-	if p.oidcClient == nil {
-		return nil, nil, errors.New("keycloak: OIDC client not configured for login")
+// IsHealthy returns true if the external OIDC provider is currently connected and responsive.
+func (p *KeycloakProvider) IsHealthy() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.isHealthy
+}
+
+// SetConfig sets parameters needed for background self-healing reconnection.
+func (p *KeycloakProvider) SetConfig(clientSecret, explicitJWKS string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.clientSecret = clientSecret
+	p.explicitJWKS = explicitJWKS
+}
+
+// Ping checks if the remote OIDC provider is reachable and responsive.
+func (p *KeycloakProvider) Ping(ctx context.Context) error {
+	p.mu.RLock()
+	issuer := p.issuer
+	p.mu.RUnlock()
+
+	if issuer == "" {
+		return errors.New("oidc: issuer URL is empty")
 	}
 
-	resp, err := p.oidcClient.AuthenticatePassword(ctx, username, password, requestedScopes)
+	discoveryURL := fmt.Sprintf("%s/.well-known/openid-configuration", strings.TrimRight(issuer, "/"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, discoveryURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("oidc: ping returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// Reconnect attempts to rediscover OIDC endpoints and refresh JWKS keys.
+func (p *KeycloakProvider) Reconnect(ctx context.Context) error {
+	p.mu.RLock()
+	issuer := p.issuer
+	clientID := p.clientID
+	clientSecret := p.clientSecret
+	explicitJWKS := p.explicitJWKS
+	p.mu.RUnlock()
+
+	client, err := NewOIDCClient(ctx, issuer, clientID, clientSecret, explicitJWKS)
+	if err != nil {
+		p.mu.Lock()
+		p.isHealthy = false
+		p.mu.Unlock()
+		return fmt.Errorf("oidc reconnect failed: %w", err)
+	}
+
+	jwksURL := explicitJWKS
+	if jwksURL == "" && client != nil {
+		jwksURL = client.JwksURI()
+	}
+	if jwksURL == "" {
+		jwksURL = fmt.Sprintf("%s/protocol/openid-connect/certs", strings.TrimRight(issuer, "/"))
+	}
+
+	jwksCache := NewJWKSCache(jwksURL, 1*time.Hour)
+	_ = jwksCache.Refresh(ctx)
+
+	p.mu.Lock()
+	p.oidcClient = client
+	p.jwksCache = jwksCache
+	p.isHealthy = true
+	p.mu.Unlock()
+
+	log.Printf("[OIDC-RECOVERY] Successfully reconnected to OIDC provider: %s", issuer)
+	return nil
+}
+
+// StartHealthPoller starts an asynchronous background health check / reconnect poller.
+// If Keycloak/OIDC is down, it pings and reconnects as soon as it recovers.
+func (p *KeycloakProvider) StartHealthPoller(interval time.Duration) {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-p.stopPoller:
+				return
+			case <-ticker.C:
+				p.mu.RLock()
+				healthy := p.isHealthy
+				p.mu.RUnlock()
+
+				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+				err := p.Ping(ctx)
+				cancel()
+
+				if err != nil {
+					if healthy {
+						log.Printf("[OIDC-HEALTH] Provider %s ping failed (%v); marking degraded", p.issuer, err)
+						p.mu.Lock()
+						p.isHealthy = false
+						p.mu.Unlock()
+					}
+				} else {
+					if !healthy {
+						log.Printf("[OIDC-HEALTH] Provider %s is now reachable! Reconnecting...", p.issuer)
+						reconCtx, reconCancel := context.WithTimeout(context.Background(), 5*time.Second)
+						reconErr := p.Reconnect(reconCtx)
+						if reconErr != nil {
+							log.Printf("[OIDC-HEALTH] Reconnect attempt failed: %v", reconErr)
+						} else {
+							log.Printf("[OIDC-HEALTH] Reconnect succeeded! Healthy is now true")
+						}
+						reconCancel()
+					}
+				}
+			}
+		}
+	}()
+}
+
+// StopHealthPoller stops the background poller routine.
+func (p *KeycloakProvider) StopHealthPoller() {
+	select {
+	case <-p.stopPoller:
+		// already closed
+	default:
+		close(p.stopPoller)
+	}
+}
+
+func (p *KeycloakProvider) Authenticate(ctx context.Context, username, password string, requestedScopes []string) (*UnifiedClaims, *TokenPair, error) {
+	p.mu.RLock()
+	client := p.oidcClient
+	healthy := p.isHealthy
+	p.mu.RUnlock()
+
+	if client == nil || !healthy {
+		return nil, nil, errors.New("oidc: provider client unavailable or unhealthy")
+	}
+
+	resp, err := client.AuthenticatePassword(ctx, username, password, requestedScopes)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	uClaims, err := p.ValidateToken(ctx, resp.AccessToken)
 	if err != nil {
-		return nil, nil, fmt.Errorf("keycloak: validating issued access token: %w", err)
+		return nil, nil, fmt.Errorf("oidc: validating issued access token: %w", err)
 	}
 
 	return uClaims, &TokenPair{
@@ -220,33 +378,48 @@ func (p *KeycloakProvider) Authenticate(ctx context.Context, username, password 
 }
 
 func (p *KeycloakProvider) ValidateToken(ctx context.Context, tokenStr string) (*UnifiedClaims, error) {
-	kcClaims, err := p.jwksCache.VerifyToken(ctx, tokenStr)
+	p.mu.RLock()
+	cache := p.jwksCache
+	issuer := p.issuer
+	clientID := p.clientID
+	p.mu.RUnlock()
+
+	if cache == nil {
+		return nil, errors.New("oidc: JWKS cache unavailable")
+	}
+
+	kcClaims, err := cache.VerifyToken(ctx, tokenStr)
 	if err != nil {
 		return nil, err
 	}
 
 	// Validate issuer if configured
-	if p.issuer != "" && strings.TrimRight(kcClaims.Issuer, "/") != p.issuer {
-		return nil, fmt.Errorf("keycloak: token issuer %q does not match configured issuer %q", kcClaims.Issuer, p.issuer)
+	if issuer != "" && strings.TrimRight(kcClaims.Issuer, "/") != issuer {
+		return nil, fmt.Errorf("oidc: token issuer %q does not match configured issuer %q", kcClaims.Issuer, issuer)
 	}
 
-	uClaims := MapKeycloakClaims(kcClaims, p.clientID)
+	uClaims := MapKeycloakClaims(kcClaims, clientID)
 	return uClaims, nil
 }
 
 func (p *KeycloakProvider) RefreshToken(ctx context.Context, refreshToken string) (*UnifiedClaims, *TokenPair, error) {
-	if p.oidcClient == nil {
-		return nil, nil, errors.New("keycloak: OIDC client not configured for refresh")
+	p.mu.RLock()
+	client := p.oidcClient
+	healthy := p.isHealthy
+	p.mu.RUnlock()
+
+	if client == nil || !healthy {
+		return nil, nil, errors.New("oidc: provider client unavailable or unhealthy")
 	}
 
-	resp, err := p.oidcClient.RefreshToken(ctx, refreshToken)
+	resp, err := client.RefreshToken(ctx, refreshToken)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	uClaims, err := p.ValidateToken(ctx, resp.AccessToken)
 	if err != nil {
-		return nil, nil, fmt.Errorf("keycloak: validating refreshed access token: %w", err)
+		return nil, nil, fmt.Errorf("oidc: validating refreshed access token: %w", err)
 	}
 
 	return uClaims, &TokenPair{
@@ -260,8 +433,9 @@ func (p *KeycloakProvider) RefreshToken(ctx context.Context, refreshToken string
 
 // ── HybridProvider ───────────────────────────────────────────────────────────
 
-// HybridProvider enables simultaneous support for internal local tokens and external Keycloak tokens.
+// HybridProvider enables simultaneous support for internal local tokens and external OIDC tokens.
 type HybridProvider struct {
+	mu       sync.RWMutex
 	local    *LocalProvider
 	external *KeycloakProvider
 }
@@ -278,10 +452,21 @@ func (h *HybridProvider) Name() string {
 	return "hybrid"
 }
 
+// SetExternalProvider dynamically replaces or updates the external provider.
+func (h *HybridProvider) SetExternalProvider(external *KeycloakProvider) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.external = external
+}
+
 func (h *HybridProvider) Authenticate(ctx context.Context, username, password string, requestedScopes []string) (*UnifiedClaims, *TokenPair, error) {
-	// First attempt Keycloak Direct Grant when external provider is configured
-	if h.external != nil {
-		extClaims, extPair, extErr := h.external.Authenticate(ctx, username, password, requestedScopes)
+	h.mu.RLock()
+	ext := h.external
+	h.mu.RUnlock()
+
+	// First attempt external provider (e.g. Keycloak / Google OIDC) when healthy
+	if ext != nil && ext.IsHealthy() {
+		extClaims, extPair, extErr := ext.Authenticate(ctx, username, password, requestedScopes)
 		if extErr == nil {
 			return extClaims, extPair, nil
 		}
@@ -292,15 +477,19 @@ func (h *HybridProvider) Authenticate(ctx context.Context, username, password st
 }
 
 func (h *HybridProvider) ValidateToken(ctx context.Context, tokenStr string) (*UnifiedClaims, error) {
+	h.mu.RLock()
+	ext := h.external
+	h.mu.RUnlock()
+
 	issuer, _ := peekTokenMetadata(tokenStr)
 
-	// If token issuer matches Keycloak realm or starts with external issuer URL, route to Keycloak first
-	if h.external != nil && h.external.issuer != "" && strings.HasPrefix(issuer, h.external.issuer) {
-		claims, err := h.external.ValidateToken(ctx, tokenStr)
+	// If token issuer matches external realm or starts with external issuer URL, route to external first
+	if ext != nil && ext.issuer != "" && strings.HasPrefix(issuer, ext.issuer) {
+		claims, err := ext.ValidateToken(ctx, tokenStr)
 		if err == nil {
 			return claims, nil
 		}
-		log.Printf("[HYBRID-AUTH] Keycloak validation failed: %v, falling back to local...", err)
+		log.Printf("[HYBRID-AUTH] External provider validation failed: %v, falling back to local...", err)
 	}
 
 	// Try local provider
@@ -310,8 +499,8 @@ func (h *HybridProvider) ValidateToken(ctx context.Context, tokenStr string) (*U
 	}
 
 	// If local failed and we have not attempted external yet, try external as fallback
-	if h.external != nil && (h.external.issuer == "" || !strings.HasPrefix(issuer, h.external.issuer)) {
-		extClaims, extErr := h.external.ValidateToken(ctx, tokenStr)
+	if ext != nil && (ext.issuer == "" || !strings.HasPrefix(issuer, ext.issuer)) {
+		extClaims, extErr := ext.ValidateToken(ctx, tokenStr)
 		if extErr == nil {
 			return extClaims, nil
 		}
@@ -327,9 +516,13 @@ func (h *HybridProvider) RefreshToken(ctx context.Context, refreshToken string) 
 		return claims, pair, nil
 	}
 
-	// Fallback to external if configured
-	if h.external != nil {
-		extClaims, extPair, extErr := h.external.RefreshToken(ctx, refreshToken)
+	h.mu.RLock()
+	ext := h.external
+	h.mu.RUnlock()
+
+	// Fallback to external if configured and healthy
+	if ext != nil && ext.IsHealthy() {
+		extClaims, extPair, extErr := ext.RefreshToken(ctx, refreshToken)
 		if extErr == nil {
 			return extClaims, extPair, nil
 		}
