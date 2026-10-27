@@ -213,5 +213,3 @@ func TestOIDCProvider_SelfHealingPoller(t *testing.T) {
 		t.Error("expected provider to automatically self-heal and reconnect when server comes back up")
 	}
 }
-
-
