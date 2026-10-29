@@ -76,7 +76,7 @@ The system decomposes financial operations into autonomous, loosely-coupled micr
 
 | Microservice Component | Protocol & Ports | Architectural Role | Bounded Context & Persistence |
 |---|---|---|---|
-| **API Gateway** | HTTP `:8080`<br>Prometheus `:8081` | • Edge ingress & HTTP REST-to-gRPC translation<br>• 6-layer defense-in-depth security pipeline<br>• Distributed `FailoverCoordinator` dynamic router | Stateless |
+| **API Gateway** | HTTP `:8080` (REST & `/metrics`) | • Edge ingress & HTTP REST-to-gRPC translation<br>• 6-layer defense-in-depth security pipeline<br>• Distributed `FailoverCoordinator` dynamic router | Stateless |
 | **Auth Service (global-auth-service)** | gRPC `:50054`<br>Management `:9095` | • Standalone SaaS-ready authentication & IAM service<br>• Pluggable Identity Providers (Keycloak OIDC + Local MongoDB)<br>• Token issuance, signature verification, token revocation blocklist | `auth_db.users`<br>`auth_db.token_revocations` |
 | **Keycloak IdP (global-auth-service)** | HTTP `:8085` | • OpenID Connect (OIDC) / OAuth 2.0 Identity Provider<br>• Realm `wallet-realm`, user/role management, JWKS public key distribution | Embedded H2 / Postgres |
 | **Wallet Service (Primary)** | gRPC `:50051`<br>Management `:9094` | • Core banking engine for `us-east-1-primary`<br>• Multi-document ACID transactions (`Majority`/`Snapshot`)<br>• Atomic Transactional Outbox relay for ledger decoupling<br>• OTel W3C tracing, gRPC health, Prometheus metrics | `banking_db.wallets`<br>`banking_db.idempotency_records`<br>`banking_db.ledger_tasks` (Outbox) |
@@ -101,8 +101,9 @@ Operating under the foundational principle of **"Never Trust, Always Verify"**, 
 ├─────────────────────────┬─────────────────────────────┬─────────────────────────────────────┤
 │ Security Vector         │ Enforcement Mechanism       │ Technical Implementation            │
 ├─────────────────────────┼─────────────────────────────┼─────────────────────────────────────┤
-│ 1. External AuthN       │ Cryptographic HMAC-SHA256   │ Validates token signature, issuer,  │
-│                         │ JSON Web Tokens (JWT)       │ audience, and expiration on all APIs│
+│ 1. External AuthN       │ HS256 or RS256 JSON Web     │ Validates token signature, issuer,  │
+│                         │ Tokens (JWT); OIDC tokens   │ audience, and expiration on all APIs│
+│                         │ verified via in-memory JWKS │ (offline RSA-256 for OIDC tokens)   │
 ├─────────────────────────┼─────────────────────────────┼─────────────────────────────────────┤
 │ 2. Data Access (IDOR)   │ Subject Ownership Check     │ Enforces claims.sub == wallet_id;   │
 │                         │ (AuthZ)                     │ cross-account access yields 403     │
@@ -111,7 +112,9 @@ Operating under the foundational principle of **"Never Trust, Always Verify"**, 
 │                         │ & Scope Verification        │ 'admin' or scope: 'cluster:admin'   │
 ├─────────────────────────┼─────────────────────────────┼─────────────────────────────────────┤
 │ 4. Internal Transport   │ Mutual TLS (mTLS)           │ Bidirectional x509 cert validation  │
-│                         │ for gRPC                    │ (tls.RequireAndVerifyClientCert)    │
+│                         │ for gRPC (opt-in via        │ (`tls.RequireAndVerifyClientCert`); │
+│                         │ GRPC_TLS_ENABLED=true)      │ default compose uses insecure gRPC  │
+│                         │                             │ for local development               │
 ├─────────────────────────┼─────────────────────────────┼─────────────────────────────────────┤
 │ 5. Perimeter Protection │ Defense-in-Depth Middleware │ Rate limiting (60 rps/100 burst),   │
 │                         │ Pipeline                    │ 1MB max body, HSTS, CSP, nosniff    │
@@ -121,9 +124,9 @@ Operating under the foundational principle of **"Never Trust, Always Verify"**, 
 └─────────────────────────┴─────────────────────────────┴─────────────────────────────────────┘
 ```
 
-1. **Perimeter Defense-in-Depth**: Every incoming request must traverse a comprehensive middleware pipeline at the API Gateway: Security Headers (HSTS, CSP, X-Frame-Options: DENY, X-Content-Type-Options: nosniff), MaxBytes (1MB payload limit), CORS, Token-Bucket Rate Limiter (60 req/s, 100 burst), and JWT Bearer validation.
+1. **Perimeter Defense-in-Depth**: Every incoming request traverses an ordered middleware defense pipeline at the API Gateway: W3C Distributed Tracing (`TraceHTTPMiddleware`), JWT Authentication & Signature Validation (`AuthMiddleware`), Token-Bucket Rate Limiter (`RateLimitMiddleware`: 60 req/s, 100 burst), Security Headers (`SecurityHeadersMiddleware`: HSTS, CSP, X-Frame-Options: DENY, X-Content-Type-Options: nosniff), CORS Preflight & Origin Filtering (`CORSMiddleware`), and Payload Size Guard (`MaxBytesMiddleware`: 1MB limit).
 2. **Insecure Direct Object Reference (IDOR) Immunity**: Callers can only perform balance checks, fund transfers, or ledger queries on wallets matching their authenticated JWT subject (`sub`). Attempts to manipulate another party's wallet are immediately rejected with `403 Forbidden` unless the caller possesses verified administrative privileges.
-3. **Internal Zero-Trust Mesh via Mutual TLS (mTLS)**: Cleartext gRPC is eliminated. The API Gateway and all core microservices mandate bidirectional x509 certificate verification (`tls.RequireAndVerifyClientCert`) with dedicated Root CA verification, preventing MITM attacks and pod-to-pod impersonation.
+3. **Internal Zero-Trust Mesh via Mutual TLS (mTLS)**: Cleartext gRPC is eliminated in secure environments. The API Gateway and core microservices support bidirectional x509 certificate verification (`tls.RequireAndVerifyClientCert`) via `GRPC_TLS_ENABLED=true` with dedicated Root CA verification, preventing MITM attacks and pod-to-pod impersonation (insecure transport used by default for local compose development).
 4. **Resilience & Anti-Abuse**: Explicit server timeouts (`ReadHeaderTimeout: 3s`, `ReadTimeout: 10s`) neutralize Slowloris attacks; token-bucket algorithms mitigate brute-force and DoS floods.
 
 
@@ -157,7 +160,9 @@ flowchart TB
     end
 
     subgraph Ingress["Ingress & Routing Layer"]
-        GW["API Gateway (:8080)<br/>- REST to gRPC Translation<br/>- Dynamic Failover Router<br/>- FX Proxy (/api/v1/fx/*)<br/>- Metrics Exporter (:8081)"]
+        GW["API Gateway (:8080)<br/>- REST to gRPC Translation<br/>- Dynamic Failover Router<br/>- FX Proxy (/api/v1/fx/*)<br/>- Metrics & Probes (/metrics, /healthz)"]
+        AUTH_SVC["auth-service (:50054)<br/>- HybridProvider (OIDC + Mongo)<br/>- Token Validation & Revocation<br/>- Self-Healing Health Poller"]
+        KC["Keycloak IdP (:8085)<br/>- OIDC / OAuth2 Realm: wallet<br/>- RSA256 JWKS Endpoint"]
     end
 
     subgraph CoreServices["Core Financial Services Layer"]
@@ -208,6 +213,9 @@ flowchart TB
     end
 
     REST -->|"HTTP REST"| GW
+    GW -->|"gRPC Auth / ValidateToken"| AUTH_SVC
+    AUTH_SVC -->|"OIDC Password / Discovery"| KC
+    AUTH_SVC -.->|"Self-Healing Health Poller"| KC
     RPC -->|"gRPC Protobuf"| WP
     RPC -.->|"gRPC Protobuf"| WS
     RPC -->|"gRPC Protobuf"| LS
@@ -243,7 +251,7 @@ flowchart TB
     LOG_SVC -->|"Persist Logs"| MDB_LOG
     REST -->|"Log & Trace Queries"| LOG_SVC
 
-    PROM -->|"Scrape :8081"| GW
+    PROM -->|"Scrape :8080/metrics"| GW
     PROM -->|"Scrape :9094"| WP
     PROM -->|"Scrape :9093"| WS
     PROM -->|"Scrape :9092"| LS
@@ -413,11 +421,12 @@ graph TD
     Client["HTTP / REST Client"] -->|"1. HTTPS + Bearer JWT"| GW["API Gateway (:8080)"]
 
     subgraph IngressDefense["API Gateway Defense-in-Depth Pipeline"]
-        GW --> M1["SecurityHeadersMiddleware<br/>HSTS, CSP, X-Frame-Options: DENY, nosniff"]
-        M1 --> M2["MaxBytesMiddleware<br/>1MB Body Limit (Anti-DoS)"]
-        M2 --> M3["CORSMiddleware<br/>Preflight & Origin Filtering"]
-        M3 --> M4["RateLimitMiddleware<br/>Token Bucket: 60 rps, 100 burst per IP"]
-        M4 --> M5["AuthMiddleware<br/>HMAC-SHA256 Token Validation"]
+        GW --> M0["TraceHTTPMiddleware<br/>OpenTelemetry W3C Trace Context Propagation"]
+        M0 --> M1["AuthMiddleware<br/>JWT AuthN (HS256/RS256 Offline JWKS) via auth-service"]
+        M1 --> M2["RateLimitMiddleware<br/>Token Bucket: 60 rps, 100 burst per IP"]
+        M2 --> M3["SecurityHeadersMiddleware<br/>HSTS, CSP, X-Frame-Options: DENY, nosniff"]
+        M3 --> M4["CORSMiddleware<br/>Preflight & Origin Filtering"]
+        M4 --> M5["MaxBytesMiddleware<br/>1MB Body Limit (Anti-DoS)"]
         M5 --> M6{"IDOR & RBAC Validator"}
     end
 
@@ -444,11 +453,11 @@ graph TD
 
 ## Microservice Directory & Port Matrix
 
-The platform is structured into **7 modular Docker Compose projects** that can be started, stopped, or scaled independently:
+The platform is structured into **8 modular Docker Compose projects** that can be started, stopped, or scaled independently:
 
 | Service | Docker Compose Project | Container Name | Protocol / Ports | Role & Responsibilities |
 |---|---|---|---|---|
-| **API Gateway** | `global-wallet-microservices` | `wallet_api_gateway` | HTTP `:8080`<br/>Prometheus `:8081` | REST ingress, request validation, gRPC reverse proxy, distributed failover coordinator router, `/api/v1/fx/*` gateway endpoints. |
+| **API Gateway** | `global-wallet-microservices` | `wallet_api_gateway` | HTTP `:8080` (REST & `/metrics`) | REST ingress, request validation, gRPC reverse proxy, distributed failover coordinator router, `/api/v1/fx/*` gateway endpoints. |
 | **Wallet Service (Primary)** | `global-wallet-microservices` | `wallet_primary_active` | gRPC `:50051`<br/>Management `:9094` | Primary active banking engine (`us-east-1`). ACID multi-doc transactions, cross-currency FX conversion via `fx-service`, `LedgerRelay` outbox worker, gRPC health probe, Prometheus `/metrics` and `/healthz`. |
 | **Wallet Service (Standby)** | `global-wallet-microservices` | `wallet_standby_hot_dr` | gRPC `:50053`<br/>Management `:9093` | Hot standby disaster recovery replica (`eu-west-1`). Identical engine with Standby Write Fencing ready for instant promotion, gRPC health probe, Prometheus `/metrics` and `/healthz`. |
 | **Ledger Service** | `global-wallet-microservices` | `wallet_ledger_service` | gRPC `:50052`<br/>Management `:9092` | Immutable financial ledger, 2-leg same-currency & 4-leg multi-currency FX settlement double-entry postings, reverse-chronological cursor-based queries, gRPC health probe, Prometheus `/metrics` and `/healthz`. |
@@ -490,7 +499,7 @@ flowchart TD
     end
 
     subgraph CD_Build["Packaging & Release"]
-        Pub["8. docker-publish<br/>• Parallel Matrix (5 Microservices)<br/>• Docker Hub + GHA layer caching"]
+        Pub["8. docker-publish<br/>• Parallel Matrix (6 Microservices)<br/>• Docker Hub + GHA layer caching"]
     end
 
     subgraph CD_Deploy["Continuous Deployment"]
@@ -633,7 +642,7 @@ Authenticate credentials against `global-auth-service` via API Gateway for Alice
 # Obtain token for Alice (Keycloak user)
 ALICE_TOKEN=$(curl -s -X POST "http://localhost:8080/api/v1/auth/login" \
   -H "Content-Type: application/json" \
-  -d '{"username":"alice","password":"alice123"}' | jq -r .access_token)
+  -d '{"username":"alice","password":"password123"}' | jq -r .access_token)
 
 # Obtain token for Admin (change-me-in-production)
 ADMIN_TOKEN=$(curl -s -X POST "http://localhost:8080/api/v1/auth/login" \
@@ -750,10 +759,9 @@ curl -s -X POST http://localhost:8080/api/v1/cluster/failover \
 *Response:*
 ```json
 {
-  "status": "FAILOVER_SUCCESS",
-  "active_target": "STANDBY",
-  "region": "eu-west-1 (Standby Hot DR)",
-  "timestamp": "2026-09-17T18:00:00Z"
+  "message": "Failover routing triggered",
+  "active_routed_target": "STANDBY",
+  "active_target": "STANDBY"
 }
 ```
 
@@ -797,7 +805,7 @@ A comprehensive 35-test automated regression suite covering all Phase 1, Phase 2
 
 Both Postman and Bruno test runners validate:
 1. System Health & Probes (`/healthz`, `/readyz` live gRPC active node check, `/api/v1/cluster/status`)
-2. Auth & Token Minting (`/api/v1/auth/token` with claims validation)
+2. Auth & Token Minting (`/api/v1/auth/login` for credentials authentication; `/api/v1/auth/token` disabled in production via `ENABLE_DEV_TOKEN_ENDPOINT=false`)
 3. Zero-Trust Security Gates (Missing token 401, Invalid token 401, IDOR rejection 403, Rate limiter 429)
 4. Wallet Lifecycle (Alice USD $1000, Bob USD $500, Duplicate wallet 409 Conflict)
 5. Transfers & Idempotency (Atomic fund transfers, duplicate key replay, insufficient funds)
@@ -830,7 +838,7 @@ Both Postman and Bruno test runners validate:
 | [docs/KEYCLOAK_GUIDE.md](docs/KEYCLOAK_GUIDE.md) | Administrator and developer guide for Keycloak OIDC integration, login portals, user/role/client provisioning, and custom scopes. |
 | [docs/CICD_PIPELINE_GUIDE.md](docs/CICD_PIPELINE_GUIDE.md) | Comprehensive CI/CD pipeline implementation guide: quality gates, Docker Hub matrix builds, secret configuration, runner setup, and troubleshooting. |
 | [.github/workflows/ci.yml](.github/workflows/ci.yml) | Automated GitHub Actions CI/CD pipeline: Protobuf verification, Go formatting/race test quality gates, Docker Hub matrix builds, and self-hosted deployment. |
-| [postman/](postman/) | Automated 28-test integration collection, environment, and BloomRPC JSON presets. |
+| [postman/](postman/) | Automated 35-test integration collection, environment, and BloomRPC JSON presets. |
 | [SECURITY.md](SECURITY.md) | Security policy, vulnerability reporting guidelines, and development boundaries. |
 | [docs/SECURITY_VULNERABILITIES_AND_LOOPHOLES.md](docs/SECURITY_VULNERABILITIES_AND_LOOPHOLES.md) | Prioritized catalog of 15 security vulnerabilities, financial bugs, and architectural loopholes with implementation fixes. |
 | [docs/RELEASE_NOTES_v1.7.0.md](docs/RELEASE_NOTES_v1.7.0.md) | Release notes for v1.7.0: 15/15 security vulnerability remediations, Merkle tree RFC 6962 hardening, and CI/CD bugfix pipeline automation. |
