@@ -821,6 +821,7 @@ Both Postman and Bruno test runners validate:
 
 | Document | Description |
 |---|---|
+| [docs/PENDING_REQUIREMENTS_AND_ARCHITECTURE_SPEC.md](docs/PENDING_REQUIREMENTS_AND_ARCHITECTURE_SPEC.md) | Comprehensive engineering specification: pending architectural requirements, BOLA/IDOR data-layer unification, ISO-4217 financial precision, Saga patterns, and prioritized roadmap. |
 | [docs/KUBERNETES_COMPLETE_GUIDE.md](docs/KUBERNETES_COMPLETE_GUIDE.md) | Complete Kubernetes operations guide: 13-manifest reference, local Docker Desktop configuration, automated CI/CD autodeployment, and Web Dashboard navigation. |
 | [docs/DISTRIBUTED_CACHING_ARCHITECTURE.md](docs/DISTRIBUTED_CACHING_ARCHITECTURE.md) | Architectural specification and blueprint for multi-pod L1/L2 hybrid balance caching, AMQP invalidation bus, and atomic outbox relay worker leasing. |
 | [docs/RESILIENCE_CIRCUIT_BREAKING_GUIDE.md](docs/RESILIENCE_CIRCUIT_BREAKING_GUIDE.md) | Production resilience & fault tolerance guide: client-side circuit breaking with GoBreaker, resilient FX stale fallback, and outbox jittered backoff. |
