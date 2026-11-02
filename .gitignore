@@ -104,3 +104,5 @@ BloomRPC_Test_Presets.json
 
 # Documents, resumes and PDF files
 *.pdf
+
+sample*
