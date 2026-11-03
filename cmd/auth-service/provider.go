@@ -232,16 +232,14 @@ func (p *KeycloakProvider) Ping(ctx context.Context) error {
 	}
 
 	discoveryURL := fmt.Sprintf("%s/.well-known/openid-configuration", strings.TrimRight(issuer, "/"))
-	// #nosec G704 -- discoveryURL is constructed from trusted configured issuer for OIDC health check
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, discoveryURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, discoveryURL, nil) // #nosec G107 G704 -- URL built from admin-configured trusted OIDC issuer, not user input
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
 
 	client := &http.Client{Timeout: 3 * time.Second}
-	// #nosec G704 -- outbound health check probe to configured trusted OIDC issuer
-	resp, err := client.Do(req)
+	resp, err := client.Do(req) // #nosec G107 G704 -- outbound probe to configured trusted OIDC issuer
 	if err != nil {
 		return err
 	}

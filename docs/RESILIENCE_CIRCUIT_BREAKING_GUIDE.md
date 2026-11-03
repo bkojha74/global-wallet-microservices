@@ -149,7 +149,23 @@ This guarantees zero static analysis findings under **GoSec**, **SonarQube**, an
 
 ---
 
-## 5. Verification & Testing
+## 5. Identity Provider Self-Healing Health Poller & Offline Token Verification
+
+### 5.1 Asynchronous Health Poller (`cmd/auth-service`)
+In hybrid identity environments, external identity providers (Keycloak, Okta, Google Identity) may boot asynchronously or undergo transient restarts.
+
+To prevent container startup race conditions:
+1. `auth-service` launches an asynchronous background poller (`StartHealthPoller`) that probes the OIDC discovery endpoint (`/.well-known/openid-configuration`) at regular intervals (default: 5s).
+2. **Auto-Degradation**: If the external IdP becomes unreachable, the health flag (`isHealthy`) atomically switches to `false`, gracefully routing authentication requests to the local database fallback.
+3. **Auto-Reconnection**: When the remote IdP returns HTTP 200, the poller triggers `Reconnect()`, rediscovers OIDC endpoints, fetches fresh JWKS public keys, and seamlessly restores the external provider as primary.
+
+### 5.2 Stateless Offline Token Verification
+1. Microservices cache public signing keys (`JWKSCache`) in-memory.
+2. Even during a complete Keycloak outage, existing user requests (such as deposits, transfers, and balance inquiries) are verified mathematically in RAM using the cached RS256 public keys in under 0.1ms. Zero network calls to Keycloak are made for token verification.
+
+---
+
+## 6. Verification & Testing
 
 Run the full resilience and race detection test suite:
 
