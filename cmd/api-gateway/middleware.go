@@ -384,9 +384,122 @@ func RequireScope(scope string, next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// ── Wallet Ownership Cache (REQ-SEC-01) ──────────────────────────────────────
+// walletOwnershipEntry stores the verified owner_id for a wallet with an expiry timestamp.
+type walletOwnershipEntry struct {
+	ownerID   string
+	expiresAt time.Time
+}
+
+// WalletOwnershipCache stores resolved wallet ownership to accelerate BOLA/IDOR verification
+// for opaque, UUID, and system-generated wallet identifiers.
+type WalletOwnershipCache struct {
+	mu      sync.RWMutex
+	entries map[string]walletOwnershipEntry
+	ttl     time.Duration
+}
+
+// NewWalletOwnershipCache initializes a new thread-safe ownership cache.
+func NewWalletOwnershipCache(ttl time.Duration) *WalletOwnershipCache {
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	c := &WalletOwnershipCache{
+		entries: make(map[string]walletOwnershipEntry),
+		ttl:     ttl,
+	}
+	// Background cleanup of stale entries every 2 minutes
+	go func() {
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			c.mu.Lock()
+			now := time.Now()
+			for k, v := range c.entries {
+				if now.After(v.expiresAt) {
+					delete(c.entries, k)
+				}
+			}
+			c.mu.Unlock()
+		}
+	}()
+	return c
+}
+
+func (c *WalletOwnershipCache) Get(walletID string) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	key := strings.ToLower(strings.TrimSpace(walletID))
+	c.mu.RLock()
+	entry, ok := c.entries[key]
+	c.mu.RUnlock()
+	if !ok || time.Now().After(entry.expiresAt) {
+		return "", false
+	}
+	return entry.ownerID, true
+}
+
+func (c *WalletOwnershipCache) Set(walletID, ownerID string) {
+	if c == nil {
+		return
+	}
+	key := strings.ToLower(strings.TrimSpace(walletID))
+	owner := strings.ToLower(strings.TrimSpace(ownerID))
+	if key == "" || owner == "" {
+		return
+	}
+	c.mu.Lock()
+	c.entries[key] = walletOwnershipEntry{
+		ownerID:   owner,
+		expiresAt: time.Now().Add(c.ttl),
+	}
+	c.mu.Unlock()
+}
+
+func (c *WalletOwnershipCache) Invalidate(walletID string) {
+	if c == nil {
+		return
+	}
+	key := strings.ToLower(strings.TrimSpace(walletID))
+	c.mu.Lock()
+	delete(c.entries, key)
+	c.mu.Unlock()
+}
+
+var defaultWalletOwnershipCache = NewWalletOwnershipCache(5 * time.Minute)
+
+// SetWalletOwner associates a wallet with its verified owner in the Gateway cache.
+func SetWalletOwner(walletID, ownerID string) {
+	defaultWalletOwnershipCache.Set(walletID, ownerID)
+}
+
+// GetWalletOwner retrieves the cached owner for a wallet, if present.
+func GetWalletOwner(walletID string) (string, bool) {
+	return defaultWalletOwnershipCache.Get(walletID)
+}
+
+// InvalidateWalletOwner evicts a wallet from the Gateway ownership cache.
+func InvalidateWalletOwner(walletID string) {
+	defaultWalletOwnershipCache.Invalidate(walletID)
+}
+
+// isOpaqueOrSystemID returns true if the wallet identifier uses an opaque system format
+// (e.g., "wal_...", "acc_...", or standard 36-char UUID) rather than a user-namespaced prefix.
+func isOpaqueOrSystemID(id string) bool {
+	id = strings.ToLower(strings.TrimSpace(id))
+	return strings.HasPrefix(id, "wal_") ||
+		strings.HasPrefix(id, "wal-") ||
+		strings.HasPrefix(id, "acc_") ||
+		strings.HasPrefix(id, "acc-") ||
+		isOpaqueID(id)
+}
+
 // ValidateWalletOwnership verifies that the token's subject owns the specified wallet or is an admin.
-// A subject owns a wallet if the wallet ID matches the subject, or if the wallet ID is
-// prefixed by the subject followed by a delimiter (e.g., "alice_usd", "alice_eur", "alice-usd", "w-alice-01").
+// A subject owns a wallet if:
+//  1. The caller has the admin role.
+//  2. The wallet ID matches the subject, or is prefixed by the subject followed by a delimiter (e.g. "alice_usd").
+//  3. The wallet ID is cached in the ownership cache and its owner matches the subject.
 func ValidateWalletOwnership(claims *auth.Claims, walletID string) error {
 	if claims == nil {
 		return auth.ErrInsufficientPerms
@@ -407,6 +520,15 @@ func ValidateWalletOwnership(claims *auth.Claims, walletID string) error {
 		strings.HasPrefix(target, "w-"+sub+"_") {
 		return nil
 	}
+
+	// Check resolved ownership cache for opaque / UUID wallets
+	if owner, ok := defaultWalletOwnershipCache.Get(target); ok {
+		if owner == sub {
+			return nil
+		}
+		return auth.ErrIDORViolation
+	}
+
 	return auth.ErrIDORViolation
 }
 

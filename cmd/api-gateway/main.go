@@ -146,6 +146,57 @@ func withOutgoingAuthContext(ctx context.Context) context.Context {
 	return ctx
 }
 
+// verifyWalletAccess checks whether the authenticated caller has access to the specified wallet.
+// It first attempts fast-path lexical and cache-based verification via ValidateWalletOwnership.
+// If the wallet uses an opaque or system ID (e.g. "wal_...", "acc_...", or UUID) and is not yet cached,
+// it executes an authenticated probe against wallet-service, allowing the core domain service to
+// verify ownership against the database (banking_db.wallets).
+func (g *Gateway) verifyWalletAccess(ctx context.Context, claims *auth.Claims, walletID string) error {
+	if claims == nil {
+		return auth.ErrInsufficientPerms
+	}
+	if claims.HasRole(auth.RoleAdmin) || claims.HasScope("cluster:admin") || claims.HasScope("wallet:admin") {
+		return nil
+	}
+
+	// 1. Fast-path: lexical matching or local ownership cache
+	err := ValidateWalletOwnership(claims, walletID)
+	if err == nil {
+		return nil
+	}
+
+	// 2. If it is NOT an opaque or system ID, reject immediately (explicit foreign namespace)
+	target := strings.ToLower(strings.TrimSpace(walletID))
+	if !isOpaqueOrSystemID(target) {
+		return auth.ErrIDORViolation
+	}
+
+	// 3. Opaque/System ID not in local cache: resolve dynamically against wallet-service
+	client, _ := g.getActiveWalletClient(ctx)
+	if client == nil {
+		return auth.ErrIDORViolation
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	probeCtx = ContextWithClaims(probeCtx, claims)
+	probeCtx = withOutgoingAuthContext(probeCtx)
+
+	_, probeErr := client.GetBalance(probeCtx, &walletv1.GetBalanceRequest{WalletId: walletID})
+	if probeErr == nil {
+		// Authoritative core service verified caller ownership! Populate cache.
+		SetWalletOwner(walletID, claims.Subject)
+		return nil
+	}
+
+	if st, ok := status.FromError(probeErr); ok && st.Code() == codes.PermissionDenied {
+		return auth.ErrIDORViolation
+	}
+
+	// On other errors (e.g. timeout, unavailable), preserve the original IDOR violation
+	return auth.ErrIDORViolation
+}
+
 func parseCreateWalletRequest(r *http.Request, traceID string) (*walletv1.CreateWalletRequest, error) {
 	body, err := readClientJSON(traceID, r.Body)
 	if err != nil {
@@ -201,6 +252,14 @@ func handleWalletGRPCError(w http.ResponseWriter, err error, action string) {
 			http.Error(w, st.Message(), http.StatusBadRequest)
 			return
 		}
+		if st.Code() == codes.PermissionDenied {
+			writeAuthError(w, http.StatusForbidden, st.Message())
+			return
+		}
+		if st.Code() == codes.NotFound {
+			http.Error(w, st.Message(), http.StatusNotFound)
+			return
+		}
 	}
 	http.Error(w, fmt.Sprintf("Error %s: %v", action, err), http.StatusInternalServerError)
 }
@@ -241,6 +300,16 @@ func (g *Gateway) handleCreateWallet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logProto(traceID, "wallet_proto_response_received", resp)
+
+	// REQ-SEC-01: Populate ownership cache upon successful wallet creation
+	ownerID := protoReq.OwnerId
+	if ownerID == "" {
+		ownerID = protoReq.CreatedBy
+	}
+	if ownerID != "" {
+		SetWalletOwner(protoReq.WalletId, ownerID)
+	}
+
 	g.emit(ctx, eventAPIResponseSent, observability.LevelInfo, "Wallet creation response sent", map[string]any{
 		"operation":     "create_wallet",
 		"routed_target": target,
@@ -272,7 +341,7 @@ func (g *Gateway) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
-		if err := ValidateWalletOwnership(claims, walletID); err != nil {
+		if err := g.verifyWalletAccess(r.Context(), claims, walletID); err != nil {
 			log.Printf("[SECURITY] IDOR blocked: subject %s tried to view balance of %s", claims.Subject, walletID)
 			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
 			return
@@ -295,8 +364,15 @@ func (g *Gateway) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 	resp, err := client.GetBalance(callCtx, protoReq)
 	if err != nil {
 		log.Printf(traceWalletGRPCRespFmt, traceID, err)
+		if st, ok := status.FromError(err); ok && st.Code() == codes.PermissionDenied {
+			writeAuthError(w, http.StatusForbidden, st.Message())
+			return
+		}
 		http.Error(w, fmt.Sprintf("Error retrieving balance: %v", err), http.StatusInternalServerError)
 		return
+	}
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		SetWalletOwner(walletID, claims.Subject)
 	}
 	logProto(traceID, "wallet_proto_response_received", resp)
 	g.emit(ctx, eventAPIResponseSent, observability.LevelInfo, "Balance response sent", map[string]any{"operation": "get_balance", "routed_target": target})
@@ -380,7 +456,7 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
-		if err := ValidateWalletOwnership(claims, sourceWallet); err != nil {
+		if err := g.verifyWalletAccess(r.Context(), claims, sourceWallet); err != nil {
 			log.Printf("[SECURITY] IDOR blocked: subject %s tried to transfer from %s", claims.Subject, sourceWallet)
 			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
 			return
@@ -556,7 +632,7 @@ func (g *Gateway) handleWalletExchange(w http.ResponseWriter, r *http.Request) {
 	correlation.IdempotencyKey = idempKey
 
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
-		if err := ValidateWalletOwnership(claims, walletID); err != nil {
+		if err := g.verifyWalletAccess(r.Context(), claims, walletID); err != nil {
 			log.Printf("[SECURITY] IDOR blocked: subject %s tried to exchange currency in wallet %s", claims.Subject, walletID)
 			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
 			return
@@ -724,7 +800,7 @@ func (g *Gateway) handleGetWalletLimits(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
-		if err := ValidateWalletOwnership(claims, walletID); err != nil && !claims.HasRole(auth.RoleAdmin) {
+		if err := g.verifyWalletAccess(r.Context(), claims, walletID); err != nil {
 			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
 			return
 		}
@@ -741,6 +817,10 @@ func (g *Gateway) handleGetWalletLimits(w http.ResponseWriter, r *http.Request) 
 		WalletId: walletID,
 	})
 	if err != nil {
+		if st, ok := status.FromError(err); ok && st.Code() == codes.PermissionDenied {
+			writeAuthError(w, http.StatusForbidden, st.Message())
+			return
+		}
 		http.Error(w, fmt.Sprintf("Failed to get wallet limits: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -940,7 +1020,7 @@ func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWal
 	correlation.IdempotencyKey = idempKey
 
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
-		if err := ValidateWalletOwnership(claims, walletID); err != nil && !claims.HasRole(auth.RoleAdmin) {
+		if err := g.verifyWalletAccess(r.Context(), claims, walletID); err != nil {
 			log.Printf("[SECURITY] IDOR blocked: subject %s tried to deposit into wallet %s", claims.Subject, walletID)
 			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
 			return
@@ -1121,7 +1201,7 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 	correlation.IdempotencyKey = idempKey
 
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
-		if err := ValidateWalletOwnership(claims, walletID); err != nil && !claims.HasRole(auth.RoleAdmin) {
+		if err := g.verifyWalletAccess(r.Context(), claims, walletID); err != nil {
 			log.Printf("[SECURITY] IDOR blocked: subject %s tried to withdraw from wallet %s", claims.Subject, walletID)
 			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
 			return
@@ -1430,7 +1510,7 @@ func (g *Gateway) handleLedger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
-		if err := ValidateWalletOwnership(claims, walletID); err != nil {
+		if err := g.verifyWalletAccess(r.Context(), claims, walletID); err != nil {
 			log.Printf("[SECURITY] IDOR blocked: subject %s tried to view ledger of %s", claims.Subject, walletID)
 			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
 			return
