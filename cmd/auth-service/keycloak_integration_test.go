@@ -136,7 +136,10 @@ func TestKeycloakIntegration(t *testing.T) {
 			t.Skip("aliceAccessToken not available")
 		}
 
-		oidcClient, _ := NewOIDCClient(ctx, issuerURL, clientID, clientSecret, "")
+		oidcClient, err := NewOIDCClient(ctx, issuerURL, clientID, clientSecret, "")
+		if err != nil {
+			t.Fatalf("OIDC client init failed: %v", err)
+		}
 		jwksCache := NewJWKSCache(oidcClient.JwksURI(), time.Hour)
 		kcProvider := NewKeycloakProvider(oidcClient, jwksCache, clientID, issuerURL)
 
@@ -176,7 +179,10 @@ func TestKeycloakIntegration(t *testing.T) {
 
 	// ── LEVEL 4: AC-07 - Fine-grained Authorization Decisions ────────────────
 	t.Run("Level4_Authorization_Decisions", func(t *testing.T) {
-		oidcClient, _ := NewOIDCClient(ctx, issuerURL, clientID, clientSecret, "")
+		oidcClient, err := NewOIDCClient(ctx, issuerURL, clientID, clientSecret, "")
+		if err != nil {
+			t.Fatalf("OIDC client init failed: %v", err)
+		}
 		jwksCache := NewJWKSCache(oidcClient.JwksURI(), time.Hour)
 		kcProvider := NewKeycloakProvider(oidcClient, jwksCache, clientID, issuerURL)
 
@@ -241,7 +247,10 @@ func TestKeycloakIntegration(t *testing.T) {
 			t.Skip("aliceAccessToken not available")
 		}
 
-		oidcClient, _ := NewOIDCClient(ctx, issuerURL, clientID, clientSecret, "")
+		oidcClient, err := NewOIDCClient(ctx, issuerURL, clientID, clientSecret, "")
+		if err != nil {
+			t.Fatalf("OIDC client init failed: %v", err)
+		}
 		jwksCache := NewJWKSCache(oidcClient.JwksURI(), time.Hour)
 		kcProvider := NewKeycloakProvider(oidcClient, jwksCache, clientID, issuerURL)
 

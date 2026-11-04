@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -38,13 +37,7 @@ func (r *mockServerRegistry) RoundTrip(req *http.Request) (*http.Response, error
 	r.mu.RUnlock()
 
 	if !ok {
-		return &http.Response{
-			StatusCode: http.StatusBadGateway,
-			Status:     "502 Bad Gateway",
-			Body:       io.NopCloser(bytes.NewBufferString("no test handler for " + req.URL.String())),
-			Header:     make(http.Header),
-			Request:    req,
-		}, nil
+		return http.DefaultTransport.RoundTrip(req)
 	}
 
 	rec := httptest.NewRecorder()

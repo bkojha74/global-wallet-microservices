@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -31,13 +29,7 @@ func (r *mockAuthServerRegistry) RoundTrip(req *http.Request) (*http.Response, e
 	r.mu.RUnlock()
 
 	if !ok {
-		return &http.Response{
-			StatusCode: http.StatusBadGateway,
-			Status:     "502 Bad Gateway",
-			Body:       io.NopCloser(bytes.NewBufferString("no test handler for " + req.URL.String())),
-			Header:     make(http.Header),
-			Request:    req,
-		}, nil
+		return http.DefaultTransport.RoundTrip(req)
 	}
 
 	rec := httptest.NewRecorder()
