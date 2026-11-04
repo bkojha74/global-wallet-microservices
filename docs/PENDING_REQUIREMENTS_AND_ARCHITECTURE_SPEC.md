@@ -318,7 +318,7 @@ Two independent polling timers incur unnecessary read query load on the primary 
 - For CLI and Gateway unit tests, mock HTTP clients using `http.RoundTripper` or in-memory `net.Pipe()` rather than relying on live host TCP listeners.
 
 #### Acceptance Criteria
-- [ ] `go test ./...` passes 100% cleanly in completely disconnected/air-gapped environments without network or socket errors.
+- [x] `go test ./...` passes 100% cleanly in completely disconnected/air-gapped environments without network or socket errors.
 
 ---
 
@@ -340,7 +340,7 @@ Recent core banking additions (deposit payment rails `ACH`/`CARD`, withdrawal ra
 | Req ID | Component | Severity | Description | Target |
 |---|---|:---:|---|:---:|
 | **REQ-SEC-01** | `api-gateway` / `wallet-service` | 🔴 P0 | Unify Gateway BOLA prefix validation with core banking data-layer ownership | ✅ Completed |
-| **REQ-DEV-01** | `pkg/webhook` / `cmd/walletctl` | 🔴 P0 | Clean up test DNS lookups and live TCP dials for air-gapped CI/CD | Sprint 1 |
+| **REQ-DEV-01** | `pkg/webhook` / `cmd/walletctl` | 🔴 P0 | Clean up test DNS lookups and live TCP dials for air-gapped CI/CD | ✅ Completed |
 | **REQ-FIN-01** | `proto/wallet` / all services | 🔴 P0 | Standardize `Money` contract with ISO-4217 minor-unit scale & fractional nanos | Sprint 1 |
 | **REQ-FIN-02** | `wallet-service` / `fx-service` | 🟡 P1 | Compensating Saga / reservation release for failed cross-currency transfers | Sprint 2 |
 | **REQ-DIST-02** | `pkg/cache` | 🟡 P1 | AMQP Invalidation Bus auto-reconnect with full jitter exponential backoff | Sprint 2 |

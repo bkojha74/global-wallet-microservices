@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,17 +15,26 @@ import (
 	fxv1 "wallet-system/proto/fx"
 )
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
 func TestThirdPartyRateProviders(t *testing.T) {
 	ctx := context.Background()
 
-	// 1. Mock Frankfurter ECB 3rd-party API server
-	frankfurterSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"amount":1.0,"base":"USD","date":"2026-09-30","rates":{"EUR":0.915,"GBP":0.785,"JPY":149.5}}`))
-	}))
-	defer frankfurterSrv.Close()
-
-	fp := NewFrankfurterProvider(frankfurterSrv.URL, 2*time.Second)
+	// 1. Mock Frankfurter ECB 3rd-party API server in-memory
+	fp := NewFrankfurterProvider("http://mock-frankfurter.local", 2*time.Second)
+	fp.HTTPClient = &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(bytes.NewBufferString(`{"amount":1.0,"base":"USD","date":"2026-09-30","rates":{"EUR":0.915,"GBP":0.785,"JPY":149.5}}`)),
+			}, nil
+		}),
+	}
 	snap, err := fp.FetchRates(ctx, "USD")
 	if err != nil {
 		t.Fatalf("expected Frankfurter provider to succeed, got: %v", err)
@@ -33,14 +43,17 @@ func TestThirdPartyRateProviders(t *testing.T) {
 		t.Fatalf("unexpected rates from Frankfurter: %+v", snap.Rates)
 	}
 
-	// 2. Mock Open ExchangeRate-API server
-	erSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"result":"success","base_code":"USD","rates":{"EUR":0.921,"BHD":0.376,"INR":83.75}}`))
-	}))
-	defer erSrv.Close()
-
-	erp := NewExchangeRateAPIProvider(erSrv.URL, "test-api-key", 2*time.Second)
+	// 2. Mock Open ExchangeRate-API server in-memory
+	erp := NewExchangeRateAPIProvider("http://mock-exchangerate.local", "test-api-key", 2*time.Second)
+	erp.HTTPClient = &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(bytes.NewBufferString(`{"result":"success","base_code":"USD","rates":{"EUR":0.921,"BHD":0.376,"INR":83.75}}`)),
+			}, nil
+		}),
+	}
 	snapER, err := erp.FetchRates(ctx, "USD")
 	if err != nil {
 		t.Fatalf("expected ExchangeRate-API provider to succeed, got: %v", err)
@@ -50,14 +63,20 @@ func TestThirdPartyRateProviders(t *testing.T) {
 	}
 
 	// 3. CompositeRateProvider fallback when primary fails
-	failingSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer failingSrv.Close()
+	failFP := NewFrankfurterProvider("http://mock-fail.local", time.Second)
+	failFP.HTTPClient = &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(bytes.NewBuffer(nil)),
+			}, nil
+		}),
+	}
 
 	comp := &CompositeRateProvider{
 		Providers: []RateProvider{
-			NewFrankfurterProvider(failingSrv.URL, time.Second),
+			failFP,
 			fp,
 		},
 		Fallback: &BaselineProvider{},
@@ -276,15 +295,21 @@ func TestFXScaleAwareQuoteCreation(t *testing.T) {
 func TestCompositeRateProvider_StaleFallback(t *testing.T) {
 	ctx := context.Background()
 
-	// 1. Mock failing provider
-	failingSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusGatewayTimeout)
-	}))
-	defer failingSrv.Close()
+	// 1. Mock failing provider in-memory
+	failFP := NewFrankfurterProvider("http://mock-fail.local", 500*time.Millisecond)
+	failFP.HTTPClient = &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusGatewayTimeout,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(bytes.NewBuffer(nil)),
+			}, nil
+		}),
+	}
 
 	comp := &CompositeRateProvider{
 		Providers: []RateProvider{
-			NewFrankfurterProvider(failingSrv.URL, 500*time.Millisecond),
+			failFP,
 		},
 		Fallback: &BaselineProvider{},
 	}

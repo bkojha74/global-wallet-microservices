@@ -67,7 +67,7 @@ func runHealthCmd(args []string, out io.Writer, errOut io.Writer) int {
 	}
 
 	base := strings.TrimRight(*gatewayURL, "/")
-	client := &http.Client{Timeout: *timeout}
+	client := newHTTPClient(*timeout)
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 

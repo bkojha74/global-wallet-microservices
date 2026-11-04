@@ -131,7 +131,7 @@ func runWebhookCmd(args []string, out io.Writer, errOut io.Writer) int {
 	req.Header.Set("X-Wallet-Delivery", deliveryID)
 	req.Header.Set("X-Wallet-Timestamp", strconv.FormatInt(tsUnix, 10))
 
-	client := &http.Client{Timeout: *timeout}
+	client := newHTTPClient(*timeout)
 	startTime := time.Now()
 	resp, reqErr := client.Do(req)
 	latency := time.Since(startTime)

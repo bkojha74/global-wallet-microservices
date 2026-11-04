@@ -1,17 +1,24 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
-	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 func TestSignatureLifecycle(t *testing.T) {
 	secret, err := GenerateSecret()
@@ -104,24 +111,29 @@ func TestDispatcherSendAndVerifyWithHTTPServer(t *testing.T) {
 	var requestCount int32
 
 	secret := "whsec_0123456789abcdef0123456789abcdef"
+	targetURL := "https://partner-test.local/webhook"
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&requestCount, 1)
-		receivedHeader = r.Header.Get("X-Wallet-Signature")
-		receivedEvent = r.Header.Get("X-Wallet-Event")
-		receivedDelivery = r.Header.Get("X-Wallet-Delivery")
-		body, _ := io.ReadAll(r.Body)
-		receivedBody = body
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"received":true}`))
-	}))
-	defer server.Close()
+	client := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			atomic.AddInt32(&requestCount, 1)
+			receivedHeader = r.Header.Get("X-Wallet-Signature")
+			receivedEvent = r.Header.Get("X-Wallet-Event")
+			receivedDelivery = r.Header.Get("X-Wallet-Delivery")
+			body, _ := io.ReadAll(r.Body)
+			receivedBody = body
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(bytes.NewReader([]byte(`{"received":true}`))),
+			}, nil
+		}),
+	}
 
-	dispatcher := NewDispatcher(nil, server.Client())
+	dispatcher := NewDispatcher(nil, client)
 
 	sub := WebhookSubscription{
 		ID:       primitive.NewObjectID(),
-		URL:      server.URL,
+		URL:      targetURL,
 		Secret:   secret,
 		Events:   []string{EventTransferCompleted},
 		IsActive: true,
@@ -151,18 +163,28 @@ func TestDispatcherSendAndVerifyWithHTTPServer(t *testing.T) {
 	}
 
 	// Test endpoint ping method
-	code, latency, err := dispatcher.TestEndpoint(ctx, server.URL, secret)
+	code, latency, err := dispatcher.TestEndpoint(ctx, targetURL, secret)
 	if err != nil || code != http.StatusOK {
 		t.Errorf("TestEndpoint failed: code=%d, err=%v", code, err)
 	}
-	if latency <= 0 {
-		t.Errorf("expected positive latency measurement")
+	if latency < 0 {
+		t.Errorf("expected non-negative latency measurement")
 	}
 }
 
 func TestRegisterSubscriptionValidation(t *testing.T) {
 	d := NewDispatcher(nil, nil)
 	ctx := context.Background()
+
+	// Mock lookupIPFunc to resolve partner.com to a valid public IP in air-gapped/offline test environments
+	prevLookup := lookupIPFunc
+	lookupIPFunc = func(host string) ([]net.IP, error) {
+		if host == "partner.com" {
+			return []net.IP{net.ParseIP("93.184.216.34")}, nil
+		}
+		return prevLookup(host)
+	}
+	defer func() { lookupIPFunc = prevLookup }()
 
 	// 1. Nil subscription
 	if err := d.RegisterSubscription(ctx, nil); err == nil {

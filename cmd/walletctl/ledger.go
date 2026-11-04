@@ -114,7 +114,7 @@ func runLedgerVerifyCmd(args []string, out io.Writer, errOut io.Writer) int {
 		return 1
 	}
 
-	client := &http.Client{Timeout: *timeout}
+	client := newHTTPClient(*timeout)
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
@@ -289,7 +289,7 @@ func runLedgerMerkleCmd(args []string, out io.Writer, errOut io.Writer) int {
 		return 1
 	}
 
-	client := &http.Client{Timeout: *timeout}
+	client := newHTTPClient(*timeout)
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
