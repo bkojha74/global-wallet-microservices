@@ -901,14 +901,6 @@ func parseMoney(raw json.RawMessage, fallbackCurrency string) (*walletv1.Money, 
 	return nil, errors.New("invalid amount format: expected integer or money object")
 }
 
-func parseAmountAndCurrency(raw json.RawMessage, fallbackCurrency string) (int64, string, error) {
-	m, err := parseMoney(raw, fallbackCurrency)
-	if err != nil {
-		return 0, fallbackCurrency, err
-	}
-	return m.Units, m.Currency, nil
-}
-
 func parseProtoPaymentRail(railStr string) walletv1.PaymentRail {
 	switch strings.ToUpper(strings.TrimSpace(railStr)) {
 	case "CARD":
