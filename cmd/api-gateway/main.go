@@ -428,13 +428,14 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "source_wallet_id and destination_wallet_id are required", http.StatusBadRequest)
 		return
 	}
-	amountUnits, currExtracted, err := parseAmountAndCurrency(req.Amount, req.Currency)
+	moneyObj, err := parseMoney(req.Amount, req.Currency)
 	if err != nil {
 		log.Printf("[TRACE] trace_id=%s step=http_amount_decode_failed error=%v", traceID, err)
 		http.Error(w, fmt.Sprintf("invalid amount format: %v", err), http.StatusBadRequest)
 		return
 	}
-	transferCurrency := db.NormalizeCurrency(currExtracted)
+	transferCurrency := db.NormalizeCurrency(moneyObj.Currency)
+	amountUnits := moneyObj.Units
 	if transferCurrency == "" {
 		http.Error(w, "currency is required", http.StatusBadRequest)
 		return
@@ -451,7 +452,7 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		idempKey = "idemp_tx_" + traceID
 	}
 	correlation.IdempotencyKey = idempKey
-	if err := db.ValidateAmount(amountUnits, transferCurrency); err != nil {
+	if err := db.ValidateMoney(transferCurrency, amountUnits, moneyObj.Nanos, moneyObj.Scale); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -478,7 +479,7 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		IdempotencyKey:      idempKey,
 		SourceWalletId:      sourceWallet,
 		DestinationWalletId: destWallet,
-		Amount:              &walletv1.Money{Currency: transferCurrency, Units: amountUnits},
+		Amount:              moneyObj,
 		FxQuoteId:           strings.TrimSpace(req.FXQuoteID),
 	}
 	logProto(traceID, "http_json_to_wallet_proto_request", protoReq)
@@ -839,35 +840,73 @@ func (g *Gateway) handleGetWalletLimits(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-func parseAmountAndCurrency(raw json.RawMessage, fallbackCurrency string) (int64, string, error) {
+func parseMoney(raw json.RawMessage, fallbackCurrency string) (*walletv1.Money, error) {
 	if len(raw) == 0 {
-		return 0, fallbackCurrency, nil
+		fbCurr := db.NormalizeCurrency(fallbackCurrency)
+		scale, _ := db.CurrencyScale(fbCurr)
+		return &walletv1.Money{
+			Currency:     fbCurr,
+			CurrencyCode: fbCurr,
+			Units:        0,
+			Scale:        int32(scale),
+		}, nil
 	}
 	// Try parsing as scalar int64 (e.g. 500000)
 	var units int64
 	if err := json.Unmarshal(raw, &units); err == nil {
-		return units, fallbackCurrency, nil
+		fbCurr := db.NormalizeCurrency(fallbackCurrency)
+		scale, _ := db.CurrencyScale(fbCurr)
+		return &walletv1.Money{
+			Currency:     fbCurr,
+			CurrencyCode: fbCurr,
+			Units:        units,
+			Scale:        int32(scale),
+		}, nil
 	}
-	// Try parsing as Money object: {"units": 500000, "currency": "USD"} or {"amount": 500000, "currency": "USD"}
+	// Try parsing as Money object: {"units": 500000, "currency": "USD", "nanos": 0, "scale": 2}
 	var obj struct {
-		Units    int64  `json:"units"`
-		Amount   int64  `json:"amount"`
-		Currency string `json:"currency"`
+		Units        int64  `json:"units"`
+		Amount       int64  `json:"amount"`
+		Currency     string `json:"currency"`
+		CurrencyCode string `json:"currency_code"`
+		Nanos        int32  `json:"nanos"`
+		Scale        int32  `json:"scale"`
 	}
 	if err := json.Unmarshal(raw, &obj); err == nil {
 		curr := strings.TrimSpace(obj.Currency)
 		if curr == "" {
+			curr = strings.TrimSpace(obj.CurrencyCode)
+		}
+		if curr == "" {
 			curr = fallbackCurrency
 		}
-		if obj.Units != 0 {
-			return obj.Units, curr, nil
+		curr = db.NormalizeCurrency(curr)
+		u := obj.Units
+		if u == 0 && obj.Amount != 0 {
+			u = obj.Amount
 		}
-		if obj.Amount != 0 {
-			return obj.Amount, curr, nil
+		s := obj.Scale
+		if s == 0 && curr != "" {
+			stdScale, _ := db.CurrencyScale(curr)
+			s = int32(stdScale)
 		}
-		return 0, curr, nil
+		return &walletv1.Money{
+			Currency:     curr,
+			CurrencyCode: curr,
+			Units:        u,
+			Nanos:        obj.Nanos,
+			Scale:        s,
+		}, nil
 	}
-	return 0, fallbackCurrency, errors.New("invalid amount format: expected integer or money object")
+	return nil, errors.New("invalid amount format: expected integer or money object")
+}
+
+func parseAmountAndCurrency(raw json.RawMessage, fallbackCurrency string) (int64, string, error) {
+	m, err := parseMoney(raw, fallbackCurrency)
+	if err != nil {
+		return 0, fallbackCurrency, err
+	}
+	return m.Units, m.Currency, nil
 }
 
 func parseProtoPaymentRail(railStr string) walletv1.PaymentRail {
@@ -959,7 +998,7 @@ func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWal
 		return
 	}
 
-	amountUnits, currExtracted, err := parseAmountAndCurrency(req.Amount, req.Currency)
+	moneyObj, err := parseMoney(req.Amount, req.Currency)
 	if err != nil {
 		log.Printf("[TRACE] trace_id=%s step=http_amount_decode_failed error=%v", traceID, err)
 		http.Error(w, fmt.Sprintf("invalid amount format: %v", err), http.StatusBadRequest)
@@ -986,16 +1025,13 @@ func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWal
 		return
 	}
 
-	curr := db.NormalizeCurrency(currExtracted)
+	curr := db.NormalizeCurrency(moneyObj.Currency)
 	if curr == "" {
 		http.Error(w, "currency is required", http.StatusBadRequest)
 		return
 	}
-	if amountUnits <= 0 {
-		http.Error(w, "amount must be strictly positive", http.StatusBadRequest)
-		return
-	}
-	if err := db.ValidateAmount(amountUnits, curr); err != nil {
+	amountUnits := moneyObj.Units
+	if err := db.ValidateMoney(curr, amountUnits, moneyObj.Nanos, moneyObj.Scale); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -1040,12 +1076,9 @@ func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWal
 	protoReq := &walletv1.DepositFundsRequest{
 		IdempotencyKey: idempKey,
 		WalletId:       walletID,
-		Amount: &walletv1.Money{
-			Currency: curr,
-			Units:    amountUnits,
-		},
-		PaymentRail: railProto,
-		Reference:   req.Reference,
+		Amount:         moneyObj,
+		PaymentRail:    railProto,
+		Reference:      req.Reference,
 	}
 
 	client, target := g.getActiveWalletClient(ctx)
@@ -1140,7 +1173,7 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 		return
 	}
 
-	amountUnits, currExtracted, err := parseAmountAndCurrency(req.Amount, req.Currency)
+	moneyObj, err := parseMoney(req.Amount, req.Currency)
 	if err != nil {
 		log.Printf("[TRACE] trace_id=%s step=http_amount_decode_failed error=%v", traceID, err)
 		http.Error(w, fmt.Sprintf("invalid amount format: %v", err), http.StatusBadRequest)
@@ -1167,16 +1200,13 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 		return
 	}
 
-	curr := db.NormalizeCurrency(currExtracted)
+	curr := db.NormalizeCurrency(moneyObj.Currency)
 	if curr == "" {
 		http.Error(w, "currency is required", http.StatusBadRequest)
 		return
 	}
-	if amountUnits <= 0 {
-		http.Error(w, "amount must be strictly positive", http.StatusBadRequest)
-		return
-	}
-	if err := db.ValidateAmount(amountUnits, curr); err != nil {
+	amountUnits := moneyObj.Units
+	if err := db.ValidateMoney(curr, amountUnits, moneyObj.Nanos, moneyObj.Scale); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -1219,12 +1249,9 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 	})
 
 	protoReq := &walletv1.WithdrawFundsRequest{
-		IdempotencyKey: idempKey,
-		WalletId:       walletID,
-		Amount: &walletv1.Money{
-			Currency: curr,
-			Units:    amountUnits,
-		},
+		IdempotencyKey:     idempKey,
+		WalletId:           walletID,
+		Amount:             moneyObj,
 		PaymentRail:        railProto,
 		BeneficiaryDetails: req.BeneficiaryDetails,
 	}
