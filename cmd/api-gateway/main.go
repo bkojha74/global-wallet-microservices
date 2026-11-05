@@ -843,24 +843,24 @@ func (g *Gateway) handleGetWalletLimits(w http.ResponseWriter, r *http.Request) 
 func parseMoney(raw json.RawMessage, fallbackCurrency string) (*walletv1.Money, error) {
 	if len(raw) == 0 {
 		fbCurr := db.NormalizeCurrency(fallbackCurrency)
-		scale, _ := db.CurrencyScale(fbCurr)
+		scale, _ := db.CurrencyScaleInt32(fbCurr)
 		return &walletv1.Money{
 			Currency:     fbCurr,
 			CurrencyCode: fbCurr,
 			Units:        0,
-			Scale:        int32(scale),
+			Scale:        scale,
 		}, nil
 	}
 	// Try parsing as scalar int64 (e.g. 500000)
 	var units int64
 	if err := json.Unmarshal(raw, &units); err == nil {
 		fbCurr := db.NormalizeCurrency(fallbackCurrency)
-		scale, _ := db.CurrencyScale(fbCurr)
+		scale, _ := db.CurrencyScaleInt32(fbCurr)
 		return &walletv1.Money{
 			Currency:     fbCurr,
 			CurrencyCode: fbCurr,
 			Units:        units,
-			Scale:        int32(scale),
+			Scale:        scale,
 		}, nil
 	}
 	// Try parsing as Money object: {"units": 500000, "currency": "USD", "nanos": 0, "scale": 2}
@@ -887,8 +887,8 @@ func parseMoney(raw json.RawMessage, fallbackCurrency string) (*walletv1.Money, 
 		}
 		s := obj.Scale
 		if s == 0 && curr != "" {
-			stdScale, _ := db.CurrencyScale(curr)
-			s = int32(stdScale)
+			stdScale, _ := db.CurrencyScaleInt32(curr)
+			s = stdScale
 		}
 		return &walletv1.Money{
 			Currency:     curr,

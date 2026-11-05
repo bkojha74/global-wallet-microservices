@@ -40,6 +40,15 @@ func TestCurrencyScale(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for invalid currency scale")
 	}
+
+	scale32, err := CurrencyScaleInt32("USD")
+	if err != nil || scale32 != 2 {
+		t.Fatalf("expected USD scale32 2, got %d, err: %v", scale32, err)
+	}
+	_, err = CurrencyScaleInt32("INVALID")
+	if err == nil {
+		t.Fatal("expected error for invalid currency scale32")
+	}
 }
 
 func TestValidateAmount(t *testing.T) {

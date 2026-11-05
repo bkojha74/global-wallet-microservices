@@ -89,6 +89,19 @@ func CurrencyScale(code string) (int, error) {
 	return scale, nil
 }
 
+// CurrencyScaleInt32 returns the decimal scale as an int32, bounded by ISO-4217 standard exponents.
+func CurrencyScaleInt32(code string) (int32, error) {
+	scale, err := CurrencyScale(code)
+	if err != nil {
+		return 0, err
+	}
+	if scale < 0 || scale > 18 {
+		return 0, fmt.Errorf("scale out of bounds: %d", scale)
+	}
+	// #nosec G115 -- ISO-4217 minor unit scale exponent is verified in [0, 18]
+	return int32(scale), nil
+}
+
 // ValidateAmount validates that the amount is positive, non-zero, and belongs to a supported currency.
 func ValidateAmount(units int64, currency string) error {
 	return ValidateMoney(currency, units, 0, 0)
@@ -106,12 +119,12 @@ func ValidateMoney(currency string, units int64, nanos int32, scale int32) error
 		return fmt.Errorf("invalid or unsupported currency: %s", currency)
 	}
 
-	expectedScale, err := CurrencyScale(normCurr)
+	expectedScale, err := CurrencyScaleInt32(normCurr)
 	if err != nil {
 		return err
 	}
 
-	if scale != 0 && scale != int32(expectedScale) {
+	if scale != 0 && scale != expectedScale {
 		return fmt.Errorf("invalid scale %d for currency %s (expected %d)", scale, normCurr, expectedScale)
 	}
 

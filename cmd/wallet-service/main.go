@@ -239,11 +239,11 @@ func (w *WalletModel) GetAllBalances() []*walletv1.Money {
 	if len(w.Balances) > 0 {
 		out := make([]*walletv1.Money, 0, len(w.Balances))
 		for curr, units := range w.Balances {
-			scale, _ := db.CurrencyScale(curr)
+			scale, _ := db.CurrencyScaleInt32(curr)
 			out = append(out, &walletv1.Money{
 				Currency:     curr,
 				Units:        units,
-				Scale:        int32(scale),
+				Scale:        scale,
 				CurrencyCode: curr,
 			})
 		}
@@ -254,9 +254,9 @@ func (w *WalletModel) GetAllBalances() []*walletv1.Money {
 	}
 	if w.Currency != "" {
 		curr := db.NormalizeCurrency(w.Currency)
-		scale, _ := db.CurrencyScale(curr)
+		scale, _ := db.CurrencyScaleInt32(curr)
 		return []*walletv1.Money{
-			{Currency: w.Currency, Units: w.Balance, Scale: int32(scale), CurrencyCode: curr},
+			{Currency: w.Currency, Units: w.Balance, Scale: scale, CurrencyCode: curr},
 		}
 	}
 	return []*walletv1.Money{}
@@ -1167,11 +1167,11 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 		ExchangeRate:    state.exchangeRate,
 	}
 	if state.destCurrency != "" && state.destUnits > 0 {
-		destScale, _ := db.CurrencyScale(state.destCurrency)
+		destScale, _ := db.CurrencyScaleInt32(state.destCurrency)
 		resp.ConvertedAmount = &walletv1.Money{
 			Currency:     state.destCurrency,
 			Units:        state.destUnits,
-			Scale:        int32(destScale),
+			Scale:        destScale,
 			CurrencyCode: state.destCurrency,
 		}
 	}
@@ -1450,8 +1450,8 @@ func (s *server) ExchangeCurrency(ctx context.Context, req *walletv1.ExchangeCur
 	log.Printf("[WALLET-FX] SUCCESS: TX=%s | Wallet %s converted %d %s -> %d %s @ %.6f (quote: %s)",
 		finalTxnID, walletID, fromAmount, fromCurr, targetUnits, toCurr, effectiveRate, quoteID)
 
-	fromScale, _ := db.CurrencyScale(fromCurr)
-	toScale, _ := db.CurrencyScale(toCurr)
+	fromScale, _ := db.CurrencyScaleInt32(fromCurr)
+	toScale, _ := db.CurrencyScaleInt32(toCurr)
 	return &walletv1.ExchangeCurrencyResponse{
 		TransactionId:   finalTxnID,
 		Status:          walletv1.ExchangeCurrencyResponse_SUCCESS,
@@ -1461,13 +1461,13 @@ func (s *server) ExchangeCurrency(ctx context.Context, req *walletv1.ExchangeCur
 		DebitedAmount: &walletv1.Money{
 			Currency:     fromCurr,
 			Units:        fromAmount,
-			Scale:        int32(fromScale),
+			Scale:        fromScale,
 			CurrencyCode: fromCurr,
 		},
 		CreditedAmount: &walletv1.Money{
 			Currency:     toCurr,
 			Units:        targetUnits,
-			Scale:        int32(toScale),
+			Scale:        toScale,
 			CurrencyCode: toCurr,
 		},
 	}, nil
@@ -1676,7 +1676,7 @@ func (s *server) DepositFunds(ctx context.Context, req *walletv1.DepositFundsReq
 		"external_reference": req.Reference,
 	})
 
-	scale, _ := db.CurrencyScale(curr)
+	scale, _ := db.CurrencyScaleInt32(curr)
 	return &walletv1.DepositFundsResponse{
 		TransactionId:   finalTxnID,
 		Status:          walletv1.DepositFundsResponse_SUCCESS,
@@ -1685,7 +1685,7 @@ func (s *server) DepositFunds(ctx context.Context, req *walletv1.DepositFundsReq
 			Currency:     curr,
 			Units:        req.Amount.Units,
 			Nanos:        req.Amount.Nanos,
-			Scale:        int32(scale),
+			Scale:        scale,
 			CurrencyCode: curr,
 		},
 		PaymentRail:       req.PaymentRail,
@@ -1911,7 +1911,7 @@ func (s *server) WithdrawFunds(ctx context.Context, req *walletv1.WithdrawFundsR
 		"beneficiary_details": req.BeneficiaryDetails,
 	})
 
-	scale, _ := db.CurrencyScale(curr)
+	scale, _ := db.CurrencyScaleInt32(curr)
 	return &walletv1.WithdrawFundsResponse{
 		TransactionId:   finalTxnID,
 		Status:          walletv1.WithdrawFundsResponse_SUCCESS,
@@ -1920,7 +1920,7 @@ func (s *server) WithdrawFunds(ctx context.Context, req *walletv1.WithdrawFundsR
 			Currency:     curr,
 			Units:        req.Amount.Units,
 			Nanos:        req.Amount.Nanos,
-			Scale:        int32(scale),
+			Scale:        scale,
 			CurrencyCode: curr,
 		},
 		PaymentRail:       req.PaymentRail,
