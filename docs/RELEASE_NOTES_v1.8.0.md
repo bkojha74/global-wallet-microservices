@@ -87,3 +87,4 @@ This release resolves three critical (P0) architectural requirements:
    - Clients sending requests in `JPY` or `KRW` with `nanos > 0` will receive `codes.InvalidArgument` (rejected by core banking invariant validation).
 3. **API Gateway Ingress**:
    - JSON payloads can now provide either integer units (e.g. `{"amount": 1000, "currency": "USD"}`) or structured money (e.g. `{"amount": {"units": 1000, "currency_code": "USD", "scale": 2}}`).
+
