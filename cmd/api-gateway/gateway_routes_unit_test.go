@@ -22,6 +22,12 @@ import (
 	walletv1 "wallet-system/proto/wallet"
 )
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
 type mockWalletClient struct {
 	walletv1.WalletServiceClient
 }
@@ -675,17 +681,25 @@ func TestHandleWebhookSubscriptions(t *testing.T) {
 }
 
 func TestHandleWebhookTest(t *testing.T) {
-	dispatcher := webhook.NewDispatcher(nil, nil)
+	mockPartnerHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"received":true}`))
+	})
+	mockClient := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			rec := httptest.NewRecorder()
+			mockPartnerHandler.ServeHTTP(rec, req)
+			resp := rec.Result()
+			resp.Request = req
+			return resp, nil
+		}),
+	}
+	dispatcher := webhook.NewDispatcher(nil, mockClient)
 	gw := &Gateway{
 		webhookDispatcher: dispatcher,
 	}
 
-	// Mock partner receiver
-	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"received":true}`))
-	}))
-	defer mockServer.Close()
+	targetURL := "http://127.0.0.1:49999/webhook"
 
 	// 1. Method Not Allowed (GET)
 	reqGet := httptest.NewRequest(http.MethodGet, "/api/v1/webhooks/test", nil)
@@ -712,7 +726,7 @@ func TestHandleWebhookTest(t *testing.T) {
 	}
 
 	// 3b. SSRF restricted loopback URL rejected without ALLOW_LOCAL_WEBHOOKS (VULN-06)
-	bodyBlocked := bytes.NewBufferString(`{"target_url":"` + mockServer.URL + `","secret":"sec_test123"}`)
+	bodyBlocked := bytes.NewBufferString(`{"target_url":"` + targetURL + `","secret":"sec_test123"}`)
 	reqBlocked := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/test", bodyBlocked)
 	wBlocked := httptest.NewRecorder()
 	gw.handleWebhookTest(wBlocked, reqBlocked)
@@ -722,7 +736,7 @@ func TestHandleWebhookTest(t *testing.T) {
 
 	// 4. Ping test endpoint success with ALLOW_LOCAL_WEBHOOKS=true
 	t.Setenv("ALLOW_LOCAL_WEBHOOKS", "true")
-	bodyPing := bytes.NewBufferString(`{"target_url":"` + mockServer.URL + `","secret":"sec_test123"}`)
+	bodyPing := bytes.NewBufferString(`{"target_url":"` + targetURL + `","secret":"sec_test123"}`)
 	reqPing := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/test", bodyPing)
 	wPing := httptest.NewRecorder()
 	gw.handleWebhookTest(wPing, reqPing)
@@ -816,7 +830,7 @@ func TestSwaggerAndOpenAPIRoutes(t *testing.T) {
 }
 
 func TestGateway_LedgerMerkleRoutes(t *testing.T) {
-	mockLedgerMgmt := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mockLedgerHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/audit/merkle/latest":
@@ -843,15 +857,24 @@ func TestGateway_LedgerMerkleRoutes(t *testing.T) {
 		default:
 			http.NotFound(w, r)
 		}
-	}))
-	defer mockLedgerMgmt.Close()
+	})
+
+	mockClient := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			rec := httptest.NewRecorder()
+			mockLedgerHandler.ServeHTTP(rec, req)
+			resp := rec.Result()
+			resp.Request = req
+			return resp, nil
+		}),
+	}
 
 	gw := &Gateway{
 		primaryClient: &mockWalletClient{},
 		standbyClient: &mockWalletClient{},
 		activeTarget:  coordinator.TargetPrimary,
-		ledgerMgmtURL: mockLedgerMgmt.URL,
-		httpClient:    mockLedgerMgmt.Client(),
+		ledgerMgmtURL: "http://mock-ledger.local",
+		httpClient:    mockClient,
 	}
 	router := buildGatewayRouter(gw)
 
@@ -890,8 +913,12 @@ func TestGateway_LedgerMerkleRoutes(t *testing.T) {
 
 	t.Run("Ledger service unavailable returns 502", func(t *testing.T) {
 		badGW := &Gateway{
-			ledgerMgmtURL: "http://127.0.0.1:59999",
-			httpClient:    &http.Client{Timeout: 50 * time.Millisecond},
+			ledgerMgmtURL: "http://mock-bad-ledger.local",
+			httpClient: &http.Client{
+				Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					return nil, errors.New("connection refused")
+				}),
+			},
 		}
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/ledger/merkle/latest", nil)
 		rec := httptest.NewRecorder()

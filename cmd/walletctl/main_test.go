@@ -3,15 +3,77 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"wallet-system/pkg/auth"
 	"wallet-system/pkg/merkle"
 	"wallet-system/pkg/webhook"
 )
+
+type mockServerRegistry struct {
+	mu       sync.RWMutex
+	handlers map[string]http.Handler
+	seq      int64
+}
+
+var testServers = &mockServerRegistry{
+	handlers: make(map[string]http.Handler),
+}
+
+func (r *mockServerRegistry) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.mu.RLock()
+	key := req.URL.Scheme + "://" + req.URL.Host
+	h, ok := r.handlers[key]
+	if !ok {
+		h, ok = r.handlers[req.URL.Host]
+	}
+	r.mu.RUnlock()
+
+	if !ok {
+		return http.DefaultTransport.RoundTrip(req)
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	resp := rec.Result()
+	resp.Request = req
+	return resp, nil
+}
+
+type inMemoryTestServer struct {
+	URL string
+}
+
+func newTestServer(handler http.Handler) *inMemoryTestServer {
+	id := atomic.AddInt64(&testServers.seq, 1)
+	u := fmt.Sprintf("http://walletctl-node-%d.local", id)
+	testServers.mu.Lock()
+	testServers.handlers[u] = handler
+	testServers.mu.Unlock()
+	return &inMemoryTestServer{URL: u}
+}
+
+func (s *inMemoryTestServer) Close() {
+	testServers.mu.Lock()
+	delete(testServers.handlers, s.URL)
+	testServers.mu.Unlock()
+}
+
+func init() {
+	newHTTPClient = func(timeout time.Duration) *http.Client {
+		return &http.Client{
+			Timeout:   timeout,
+			Transport: testServers,
+		}
+	}
+}
 
 func TestRunCLI_VersionAndHelp(t *testing.T) {
 	tests := []struct {
@@ -76,7 +138,7 @@ func TestRunCLI_VersionAndHelp(t *testing.T) {
 }
 
 func TestRunCLI_Health(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/healthz":
 			w.WriteHeader(http.StatusOK)
@@ -137,7 +199,7 @@ func TestRunCLI_Health(t *testing.T) {
 	})
 
 	t.Run("failing health probe returns exit code 1", func(t *testing.T) {
-		failServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		failServer := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte(`{"status":"DOWN"}`))
 		}))
@@ -222,7 +284,7 @@ func TestRunCLI_Token(t *testing.T) {
 	})
 
 	t.Run("remote token minting via mock gateway", func(t *testing.T) {
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ts := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/api/v1/auth/token" && r.Method == http.MethodPost {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
@@ -255,7 +317,7 @@ func TestRunCLI_Token(t *testing.T) {
 func TestRunCLI_Failover(t *testing.T) {
 	var receivedFailoverReq map[string]string
 
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/cluster/status":
 			w.Header().Set("Content-Type", "application/json")
@@ -370,7 +432,7 @@ func TestRunCLI_LedgerVerify(t *testing.T) {
 	})
 
 	t.Run("valid ledger audit chain", func(t *testing.T) {
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ts := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			resp := ledgerResponseDTO{
 				WalletID:   "w_audit_test",
 				TotalCount: 2,
@@ -424,7 +486,7 @@ func TestRunCLI_LedgerVerify(t *testing.T) {
 	})
 
 	t.Run("broken ledger hash chain is detected", func(t *testing.T) {
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ts := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			resp := ledgerResponseDTO{
 				WalletID:   "w_tampered",
 				TotalCount: 2,
@@ -469,7 +531,7 @@ func TestRunCLI_LedgerVerify(t *testing.T) {
 	})
 
 	t.Run("direct ledger service audit verify endpoint", func(t *testing.T) {
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ts := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if strings.HasPrefix(r.URL.Path, "/audit/verify") {
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte(`{"status":"VALID","entries_verified":10}`))
@@ -501,7 +563,7 @@ func TestRunCLI_LedgerMerkle(t *testing.T) {
 	root := tree.RootHash()
 	validProof, _ := tree.GetProof(leaf1)
 
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/api/v1/ledger/merkle/latest", "/audit/merkle/latest":
@@ -664,7 +726,7 @@ func TestRunCLI_WebhookPing(t *testing.T) {
 		var receivedEvent string
 		var receivedDelivery string
 
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ts := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			receivedSig = r.Header.Get("X-Wallet-Signature")
 			receivedEvent = r.Header.Get("X-Wallet-Event")
 			receivedDelivery = r.Header.Get("X-Wallet-Delivery")
@@ -716,7 +778,7 @@ func TestRunCLI_WebhookPing(t *testing.T) {
 	})
 
 	t.Run("webhook ping json report", func(t *testing.T) {
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ts := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusAccepted)
 			_, _ = w.Write([]byte(`{"accepted":true}`))
 		}))
@@ -752,7 +814,7 @@ func TestRunCLI_WebhookPing(t *testing.T) {
 	})
 
 	t.Run("webhook ping failure report on 500 error", func(t *testing.T) {
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ts := newTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte(`{"error":"partner internal crash"}`))
 		}))

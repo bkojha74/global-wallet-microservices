@@ -10,6 +10,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/test/bufconn"
 
 	walletv1 "wallet-system/proto/wallet"
 )
@@ -33,10 +34,8 @@ func TestMutualTLSHandshakeSuccess(t *testing.T) {
 		t.Fatalf("failed to build server TLS: %v", err)
 	}
 
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
-	}
+	const bufSize = 1024 * 1024
+	lis := bufconn.Listen(bufSize)
 	defer lis.Close()
 
 	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
@@ -53,7 +52,12 @@ func TestMutualTLSHandshakeSuccess(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(credentials.NewTLS(clientTLS)))
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(credentials.NewTLS(clientTLS)),
+	)
 	if err != nil {
 		t.Fatalf("mTLS dial failed: %v", err)
 	}
@@ -80,10 +84,8 @@ func TestMutualTLSRejectsUntrustedClient(t *testing.T) {
 		t.Fatalf("failed to build server TLS: %v", err)
 	}
 
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
-	}
+	const bufSize = 1024 * 1024
+	lis := bufconn.Listen(bufSize)
 	defer lis.Close()
 
 	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
@@ -100,7 +102,12 @@ func TestMutualTLSRejectsUntrustedClient(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(credentials.NewTLS(untrustedTLS)))
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(credentials.NewTLS(untrustedTLS)),
+	)
 	if err == nil {
 		// If dial succeeded (lazy handshake), RPC must fail
 		client := walletv1.NewWalletServiceClient(conn)

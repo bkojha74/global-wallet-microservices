@@ -52,7 +52,7 @@ func NewOIDCClient(ctx context.Context, issuerURL, clientID, clientSecret string
 		issuerURL:    cleanIssuer,
 		clientID:     clientID,
 		clientSecret: clientSecret,
-		httpClient:   &http.Client{Timeout: 10 * time.Second},
+		httpClient:   newAuthHTTPClient(10 * time.Second),
 	}
 
 	// Fetch discovery document

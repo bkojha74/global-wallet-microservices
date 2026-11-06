@@ -239,9 +239,12 @@ func (w *WalletModel) GetAllBalances() []*walletv1.Money {
 	if len(w.Balances) > 0 {
 		out := make([]*walletv1.Money, 0, len(w.Balances))
 		for curr, units := range w.Balances {
+			scale, _ := db.CurrencyScaleInt32(curr)
 			out = append(out, &walletv1.Money{
-				Currency: curr,
-				Units:    units,
+				Currency:     curr,
+				Units:        units,
+				Scale:        scale,
+				CurrencyCode: curr,
 			})
 		}
 		sort.Slice(out, func(i, j int) bool {
@@ -250,8 +253,10 @@ func (w *WalletModel) GetAllBalances() []*walletv1.Money {
 		return out
 	}
 	if w.Currency != "" {
+		curr := db.NormalizeCurrency(w.Currency)
+		scale, _ := db.CurrencyScaleInt32(curr)
 		return []*walletv1.Money{
-			{Currency: w.Currency, Units: w.Balance},
+			{Currency: w.Currency, Units: w.Balance, Scale: scale, CurrencyCode: curr},
 		}
 	}
 	return []*walletv1.Money{}
@@ -595,7 +600,11 @@ func (s *server) validateTransferRequest(ctx context.Context, req *walletv1.Tran
 		})
 		return nil, status.Error(codes.InvalidArgument, "idempotency_key, source_wallet_id, destination_wallet_id, and amount are required")
 	}
-	if err := db.ValidateAmount(req.Amount.Units, req.Amount.Currency); err != nil {
+	curr := req.Amount.Currency
+	if curr == "" {
+		curr = req.Amount.CurrencyCode
+	}
+	if err := db.ValidateMoney(curr, req.Amount.Units, req.Amount.Nanos, req.Amount.Scale); err != nil {
 		log.Printf("[WALLET-TX] trace_id=%s step=validation_failed reason=%v", traceID, err)
 		durationMS := time.Since(startTime).Milliseconds()
 		s.emitTerminal(ctx, eventWalletTransferFailed, observability.LevelError, "Validation failed", durationMS, false, map[string]any{
@@ -1158,9 +1167,12 @@ func (s *server) TransferFunds(ctx context.Context, req *walletv1.TransferFundsR
 		ExchangeRate:    state.exchangeRate,
 	}
 	if state.destCurrency != "" && state.destUnits > 0 {
+		destScale, _ := db.CurrencyScaleInt32(state.destCurrency)
 		resp.ConvertedAmount = &walletv1.Money{
-			Currency: state.destCurrency,
-			Units:    state.destUnits,
+			Currency:     state.destCurrency,
+			Units:        state.destUnits,
+			Scale:        destScale,
+			CurrencyCode: state.destCurrency,
 		}
 	}
 	return resp, nil
@@ -1198,6 +1210,9 @@ func (s *server) ExchangeCurrency(ctx context.Context, req *walletv1.ExchangeCur
 	}
 	if err := db.ValidateAmount(fromAmount, fromCurr); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if !db.IsValidCurrency(toCurr) {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid target currency: %s", toCurr)
 	}
 
 	correlation := observability.FromIncomingContext(ctx)
@@ -1435,6 +1450,8 @@ func (s *server) ExchangeCurrency(ctx context.Context, req *walletv1.ExchangeCur
 	log.Printf("[WALLET-FX] SUCCESS: TX=%s | Wallet %s converted %d %s -> %d %s @ %.6f (quote: %s)",
 		finalTxnID, walletID, fromAmount, fromCurr, targetUnits, toCurr, effectiveRate, quoteID)
 
+	fromScale, _ := db.CurrencyScaleInt32(fromCurr)
+	toScale, _ := db.CurrencyScaleInt32(toCurr)
 	return &walletv1.ExchangeCurrencyResponse{
 		TransactionId:   finalTxnID,
 		Status:          walletv1.ExchangeCurrencyResponse_SUCCESS,
@@ -1442,12 +1459,16 @@ func (s *server) ExchangeCurrency(ctx context.Context, req *walletv1.ExchangeCur
 		FxQuoteId:       quoteID,
 		ExchangeRate:    effectiveRate,
 		DebitedAmount: &walletv1.Money{
-			Currency: fromCurr,
-			Units:    fromAmount,
+			Currency:     fromCurr,
+			Units:        fromAmount,
+			Scale:        fromScale,
+			CurrencyCode: fromCurr,
 		},
 		CreditedAmount: &walletv1.Money{
-			Currency: toCurr,
-			Units:    targetUnits,
+			Currency:     toCurr,
+			Units:        targetUnits,
+			Scale:        toScale,
+			CurrencyCode: toCurr,
 		},
 	}, nil
 }
@@ -1485,14 +1506,18 @@ func (s *server) DepositFunds(ctx context.Context, req *walletv1.DepositFundsReq
 	if err := s.verifyWalletAccessByWalletID(ctx, walletID); err != nil {
 		return nil, err
 	}
-	if req.Amount == nil || req.Amount.Units <= 0 {
-		return nil, status.Errorf(codes.InvalidArgument, "amount units must be strictly positive")
+	if req.Amount == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "amount is required")
 	}
-	curr := db.NormalizeCurrency(req.Amount.Currency)
+	curr := req.Amount.Currency
+	if curr == "" {
+		curr = req.Amount.CurrencyCode
+	}
+	curr = db.NormalizeCurrency(curr)
 	if curr == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "currency is required")
 	}
-	if err := db.ValidateAmount(req.Amount.Units, curr); err != nil {
+	if err := db.ValidateMoney(curr, req.Amount.Units, req.Amount.Nanos, req.Amount.Scale); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	railStr, railErr := parsePaymentRail(req.PaymentRail)
@@ -1651,13 +1676,17 @@ func (s *server) DepositFunds(ctx context.Context, req *walletv1.DepositFundsReq
 		"external_reference": req.Reference,
 	})
 
+	scale, _ := db.CurrencyScaleInt32(curr)
 	return &walletv1.DepositFundsResponse{
 		TransactionId:   finalTxnID,
 		Status:          walletv1.DepositFundsResponse_SUCCESS,
 		HandledByRegion: s.region,
 		CreditedAmount: &walletv1.Money{
-			Currency: curr,
-			Units:    req.Amount.Units,
+			Currency:     curr,
+			Units:        req.Amount.Units,
+			Nanos:        req.Amount.Nanos,
+			Scale:        scale,
+			CurrencyCode: curr,
 		},
 		PaymentRail:       req.PaymentRail,
 		ExternalReference: req.Reference,
@@ -1682,14 +1711,18 @@ func (s *server) WithdrawFunds(ctx context.Context, req *walletv1.WithdrawFundsR
 	if err := s.verifyWalletAccessByWalletID(ctx, walletID); err != nil {
 		return nil, err
 	}
-	if req.Amount == nil || req.Amount.Units <= 0 {
-		return nil, status.Errorf(codes.InvalidArgument, "amount units must be strictly positive")
+	if req.Amount == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "amount is required")
 	}
-	curr := db.NormalizeCurrency(req.Amount.Currency)
+	curr := req.Amount.Currency
+	if curr == "" {
+		curr = req.Amount.CurrencyCode
+	}
+	curr = db.NormalizeCurrency(curr)
 	if curr == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "currency is required")
 	}
-	if err := db.ValidateAmount(req.Amount.Units, curr); err != nil {
+	if err := db.ValidateMoney(curr, req.Amount.Units, req.Amount.Nanos, req.Amount.Scale); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	railStr, railErr := parsePaymentRail(req.PaymentRail)
@@ -1878,13 +1911,17 @@ func (s *server) WithdrawFunds(ctx context.Context, req *walletv1.WithdrawFundsR
 		"beneficiary_details": req.BeneficiaryDetails,
 	})
 
+	scale, _ := db.CurrencyScaleInt32(curr)
 	return &walletv1.WithdrawFundsResponse{
 		TransactionId:   finalTxnID,
 		Status:          walletv1.WithdrawFundsResponse_SUCCESS,
 		HandledByRegion: s.region,
 		DebitedAmount: &walletv1.Money{
-			Currency: curr,
-			Units:    req.Amount.Units,
+			Currency:     curr,
+			Units:        req.Amount.Units,
+			Nanos:        req.Amount.Nanos,
+			Scale:        scale,
+			CurrencyCode: curr,
 		},
 		PaymentRail:       req.PaymentRail,
 		ExternalReference: req.BeneficiaryDetails,

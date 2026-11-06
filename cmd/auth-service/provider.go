@@ -238,7 +238,7 @@ func (p *KeycloakProvider) Ping(ctx context.Context) error {
 	}
 	req.Header.Set("Accept", "application/json")
 
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := newAuthHTTPClient(3 * time.Second)
 	resp, err := client.Do(req) // #nosec G107 G704 -- outbound probe to configured trusted OIDC issuer
 	if err != nil {
 		return err
