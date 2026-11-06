@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -33,8 +32,8 @@ func TestJWKSCache_RS256Verify_Full(t *testing.T) {
 	eBytes := big.NewInt(int64(pubKey.E)).Bytes()
 	eB64 := base64.RawURLEncoding.EncodeToString(eBytes)
 
-	// 2. Mock JWKS HTTP Server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// 2. Mock JWKS HTTP Server in-memory
+	server := newAuthTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(JSONWebKeySet{
 			Keys: []JSONWebKey{

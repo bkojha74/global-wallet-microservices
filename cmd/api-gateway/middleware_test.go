@@ -309,6 +309,30 @@ func TestValidateWalletOwnershipIDOR(t *testing.T) {
 		t.Fatalf("expected IDOR violation when owner_id is empty and prefix mismatches, got: %v", err)
 	}
 
+	// REQ-SEC-01: Ownership Cache & Opaque Wallet Ownership Validation
+	SetWalletOwner("wal_custom_savings_99", "alice")
+	if owner, ok := GetWalletOwner("wal_custom_savings_99"); !ok || owner != "alice" {
+		t.Fatalf("expected cached owner alice, got ok=%v, owner=%s", ok, owner)
+	}
+	// Alice accessing cached opaque wallet -> Allowed!
+	if err := ValidateWalletOwnership(aliceClaims, "wal_custom_savings_99"); err != nil {
+		t.Fatalf("expected cached opaque wallet allowed for alice, got: %v", err)
+	}
+	// Bob accessing Alice's opaque wallet -> IDOR Blocked!
+	bobClaims := &auth.Claims{Subject: "bob", Roles: []string{auth.RoleUser}}
+	if err := ValidateWalletOwnership(bobClaims, "wal_custom_savings_99"); err != auth.ErrIDORViolation {
+		t.Fatalf("expected IDOR violation for bob accessing alice's opaque wallet, got: %v", err)
+	}
+	// Invalidation
+	InvalidateWalletOwner("wal_custom_savings_99")
+	if _, ok := GetWalletOwner("wal_custom_savings_99"); ok {
+		t.Fatalf("expected wallet evicted after invalidate")
+	}
+	// Once invalidated, direct ValidateWalletOwnership blocks un-cached opaque wallet
+	if err := ValidateWalletOwnership(aliceClaims, "wal_custom_savings_99"); err != auth.ErrIDORViolation {
+		t.Fatalf("expected IDOR violation on evicted opaque wallet, got: %v", err)
+	}
+
 	// tokenErrorMessage helper
 	if msg := tokenErrorMessage(authv1.TokenErrorCode_TOKEN_EXPIRED); msg != "token has expired" {
 		t.Fatalf("unexpected msg for expired token: %s", msg)

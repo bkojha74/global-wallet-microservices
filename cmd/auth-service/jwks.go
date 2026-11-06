@@ -48,6 +48,12 @@ type JWKSCache struct {
 	lastAttempt time.Time
 }
 
+// newAuthHTTPClient creates an HTTP client for auth-service operations.
+// Tests can override this to inject mock round-trippers for air-gapped test execution.
+var newAuthHTTPClient = func(timeout time.Duration) *http.Client {
+	return &http.Client{Timeout: timeout}
+}
+
 // NewJWKSCache creates a JWKS cache targeting an external OIDC JWKS endpoint.
 func NewJWKSCache(jwksURL string, ttl time.Duration) *JWKSCache {
 	if ttl <= 0 {
@@ -55,7 +61,7 @@ func NewJWKSCache(jwksURL string, ttl time.Duration) *JWKSCache {
 	}
 	return &JWKSCache{
 		jwksURL:    jwksURL,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+		httpClient: newAuthHTTPClient(10 * time.Second),
 		keys:       make(map[string]*rsa.PublicKey),
 		ttl:        ttl,
 		minRefresh: 5 * time.Second,

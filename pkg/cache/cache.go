@@ -214,8 +214,11 @@ func CloneGetBalanceResponse(in *walletv1.GetBalanceResponse) *walletv1.GetBalan
 	for i, m := range in.Balances {
 		if m != nil {
 			out.Balances[i] = &walletv1.Money{
-				Currency: m.Currency,
-				Units:    m.Units,
+				Currency:     m.Currency,
+				Units:        m.Units,
+				Nanos:        m.Nanos,
+				Scale:        m.Scale,
+				CurrencyCode: m.CurrencyCode,
 			}
 		}
 	}

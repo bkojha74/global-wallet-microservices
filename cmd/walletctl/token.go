@@ -80,7 +80,8 @@ func runTokenCmd(args []string, out io.Writer, errOut io.Writer) int {
 		}
 		req.Header.Set("Content-Type", "application/json")
 
-		resp, err := http.DefaultClient.Do(req)
+		client := newHTTPClient(5 * time.Second)
+		resp, err := client.Do(req)
 		if err != nil {
 			fmt.Fprintf(errOut, "Remote token request failed: %v\n", err)
 			return 1

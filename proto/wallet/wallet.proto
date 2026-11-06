@@ -16,8 +16,16 @@ service WalletService {
 }
 
 message Money {
+  // 3-letter ISO-4217 currency code (e.g., "USD", "EUR", "JPY")
   string currency = 1;
+  // The whole or minor units of the amount (matching scale)
   int64 units = 2;
+  // Number of nano (10^-9) units of the amount (-999,999,999 to +999,999,999)
+  int32 nanos = 3;
+  // Explicit minor-unit decimal scale (e.g. 2 for cents, 0 for yen, 3 for dinar)
+  int32 scale = 4;
+  // Standard Google Money alias for ISO-4217 currency code
+  string currency_code = 5;
 }
 
 message CreateWalletRequest {

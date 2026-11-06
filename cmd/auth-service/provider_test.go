@@ -9,7 +9,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -114,7 +113,7 @@ func TestJWKSCache_VerifyToken(t *testing.T) {
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
-	ts := httptest.NewServer(jwksHandler)
+	ts := newAuthTestServer(jwksHandler)
 	defer ts.Close()
 
 	// 3. Create JWKSCache targeting mock server
@@ -181,7 +180,7 @@ func TestHybridProvider_TokenRouting(t *testing.T) {
 	eB64 := base64.RawURLEncoding.EncodeToString([]byte{1, 0, 1})
 	kid := "kc-key-1"
 
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := newAuthTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(JSONWebKeySet{
 			Keys: []JSONWebKey{{Kty: "RSA", Kid: kid, Alg: "RS256", N: nB64, E: eB64}},

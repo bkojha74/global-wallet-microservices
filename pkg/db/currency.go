@@ -24,10 +24,13 @@ var ISO4217Catalog = map[string]CurrencyInfo{
 	"CAD": {Code: "CAD", NumericCode: "124", Scale: 2, Symbol: "CA$", Name: "Canadian Dollar"},
 	"AUD": {Code: "AUD", NumericCode: "036", Scale: 2, Symbol: "A$", Name: "Australian Dollar"},
 	"JPY": {Code: "JPY", NumericCode: "392", Scale: 0, Symbol: "¥", Name: "Japanese Yen"},
+	"KRW": {Code: "KRW", NumericCode: "410", Scale: 0, Symbol: "₩", Name: "South Korean Won"},
 	"CHF": {Code: "CHF", NumericCode: "756", Scale: 2, Symbol: "CHF", Name: "Swiss Franc"},
 	"SGD": {Code: "SGD", NumericCode: "702", Scale: 2, Symbol: "S$", Name: "Singapore Dollar"},
 	"INR": {Code: "INR", NumericCode: "356", Scale: 2, Symbol: "₹", Name: "Indian Rupee"},
 	"BHD": {Code: "BHD", NumericCode: "048", Scale: 3, Symbol: "BD", Name: "Bahraini Dinar"},
+	"KWD": {Code: "KWD", NumericCode: "414", Scale: 3, Symbol: "KD", Name: "Kuwaiti Dinar"},
+	"TND": {Code: "TND", NumericCode: "788", Scale: 3, Symbol: "DT", Name: "Tunisian Dinar"},
 }
 
 // SupportedCurrencies maps standard ISO-4217 codes to their standard minor unit decimal scale.
@@ -38,10 +41,13 @@ var SupportedCurrencies = map[string]int{
 	"CAD": 2, // Canadian Dollar (Cents)
 	"AUD": 2, // Australian Dollar (Cents)
 	"JPY": 0, // Japanese Yen (Zero minor units)
+	"KRW": 0, // South Korean Won (Zero minor units)
 	"CHF": 2, // Swiss Franc (Rappen)
 	"SGD": 2, // Singapore Dollar (Cents)
 	"INR": 2, // Indian Rupee (Paise)
 	"BHD": 3, // Bahraini Dinar (Fils)
+	"KWD": 3, // Kuwaiti Dinar (Fils)
+	"TND": 3, // Tunisian Dinar (Millimes)
 }
 
 // NormalizeCurrency normalizes a currency code to uppercase trimmed ISO-4217 format.
@@ -83,14 +89,62 @@ func CurrencyScale(code string) (int, error) {
 	return scale, nil
 }
 
+// CurrencyScaleInt32 returns the decimal scale as an int32, bounded by ISO-4217 standard exponents.
+func CurrencyScaleInt32(code string) (int32, error) {
+	scale, err := CurrencyScale(code)
+	if err != nil {
+		return 0, err
+	}
+	if scale < 0 || scale > 18 {
+		return 0, fmt.Errorf("scale out of bounds: %d", scale)
+	}
+	// #nosec G115 -- ISO-4217 minor unit scale exponent is verified in [0, 18]
+	return int32(scale), nil
+}
+
 // ValidateAmount validates that the amount is positive, non-zero, and belongs to a supported currency.
 func ValidateAmount(units int64, currency string) error {
-	if units <= 0 {
-		return fmt.Errorf("amount units must be strictly positive, got: %d", units)
-	}
-	if !IsValidCurrency(currency) {
+	return ValidateMoney(currency, units, 0, 0)
+}
+
+// ValidateMoney validates a monetary amount taking into account ISO-4217 minor unit scale and fractional nanos:
+// 1. Currency code must be a valid, supported ISO-4217 currency.
+// 2. Units must be >= 0, and total amount (units + nanos) must be strictly positive.
+// 3. Nanos must be in range [0, 999,999,999].
+// 4. Zero-decimal currencies (JPY, KRW with scale 0) reject any fractional subunits (nanos != 0).
+// 5. If scale is explicitly specified (scale != 0), it must match the ISO-4217 standard scale.
+func ValidateMoney(currency string, units int64, nanos int32, scale int32) error {
+	normCurr := NormalizeCurrency(currency)
+	if !IsValidCurrency(normCurr) {
 		return fmt.Errorf("invalid or unsupported currency: %s", currency)
 	}
+
+	expectedScale, err := CurrencyScaleInt32(normCurr)
+	if err != nil {
+		return err
+	}
+
+	if scale != 0 && scale != expectedScale {
+		return fmt.Errorf("invalid scale %d for currency %s (expected %d)", scale, normCurr, expectedScale)
+	}
+
+	if nanos < 0 || nanos > 999_999_999 {
+		return fmt.Errorf("nanos out of range [0, 999999999]: %d", nanos)
+	}
+
+	if units < 0 {
+		return fmt.Errorf("amount units must be non-negative, got: %d", units)
+	}
+
+	if units == 0 && nanos == 0 {
+		return fmt.Errorf("amount units must be strictly positive, got: 0")
+	}
+
+	// Zero-decimal currencies (e.g., JPY, KRW) cannot have fractional nanos
+	if expectedScale == 0 && nanos != 0 {
+		return fmt.Errorf("zero-decimal currency %s does not allow fractional subunits (got nanos=%d)", normCurr, nanos)
+	}
+
 	return nil
 }
 

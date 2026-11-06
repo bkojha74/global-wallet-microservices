@@ -4,15 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
 )
 
 func TestOIDCClientAndKeycloakProvider(t *testing.T) {
-	// Setup Mock OIDC Server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Setup Mock OIDC Server in-memory
+	server := newAuthTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/.well-known/openid-configuration":

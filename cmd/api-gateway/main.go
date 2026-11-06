@@ -146,6 +146,57 @@ func withOutgoingAuthContext(ctx context.Context) context.Context {
 	return ctx
 }
 
+// verifyWalletAccess checks whether the authenticated caller has access to the specified wallet.
+// It first attempts fast-path lexical and cache-based verification via ValidateWalletOwnership.
+// If the wallet uses an opaque or system ID (e.g. "wal_...", "acc_...", or UUID) and is not yet cached,
+// it executes an authenticated probe against wallet-service, allowing the core domain service to
+// verify ownership against the database (banking_db.wallets).
+func (g *Gateway) verifyWalletAccess(ctx context.Context, claims *auth.Claims, walletID string) error {
+	if claims == nil {
+		return auth.ErrInsufficientPerms
+	}
+	if claims.HasRole(auth.RoleAdmin) || claims.HasScope("cluster:admin") || claims.HasScope("wallet:admin") {
+		return nil
+	}
+
+	// 1. Fast-path: lexical matching or local ownership cache
+	err := ValidateWalletOwnership(claims, walletID)
+	if err == nil {
+		return nil
+	}
+
+	// 2. If it is NOT an opaque or system ID, reject immediately (explicit foreign namespace)
+	target := strings.ToLower(strings.TrimSpace(walletID))
+	if !isOpaqueOrSystemID(target) {
+		return auth.ErrIDORViolation
+	}
+
+	// 3. Opaque/System ID not in local cache: resolve dynamically against wallet-service
+	client, _ := g.getActiveWalletClient(ctx)
+	if client == nil {
+		return auth.ErrIDORViolation
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	probeCtx = ContextWithClaims(probeCtx, claims)
+	probeCtx = withOutgoingAuthContext(probeCtx)
+
+	_, probeErr := client.GetBalance(probeCtx, &walletv1.GetBalanceRequest{WalletId: walletID})
+	if probeErr == nil {
+		// Authoritative core service verified caller ownership! Populate cache.
+		SetWalletOwner(walletID, claims.Subject)
+		return nil
+	}
+
+	if st, ok := status.FromError(probeErr); ok && st.Code() == codes.PermissionDenied {
+		return auth.ErrIDORViolation
+	}
+
+	// On other errors (e.g. timeout, unavailable), preserve the original IDOR violation
+	return auth.ErrIDORViolation
+}
+
 func parseCreateWalletRequest(r *http.Request, traceID string) (*walletv1.CreateWalletRequest, error) {
 	body, err := readClientJSON(traceID, r.Body)
 	if err != nil {
@@ -201,6 +252,14 @@ func handleWalletGRPCError(w http.ResponseWriter, err error, action string) {
 			http.Error(w, st.Message(), http.StatusBadRequest)
 			return
 		}
+		if st.Code() == codes.PermissionDenied {
+			writeAuthError(w, http.StatusForbidden, st.Message())
+			return
+		}
+		if st.Code() == codes.NotFound {
+			http.Error(w, st.Message(), http.StatusNotFound)
+			return
+		}
 	}
 	http.Error(w, fmt.Sprintf("Error %s: %v", action, err), http.StatusInternalServerError)
 }
@@ -241,6 +300,16 @@ func (g *Gateway) handleCreateWallet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logProto(traceID, "wallet_proto_response_received", resp)
+
+	// REQ-SEC-01: Populate ownership cache upon successful wallet creation
+	ownerID := protoReq.OwnerId
+	if ownerID == "" {
+		ownerID = protoReq.CreatedBy
+	}
+	if ownerID != "" {
+		SetWalletOwner(protoReq.WalletId, ownerID)
+	}
+
 	g.emit(ctx, eventAPIResponseSent, observability.LevelInfo, "Wallet creation response sent", map[string]any{
 		"operation":     "create_wallet",
 		"routed_target": target,
@@ -272,7 +341,7 @@ func (g *Gateway) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
-		if err := ValidateWalletOwnership(claims, walletID); err != nil {
+		if err := g.verifyWalletAccess(r.Context(), claims, walletID); err != nil {
 			log.Printf("[SECURITY] IDOR blocked: subject %s tried to view balance of %s", claims.Subject, walletID)
 			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
 			return
@@ -295,8 +364,15 @@ func (g *Gateway) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 	resp, err := client.GetBalance(callCtx, protoReq)
 	if err != nil {
 		log.Printf(traceWalletGRPCRespFmt, traceID, err)
+		if st, ok := status.FromError(err); ok && st.Code() == codes.PermissionDenied {
+			writeAuthError(w, http.StatusForbidden, st.Message())
+			return
+		}
 		http.Error(w, fmt.Sprintf("Error retrieving balance: %v", err), http.StatusInternalServerError)
 		return
+	}
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		SetWalletOwner(walletID, claims.Subject)
 	}
 	logProto(traceID, "wallet_proto_response_received", resp)
 	g.emit(ctx, eventAPIResponseSent, observability.LevelInfo, "Balance response sent", map[string]any{"operation": "get_balance", "routed_target": target})
@@ -352,13 +428,14 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "source_wallet_id and destination_wallet_id are required", http.StatusBadRequest)
 		return
 	}
-	amountUnits, currExtracted, err := parseAmountAndCurrency(req.Amount, req.Currency)
+	moneyObj, err := parseMoney(req.Amount, req.Currency)
 	if err != nil {
 		log.Printf("[TRACE] trace_id=%s step=http_amount_decode_failed error=%v", traceID, err)
 		http.Error(w, fmt.Sprintf("invalid amount format: %v", err), http.StatusBadRequest)
 		return
 	}
-	transferCurrency := db.NormalizeCurrency(currExtracted)
+	transferCurrency := db.NormalizeCurrency(moneyObj.Currency)
+	amountUnits := moneyObj.Units
 	if transferCurrency == "" {
 		http.Error(w, "currency is required", http.StatusBadRequest)
 		return
@@ -375,12 +452,12 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		idempKey = "idemp_tx_" + traceID
 	}
 	correlation.IdempotencyKey = idempKey
-	if err := db.ValidateAmount(amountUnits, transferCurrency); err != nil {
+	if err := db.ValidateMoney(transferCurrency, amountUnits, moneyObj.Nanos, moneyObj.Scale); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
-		if err := ValidateWalletOwnership(claims, sourceWallet); err != nil {
+		if err := g.verifyWalletAccess(r.Context(), claims, sourceWallet); err != nil {
 			log.Printf("[SECURITY] IDOR blocked: subject %s tried to transfer from %s", claims.Subject, sourceWallet)
 			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
 			return
@@ -402,7 +479,7 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		IdempotencyKey:      idempKey,
 		SourceWalletId:      sourceWallet,
 		DestinationWalletId: destWallet,
-		Amount:              &walletv1.Money{Currency: transferCurrency, Units: amountUnits},
+		Amount:              moneyObj,
 		FxQuoteId:           strings.TrimSpace(req.FXQuoteID),
 	}
 	logProto(traceID, "http_json_to_wallet_proto_request", protoReq)
@@ -556,7 +633,7 @@ func (g *Gateway) handleWalletExchange(w http.ResponseWriter, r *http.Request) {
 	correlation.IdempotencyKey = idempKey
 
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
-		if err := ValidateWalletOwnership(claims, walletID); err != nil {
+		if err := g.verifyWalletAccess(r.Context(), claims, walletID); err != nil {
 			log.Printf("[SECURITY] IDOR blocked: subject %s tried to exchange currency in wallet %s", claims.Subject, walletID)
 			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
 			return
@@ -724,7 +801,7 @@ func (g *Gateway) handleGetWalletLimits(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
-		if err := ValidateWalletOwnership(claims, walletID); err != nil && !claims.HasRole(auth.RoleAdmin) {
+		if err := g.verifyWalletAccess(r.Context(), claims, walletID); err != nil {
 			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
 			return
 		}
@@ -741,6 +818,10 @@ func (g *Gateway) handleGetWalletLimits(w http.ResponseWriter, r *http.Request) 
 		WalletId: walletID,
 	})
 	if err != nil {
+		if st, ok := status.FromError(err); ok && st.Code() == codes.PermissionDenied {
+			writeAuthError(w, http.StatusForbidden, st.Message())
+			return
+		}
 		http.Error(w, fmt.Sprintf("Failed to get wallet limits: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -759,35 +840,65 @@ func (g *Gateway) handleGetWalletLimits(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-func parseAmountAndCurrency(raw json.RawMessage, fallbackCurrency string) (int64, string, error) {
+func parseMoney(raw json.RawMessage, fallbackCurrency string) (*walletv1.Money, error) {
 	if len(raw) == 0 {
-		return 0, fallbackCurrency, nil
+		fbCurr := db.NormalizeCurrency(fallbackCurrency)
+		scale, _ := db.CurrencyScaleInt32(fbCurr)
+		return &walletv1.Money{
+			Currency:     fbCurr,
+			CurrencyCode: fbCurr,
+			Units:        0,
+			Scale:        scale,
+		}, nil
 	}
 	// Try parsing as scalar int64 (e.g. 500000)
 	var units int64
 	if err := json.Unmarshal(raw, &units); err == nil {
-		return units, fallbackCurrency, nil
+		fbCurr := db.NormalizeCurrency(fallbackCurrency)
+		scale, _ := db.CurrencyScaleInt32(fbCurr)
+		return &walletv1.Money{
+			Currency:     fbCurr,
+			CurrencyCode: fbCurr,
+			Units:        units,
+			Scale:        scale,
+		}, nil
 	}
-	// Try parsing as Money object: {"units": 500000, "currency": "USD"} or {"amount": 500000, "currency": "USD"}
+	// Try parsing as Money object: {"units": 500000, "currency": "USD", "nanos": 0, "scale": 2}
 	var obj struct {
-		Units    int64  `json:"units"`
-		Amount   int64  `json:"amount"`
-		Currency string `json:"currency"`
+		Units        int64  `json:"units"`
+		Amount       int64  `json:"amount"`
+		Currency     string `json:"currency"`
+		CurrencyCode string `json:"currency_code"`
+		Nanos        int32  `json:"nanos"`
+		Scale        int32  `json:"scale"`
 	}
 	if err := json.Unmarshal(raw, &obj); err == nil {
 		curr := strings.TrimSpace(obj.Currency)
 		if curr == "" {
+			curr = strings.TrimSpace(obj.CurrencyCode)
+		}
+		if curr == "" {
 			curr = fallbackCurrency
 		}
-		if obj.Units != 0 {
-			return obj.Units, curr, nil
+		curr = db.NormalizeCurrency(curr)
+		u := obj.Units
+		if u == 0 && obj.Amount != 0 {
+			u = obj.Amount
 		}
-		if obj.Amount != 0 {
-			return obj.Amount, curr, nil
+		s := obj.Scale
+		if s == 0 && curr != "" {
+			stdScale, _ := db.CurrencyScaleInt32(curr)
+			s = stdScale
 		}
-		return 0, curr, nil
+		return &walletv1.Money{
+			Currency:     curr,
+			CurrencyCode: curr,
+			Units:        u,
+			Nanos:        obj.Nanos,
+			Scale:        s,
+		}, nil
 	}
-	return 0, fallbackCurrency, errors.New("invalid amount format: expected integer or money object")
+	return nil, errors.New("invalid amount format: expected integer or money object")
 }
 
 func parseProtoPaymentRail(railStr string) walletv1.PaymentRail {
@@ -879,7 +990,7 @@ func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWal
 		return
 	}
 
-	amountUnits, currExtracted, err := parseAmountAndCurrency(req.Amount, req.Currency)
+	moneyObj, err := parseMoney(req.Amount, req.Currency)
 	if err != nil {
 		log.Printf("[TRACE] trace_id=%s step=http_amount_decode_failed error=%v", traceID, err)
 		http.Error(w, fmt.Sprintf("invalid amount format: %v", err), http.StatusBadRequest)
@@ -906,16 +1017,13 @@ func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWal
 		return
 	}
 
-	curr := db.NormalizeCurrency(currExtracted)
+	curr := db.NormalizeCurrency(moneyObj.Currency)
 	if curr == "" {
 		http.Error(w, "currency is required", http.StatusBadRequest)
 		return
 	}
-	if amountUnits <= 0 {
-		http.Error(w, "amount must be strictly positive", http.StatusBadRequest)
-		return
-	}
-	if err := db.ValidateAmount(amountUnits, curr); err != nil {
+	amountUnits := moneyObj.Units
+	if err := db.ValidateMoney(curr, amountUnits, moneyObj.Nanos, moneyObj.Scale); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -940,7 +1048,7 @@ func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWal
 	correlation.IdempotencyKey = idempKey
 
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
-		if err := ValidateWalletOwnership(claims, walletID); err != nil && !claims.HasRole(auth.RoleAdmin) {
+		if err := g.verifyWalletAccess(r.Context(), claims, walletID); err != nil {
 			log.Printf("[SECURITY] IDOR blocked: subject %s tried to deposit into wallet %s", claims.Subject, walletID)
 			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
 			return
@@ -960,12 +1068,9 @@ func (g *Gateway) executeDeposit(w http.ResponseWriter, r *http.Request, pathWal
 	protoReq := &walletv1.DepositFundsRequest{
 		IdempotencyKey: idempKey,
 		WalletId:       walletID,
-		Amount: &walletv1.Money{
-			Currency: curr,
-			Units:    amountUnits,
-		},
-		PaymentRail: railProto,
-		Reference:   req.Reference,
+		Amount:         moneyObj,
+		PaymentRail:    railProto,
+		Reference:      req.Reference,
 	}
 
 	client, target := g.getActiveWalletClient(ctx)
@@ -1060,7 +1165,7 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 		return
 	}
 
-	amountUnits, currExtracted, err := parseAmountAndCurrency(req.Amount, req.Currency)
+	moneyObj, err := parseMoney(req.Amount, req.Currency)
 	if err != nil {
 		log.Printf("[TRACE] trace_id=%s step=http_amount_decode_failed error=%v", traceID, err)
 		http.Error(w, fmt.Sprintf("invalid amount format: %v", err), http.StatusBadRequest)
@@ -1087,16 +1192,13 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 		return
 	}
 
-	curr := db.NormalizeCurrency(currExtracted)
+	curr := db.NormalizeCurrency(moneyObj.Currency)
 	if curr == "" {
 		http.Error(w, "currency is required", http.StatusBadRequest)
 		return
 	}
-	if amountUnits <= 0 {
-		http.Error(w, "amount must be strictly positive", http.StatusBadRequest)
-		return
-	}
-	if err := db.ValidateAmount(amountUnits, curr); err != nil {
+	amountUnits := moneyObj.Units
+	if err := db.ValidateMoney(curr, amountUnits, moneyObj.Nanos, moneyObj.Scale); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -1121,7 +1223,7 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 	correlation.IdempotencyKey = idempKey
 
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
-		if err := ValidateWalletOwnership(claims, walletID); err != nil && !claims.HasRole(auth.RoleAdmin) {
+		if err := g.verifyWalletAccess(r.Context(), claims, walletID); err != nil {
 			log.Printf("[SECURITY] IDOR blocked: subject %s tried to withdraw from wallet %s", claims.Subject, walletID)
 			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
 			return
@@ -1139,12 +1241,9 @@ func (g *Gateway) executeWithdraw(w http.ResponseWriter, r *http.Request, pathWa
 	})
 
 	protoReq := &walletv1.WithdrawFundsRequest{
-		IdempotencyKey: idempKey,
-		WalletId:       walletID,
-		Amount: &walletv1.Money{
-			Currency: curr,
-			Units:    amountUnits,
-		},
+		IdempotencyKey:     idempKey,
+		WalletId:           walletID,
+		Amount:             moneyObj,
 		PaymentRail:        railProto,
 		BeneficiaryDetails: req.BeneficiaryDetails,
 	}
@@ -1430,7 +1529,7 @@ func (g *Gateway) handleLedger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
-		if err := ValidateWalletOwnership(claims, walletID); err != nil {
+		if err := g.verifyWalletAccess(r.Context(), claims, walletID); err != nil {
 			log.Printf("[SECURITY] IDOR blocked: subject %s tried to view ledger of %s", claims.Subject, walletID)
 			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
 			return

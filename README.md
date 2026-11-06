@@ -843,6 +843,7 @@ Both Postman and Bruno test runners validate:
 | [SECURITY.md](SECURITY.md) | Security policy, vulnerability reporting guidelines, and development boundaries. |
 | [docs/SECURITY_VULNERABILITIES_AND_LOOPHOLES.md](docs/SECURITY_VULNERABILITIES_AND_LOOPHOLES.md) | Prioritized catalog of 15 security vulnerabilities, financial bugs, and architectural loopholes with implementation fixes. |
 | [docs/RELEASE_NOTES_v1.7.0.md](docs/RELEASE_NOTES_v1.7.0.md) | Release notes for v1.7.0: 15/15 security vulnerability remediations, Merkle tree RFC 6962 hardening, and CI/CD bugfix pipeline automation. |
+| [docs/RELEASE_NOTES_v1.8.0.md](docs/RELEASE_NOTES_v1.8.0.md) | Release notes for v1.8.0: Sprint 1 core banking release (BOLA unification, air-gapped test isolation, ISO-4217 decimal scale & fractional nanos). |
 | [docs/AI_DEMO_GUIDE.md](docs/AI_DEMO_GUIDE.md) | Operations and integration guide for the Gemini AI Fraud Detection engine, including payload schemas and testing procedures. |
 
 

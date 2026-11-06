@@ -25,6 +25,7 @@ type fakeWalletClient struct {
 	getBalanceRequest     *walletv1.GetBalanceRequest
 	getBalanceResponse    *walletv1.GetBalanceResponse
 	getBalanceError       error
+	getBalanceFunc        func(context.Context, *walletv1.GetBalanceRequest) (*walletv1.GetBalanceResponse, error)
 	createWalletRequest   *walletv1.CreateWalletRequest
 	transferFundsRequest  *walletv1.TransferFundsRequest
 	transferContext       context.Context
@@ -39,8 +40,11 @@ func (f *fakeWalletClient) CreateWallet(_ context.Context, req *walletv1.CreateW
 	return f.createWalletResponse, f.createWalletError
 }
 
-func (f *fakeWalletClient) GetBalance(_ context.Context, req *walletv1.GetBalanceRequest, _ ...grpc.CallOption) (*walletv1.GetBalanceResponse, error) {
+func (f *fakeWalletClient) GetBalance(ctx context.Context, req *walletv1.GetBalanceRequest, _ ...grpc.CallOption) (*walletv1.GetBalanceResponse, error) {
 	f.getBalanceRequest = req
+	if f.getBalanceFunc != nil {
+		return f.getBalanceFunc(ctx, req)
+	}
 	if f.getBalanceError != nil {
 		return nil, f.getBalanceError
 	}
@@ -1040,5 +1044,106 @@ func TestInitFailoverCoordinatorAndResolver(t *testing.T) {
 	gw.handleWallets(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("expected 405 Method Not Allowed, got %d", rec.Code)
+	}
+}
+
+func TestVerifyWalletAccess_REQ_SEC_01(t *testing.T) {
+	aliceClaims := &auth.Claims{Subject: "alice", Roles: []string{auth.RoleUser}}
+	bobClaims := &auth.Claims{Subject: "bob", Roles: []string{auth.RoleUser}}
+	adminClaims := &auth.Claims{Subject: "admin", Roles: []string{auth.RoleAdmin}}
+
+	fakeClient := &fakeWalletClient{
+		getBalanceFunc: func(ctx context.Context, req *walletv1.GetBalanceRequest) (*walletv1.GetBalanceResponse, error) {
+			md, _ := metadata.FromOutgoingContext(ctx)
+			user := ""
+			if vals := md.Get("x-user-id"); len(vals) > 0 {
+				user = vals[0]
+			}
+			// Simulate core service verifying owner_id in database:
+			// "wal_remote_alice" is owned by alice
+			if req.WalletId == "wal_remote_alice" && user == "alice" {
+				return &walletv1.GetBalanceResponse{
+					WalletId: req.WalletId,
+					Balances: []*walletv1.Money{{Currency: "USD", Units: 5000}},
+				}, nil
+			}
+			// "wal_remote_bob" is owned by bob
+			if req.WalletId == "wal_remote_bob" && user == "bob" {
+				return &walletv1.GetBalanceResponse{
+					WalletId: req.WalletId,
+					Balances: []*walletv1.Money{{Currency: "EUR", Units: 3000}},
+				}, nil
+			}
+			return nil, status.Errorf(codes.PermissionDenied, "forbidden: caller %s does not own wallet %s", user, req.WalletId)
+		},
+	}
+
+	gw := &Gateway{
+		activeTarget:  "PRIMARY",
+		primaryClient: fakeClient,
+	}
+	ctx := context.Background()
+
+	// 1. Fast-path: Lexical match
+	if err := gw.verifyWalletAccess(ctx, aliceClaims, "alice_usd"); err != nil {
+		t.Fatalf("expected lexical prefix match allowed for alice_usd, got: %v", err)
+	}
+	if err := gw.verifyWalletAccess(ctx, aliceClaims, "w-alice-01"); err != nil {
+		t.Fatalf("expected lexical prefix match allowed for w-alice-01, got: %v", err)
+	}
+
+	// 2. Fast-path: Explicit foreign namespace rejected immediately
+	if err := gw.verifyWalletAccess(ctx, aliceClaims, "bob_eur"); err != auth.ErrIDORViolation {
+		t.Fatalf("expected foreign namespace bob_eur rejected with ErrIDORViolation, got: %v", err)
+	}
+
+	// 3. Admin bypass
+	if err := gw.verifyWalletAccess(ctx, adminClaims, "bob_eur"); err != nil {
+		t.Fatalf("expected admin allowed on any wallet, got: %v", err)
+	}
+	if err := gw.verifyWalletAccess(ctx, adminClaims, "wal_remote_bob"); err != nil {
+		t.Fatalf("expected admin allowed on opaque wallet, got: %v", err)
+	}
+
+	// 4. Opaque wallet pre-cached in ownership cache
+	SetWalletOwner("wal_cached_savings", "alice")
+	if err := gw.verifyWalletAccess(ctx, aliceClaims, "wal_cached_savings"); err != nil {
+		t.Fatalf("expected cached opaque wallet allowed for alice, got: %v", err)
+	}
+	if err := gw.verifyWalletAccess(ctx, bobClaims, "wal_cached_savings"); err != auth.ErrIDORViolation {
+		t.Fatalf("expected cached opaque wallet blocked for bob, got: %v", err)
+	}
+
+	// 5. Opaque wallet on cache miss resolved dynamically via core wallet-service probe
+	InvalidateWalletOwner("wal_remote_alice")
+	if err := gw.verifyWalletAccess(ctx, aliceClaims, "wal_remote_alice"); err != nil {
+		t.Fatalf("expected core-service probe to authorize alice on wal_remote_alice, got: %v", err)
+	}
+	// Verify it was automatically cached by the probe
+	if owner, ok := GetWalletOwner("wal_remote_alice"); !ok || owner != "alice" {
+		t.Fatalf("expected wal_remote_alice cached as alice after probe, got ok=%v, owner=%s", ok, owner)
+	}
+
+	// 6. Opaque wallet on cache miss rejected by core wallet-service probe
+	InvalidateWalletOwner("wal_remote_bob")
+	if err := gw.verifyWalletAccess(ctx, aliceClaims, "wal_remote_bob"); err != auth.ErrIDORViolation {
+		t.Fatalf("expected core-service probe to reject alice on wal_remote_bob, got: %v", err)
+	}
+
+	// 7. Full HTTP handleGetBalance with dynamic resolution on opaque wallet
+	claimsCtx := ContextWithClaims(context.Background(), aliceClaims)
+	reqBal := httptest.NewRequest(http.MethodGet, "/api/v1/wallets/balance?id=wal_remote_alice", nil).WithContext(claimsCtx)
+	recBal := httptest.NewRecorder()
+	gw.handleGetBalance(recBal, reqBal)
+	if recBal.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on opaque wallet balance, got %d: %s", recBal.Code, recBal.Body.String())
+	}
+
+	// 8. Full HTTP handleGetBalance on foreign opaque wallet rejected with 403 Forbidden
+	reqBalDeny := httptest.NewRequest(http.MethodGet, "/api/v1/wallets/balance?id=wal_remote_bob", nil).WithContext(claimsCtx)
+	recBalDeny := httptest.NewRecorder()
+	gw.handleGetBalance(recBalDeny, reqBalDeny)
+	if recBalDeny.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden on foreign opaque wallet balance, got %d: %s", recBalDeny.Code, recBalDeny.Body.String())
 	}
 }

@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"runtime"
+	"time"
 )
 
 var (
@@ -14,6 +16,12 @@ var (
 	GitCommit = "dev"
 	// BuildDate is populated at build time.
 	BuildDate = "unknown"
+
+	// newHTTPClient creates an HTTP client for walletctl operations.
+	// Tests can override this to inject mock round-trippers for air-gapped test execution.
+	newHTTPClient = func(timeout time.Duration) *http.Client {
+		return &http.Client{Timeout: timeout}
+	}
 )
 
 const usageText = `walletctl - Unified Operator & Developer CLI for Global Wallet Microservices

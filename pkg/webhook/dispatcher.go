@@ -33,6 +33,10 @@ const (
 	CollectionDeliveries    = "webhook_deliveries"
 )
 
+// lookupIPFunc is the DNS IP lookup function used by ValidateWebhookURL.
+// It defaults to net.LookupIP and can be overridden in tests to support air-gapped environments.
+var lookupIPFunc = net.LookupIP
+
 // ValidateWebhookURL validates that targetURL is a valid HTTP/HTTPS URL and prevents
 // Server-Side Request Forgery (SSRF) by blocking internal, loopback, private, and cloud-metadata addresses.
 func ValidateWebhookURL(targetURL string) error {
@@ -70,7 +74,7 @@ func ValidateWebhookURL(targetURL string) error {
 	}
 
 	// Resolve host IPs to defend against DNS rebinding & private IP targeting
-	ips, err := net.LookupIP(host)
+	ips, err := lookupIPFunc(host)
 	if err != nil {
 		return fmt.Errorf("failed to resolve webhook host %q: %w", host, err)
 	}

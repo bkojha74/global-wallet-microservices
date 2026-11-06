@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -16,7 +15,7 @@ import (
 
 func TestKeycloakAndHybridProvider_Unit(t *testing.T) {
 	// 1. Mock Keycloak OIDC HTTP Server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newAuthTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/.well-known/openid-configuration":
 			w.Header().Set("Content-Type", "application/json")
@@ -125,8 +124,8 @@ func TestOIDCProvider_SelfHealingPoller(t *testing.T) {
 	// Server starts healthy
 	var mu sync.RWMutex
 	isUp := true
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var server *inMemoryAuthTestServer
+	server = newAuthTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.RLock()
 		up := isUp
 		mu.RUnlock()
