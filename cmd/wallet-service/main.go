@@ -478,6 +478,7 @@ type transferExecutionState struct {
 	destUnits       int64
 	exchangeRate    float64
 	fxQuoteID       string
+	reservationID   string
 	isCrossCurrency bool
 	srcWallet       WalletModel
 	dstWallet       WalletModel
@@ -519,18 +520,17 @@ func (s *server) prepareFXConversion(ctx context.Context, req *walletv1.Transfer
 	state.exchangeRate = 1.0
 	state.fxQuoteID = strings.TrimSpace(req.FxQuoteId)
 
-	if s.db() == nil {
-		return nil
-	}
-	walletsCol := s.db().Collection("wallets")
-	var dstWallet WalletModel
-	if err := walletsCol.FindOne(ctx, bson.M{"_id": req.DestinationWalletId}).Decode(&dstWallet); err != nil {
-		// Let validateWalletsOperational inside the transaction handle missing destination wallet
-		return nil
+	srcCurr := db.NormalizeCurrency(req.Amount.Currency)
+	dstCurr := srcCurr
+
+	if s.db() != nil {
+		walletsCol := s.db().Collection("wallets")
+		var dstWallet WalletModel
+		if err := walletsCol.FindOne(ctx, bson.M{"_id": req.DestinationWalletId}).Decode(&dstWallet); err == nil {
+			dstCurr = db.NormalizeCurrency(dstWallet.Currency)
+		}
 	}
 
-	srcCurr := db.NormalizeCurrency(req.Amount.Currency)
-	dstCurr := db.NormalizeCurrency(dstWallet.Currency)
 	if srcCurr == dstCurr && state.fxQuoteID == "" {
 		return nil
 	}
@@ -545,6 +545,38 @@ func (s *server) prepareFXConversion(ctx context.Context, req *walletv1.Transfer
 	if s.fxClient != nil {
 		callCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 		defer cancel()
+
+		if state.fxQuoteID != "" {
+			// REQ-FIN-02: Two-Phase Saga — reserve the locked quote before ACID transaction
+			resResp, err := s.fxClient.ReserveQuote(callCtx, &fxv1.ReserveQuoteRequest{
+				QuoteId:        state.fxQuoteID,
+				WalletId:       req.SourceWalletId,
+				IdempotencyKey: "wallet_fx_res_" + req.IdempotencyKey,
+				TtlSeconds:     30,
+			})
+			if err != nil {
+				state.txnStatus = walletv1.TransferFundsResponse_INTERNAL_ERROR
+				state.txnErrMsg = fmt.Sprintf("FX quote reservation failed: %v", err)
+				return err
+			}
+			state.reservationID = resResp.ReservationId
+			if resResp.Quote != nil {
+				state.destUnits = resResp.Quote.TargetAmount
+				state.exchangeRate = resResp.Quote.EffectiveRate
+				state.fxQuoteID = resResp.Quote.QuoteId
+			}
+			s.emit(ctx, "wallet.transfer.fx_quote_reserved", observability.LevelInfo, "Locked FX quote reserved for Saga transaction", map[string]any{
+				"source_currency": srcCurr,
+				"target_currency": dstCurr,
+				"source_amount":   req.Amount.Units,
+				"target_amount":   state.destUnits,
+				"exchange_rate":   state.exchangeRate,
+				"fx_quote_id":     state.fxQuoteID,
+				"reservation_id":  state.reservationID,
+			})
+			return nil
+		}
+
 		convResp, err := s.fxClient.ConvertCurrency(callCtx, &fxv1.ConvertCurrencyRequest{
 			IdempotencyKey: "wallet_fx_" + req.IdempotencyKey,
 			QuoteId:        state.fxQuoteID,
@@ -567,11 +599,6 @@ func (s *server) prepareFXConversion(ctx context.Context, req *walletv1.Transfer
 				"fx_quote_id":     state.fxQuoteID,
 			})
 			return nil
-		}
-		if state.fxQuoteID != "" && err != nil {
-			state.txnStatus = walletv1.TransferFundsResponse_INTERNAL_ERROR
-			state.txnErrMsg = fmt.Sprintf("FX quote validation failed: %v", err)
-			return err
 		}
 		log.Printf("[WALLET-FX] fx-service unreachable (%v); falling back to local institutional FX rate book", err)
 	}
@@ -1046,6 +1073,26 @@ func (s *server) handleTransferFailure(ctx context.Context, req *walletv1.Transf
 		state.txnErrMsg = err.Error()
 	}
 
+	// REQ-FIN-02: Saga Compensation — release any reserved quote upon transfer failure
+	if state.reservationID != "" && s.fxClient != nil {
+		relCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_, relErr := s.fxClient.ReleaseQuote(relCtx, &fxv1.ReleaseQuoteRequest{
+			QuoteId:       state.fxQuoteID,
+			ReservationId: state.reservationID,
+			Reason:        state.txnErrMsg,
+		})
+		cancel()
+		if relErr != nil {
+			log.Printf("[WALLET-SAGA] Warning: failed to release FX quote %s: %v", state.fxQuoteID, relErr)
+		} else {
+			s.emit(ctx, "wallet.transfer.fx_quote_released", observability.LevelWarn, "Reserved FX quote released after transaction abort", map[string]any{
+				"quote_id":       state.fxQuoteID,
+				"reservation_id": state.reservationID,
+				"reason":         state.txnErrMsg,
+			})
+		}
+	}
+
 	if state.sourceDebited {
 		s.emit(ctx, "wallet.transfer.rollback_completed", observability.LevelWarn, "Transaction aborted, balances rolled back", map[string]any{
 			"source_wallet": req.SourceWalletId,
@@ -1071,6 +1118,26 @@ func (s *server) handleTransferFailure(ctx context.Context, req *walletv1.Transf
 func (s *server) handleTransferSuccess(ctx context.Context, req *walletv1.TransferFundsRequest, state *transferExecutionState, durationMS int64) {
 	traceID := req.IdempotencyKey
 	if state.txnStatus == walletv1.TransferFundsResponse_SUCCESS {
+		// REQ-FIN-02: Finalize reserved quote now that MongoDB ACID transaction committed
+		if state.reservationID != "" && s.fxClient != nil {
+			finCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_, finErr := s.fxClient.FinalizeQuote(finCtx, &fxv1.FinalizeQuoteRequest{
+				QuoteId:       state.fxQuoteID,
+				ReservationId: state.reservationID,
+				TransactionId: state.finalTxnID,
+			})
+			cancel()
+			if finErr != nil {
+				log.Printf("[WALLET-SAGA] Warning: failed to finalize FX quote %s: %v", state.fxQuoteID, finErr)
+			} else {
+				s.emit(ctx, "wallet.transfer.fx_quote_finalized", observability.LevelAudit, "Reserved FX quote finalized upon commit", map[string]any{
+					"quote_id":       state.fxQuoteID,
+					"reservation_id": state.reservationID,
+					"transaction_id": state.finalTxnID,
+				})
+			}
+		}
+
 		s.dispatchImmediateLedger(ctx, req, state.outboxTask, state.finalTxnID)
 		// Evict both source and destination wallets immediately to prevent stale balance reads
 		if c := s.cache(); c != nil {
@@ -1291,23 +1358,48 @@ func (s *server) ExchangeCurrency(ctx context.Context, req *walletv1.ExchangeCur
 	targetUnits := int64(0)
 	effectiveRate := float64(0)
 	finalTxnID := primitive.NewObjectID().Hex()
+	var reservationID string
 
 	if s.fxClient != nil {
 		callCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
-		convResp, err := s.fxClient.ConvertCurrency(callCtx, &fxv1.ConvertCurrencyRequest{
-			IdempotencyKey: "wallet_exchange_" + idempKey,
-			QuoteId:        quoteID,
-			BaseCurrency:   fromCurr,
-			TargetCurrency: toCurr,
-			SourceAmount:   fromAmount,
-			ClientId:       walletServiceName,
-			ReferenceId:    finalTxnID,
-		})
-		cancel()
-		if err == nil && convResp != nil {
-			targetUnits = convResp.TargetAmount
-			effectiveRate = convResp.EffectiveRate
-			quoteID = convResp.QuoteId
+		if quoteID != "" {
+			// REQ-FIN-02: Saga — Reserve locked quote before transaction commit
+			resResp, err := s.fxClient.ReserveQuote(callCtx, &fxv1.ReserveQuoteRequest{
+				QuoteId:        quoteID,
+				WalletId:       walletID,
+				IdempotencyKey: "wallet_exchange_res_" + idempKey,
+				TtlSeconds:     30,
+			})
+			cancel()
+			if err != nil {
+				return &walletv1.ExchangeCurrencyResponse{
+					Status:          walletv1.ExchangeCurrencyResponse_INVALID_ARGUMENT,
+					ErrorMessage:    fmt.Sprintf("FX quote reservation failed: %v", err),
+					HandledByRegion: s.region,
+				}, nil
+			}
+			reservationID = resResp.ReservationId
+			if resResp.Quote != nil {
+				targetUnits = resResp.Quote.TargetAmount
+				effectiveRate = resResp.Quote.EffectiveRate
+				quoteID = resResp.Quote.QuoteId
+			}
+		} else {
+			convResp, err := s.fxClient.ConvertCurrency(callCtx, &fxv1.ConvertCurrencyRequest{
+				IdempotencyKey: "wallet_exchange_" + idempKey,
+				QuoteId:        quoteID,
+				BaseCurrency:   fromCurr,
+				TargetCurrency: toCurr,
+				SourceAmount:   fromAmount,
+				ClientId:       walletServiceName,
+				ReferenceId:    finalTxnID,
+			})
+			cancel()
+			if err == nil && convResp != nil {
+				targetUnits = convResp.TargetAmount
+				effectiveRate = convResp.EffectiveRate
+				quoteID = convResp.QuoteId
+			}
 		}
 	}
 	if targetUnits <= 0 {
@@ -1417,6 +1509,15 @@ func (s *server) ExchangeCurrency(ctx context.Context, req *walletv1.ExchangeCur
 
 	durationMS := time.Since(startTime).Milliseconds()
 	if err != nil {
+		if reservationID != "" && s.fxClient != nil {
+			relCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_, _ = s.fxClient.ReleaseQuote(relCtx, &fxv1.ReleaseQuoteRequest{
+				QuoteId:       quoteID,
+				ReservationId: reservationID,
+				Reason:        err.Error(),
+			})
+			cancel()
+		}
 		s.emitTerminal(ctx, "wallet.exchange.failed", observability.LevelError, "Intra-wallet exchange failed", durationMS, false, map[string]any{"error": err.Error()})
 		return &walletv1.ExchangeCurrencyResponse{
 			TransactionId:   finalTxnID,
@@ -1424,6 +1525,16 @@ func (s *server) ExchangeCurrency(ctx context.Context, req *walletv1.ExchangeCur
 			ErrorMessage:    err.Error(),
 			HandledByRegion: s.region,
 		}, nil
+	}
+
+	if reservationID != "" && s.fxClient != nil {
+		finCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_, _ = s.fxClient.FinalizeQuote(finCtx, &fxv1.FinalizeQuoteRequest{
+			QuoteId:       quoteID,
+			ReservationId: reservationID,
+			TransactionId: finalTxnID,
+		})
+		cancel()
 	}
 
 	// Dispatch immediate ledger sync fast-path

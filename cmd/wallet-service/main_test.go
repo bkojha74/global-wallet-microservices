@@ -595,6 +595,37 @@ func (f *fakeFXServiceClient) ConvertCurrency(_ context.Context, req *fxv1.Conve
 	}, nil
 }
 
+func (f *fakeFXServiceClient) ReserveQuote(_ context.Context, req *fxv1.ReserveQuoteRequest, _ ...grpc.CallOption) (*fxv1.ReserveQuoteResponse, error) {
+	return &fxv1.ReserveQuoteResponse{
+		Success:       true,
+		ReservationId: "res_" + req.QuoteId,
+		Status:        "RESERVED",
+		Quote: &fxv1.Quote{
+			QuoteId:        req.QuoteId,
+			BaseCurrency:   "USD",
+			TargetCurrency: "EUR",
+			SourceAmount:   10000,
+			TargetAmount:   9200,
+			EffectiveRate:  0.92,
+		},
+	}, nil
+}
+
+func (f *fakeFXServiceClient) FinalizeQuote(_ context.Context, req *fxv1.FinalizeQuoteRequest, _ ...grpc.CallOption) (*fxv1.FinalizeQuoteResponse, error) {
+	return &fxv1.FinalizeQuoteResponse{
+		Success:      true,
+		Status:       "EXECUTED",
+		ConversionId: "conv_" + req.QuoteId,
+	}, nil
+}
+
+func (f *fakeFXServiceClient) ReleaseQuote(_ context.Context, req *fxv1.ReleaseQuoteRequest, _ ...grpc.CallOption) (*fxv1.ReleaseQuoteResponse, error) {
+	return &fxv1.ReleaseQuoteResponse{
+		Success: true,
+		Status:  "RELEASED",
+	}, nil
+}
+
 func TestCrossCurrencyTransferFXEngine(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
