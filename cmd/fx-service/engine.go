@@ -542,8 +542,6 @@ func (e *FXEngine) loadQuoteDoc(ctx context.Context, quoteID string) (*QuoteDoc,
 	e.mu.Unlock()
 
 	return doc, nil
-
-	return nil, fmt.Errorf("quote %s not found", quoteID)
 }
 
 func quoteDocToProto(doc *QuoteDoc) *fxv1.Quote {

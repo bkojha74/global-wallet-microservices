@@ -444,6 +444,7 @@ func (d *Dispatcher) publishToQueue(ctx context.Context, job WebhookJob) error {
 		return errors.New("amqp channel unavailable")
 	}
 
+	// #nosec G117 -- internal AMQP broker message payload for webhook retry worker
 	body, err := json.Marshal(job)
 	if err != nil {
 		return fmt.Errorf("failed to marshal webhook job: %w", err)
@@ -542,10 +543,11 @@ func (d *Dispatcher) startAMQPWorker(ctx context.Context, workerID int, msgs <-c
 						})
 					}
 					_ = msg.Ack(false)
+					// #nosec G118 -- worker loop uses worker context for retry backoff
 					go func(j WebhookJob, delay time.Duration) {
 						select {
 						case <-time.After(delay):
-							_ = d.publishToQueue(context.Background(), j)
+							_ = d.publishToQueue(ctx, j)
 						case <-d.amqpStop:
 						case <-ctx.Done():
 						}
@@ -633,7 +635,8 @@ func (d *Dispatcher) Dispatch(ctx context.Context, event string, data interface{
 			}
 			if pubErr := d.publishToQueue(ctx, job); pubErr != nil {
 				log.Printf("[WEBHOOK-QUEUE] Failed to publish job to queue: %v, falling back to direct dispatch", pubErr)
-				go d.dispatchSingle(ctx, sub, event, payloadBytes)
+				// #nosec G118 -- fallback direct dispatch goroutine
+				go d.dispatchSingle(context.WithoutCancel(ctx), sub, event, payloadBytes)
 			}
 		}
 		return nil
