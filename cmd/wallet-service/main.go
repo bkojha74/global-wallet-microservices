@@ -2507,6 +2507,18 @@ func runWalletServer(ctx context.Context) error {
 	var whDispatcher *webhook.Dispatcher
 	if client != nil {
 		whDispatcher = webhook.NewDispatcher(client.Database("banking_db"), nil)
+		amqpURL := os.Getenv("RABBITMQ_URL")
+		if amqpURL == "" {
+			amqpURL = os.Getenv("LOGGING_RABBITMQ_URL")
+		}
+		if amqpURL != "" {
+			if err := whDispatcher.EnableAMQPQueue(ctx, webhook.WebhookQueueConfig{
+				URL:     amqpURL,
+				Workers: 2,
+			}); err == nil {
+				log.Printf("[WALLET-SERVICE] Decoupled RabbitMQ Webhook Dispatcher enabled on exchange '%s'", webhook.DefaultWebhookExchange)
+			}
+		}
 	}
 
 	srv := &server{

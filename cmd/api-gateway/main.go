@@ -2501,6 +2501,22 @@ func runGatewayServer(ctx context.Context) error {
 		whDispatcher = webhook.NewDispatcher(nil, nil)
 	}
 
+	// REQ-ASYNC-01: Enable RabbitMQ decoupled webhook pipeline if broker is available
+	amqpURL := os.Getenv("RABBITMQ_URL")
+	if amqpURL == "" {
+		amqpURL = os.Getenv("LOGGING_RABBITMQ_URL")
+	}
+	if amqpURL != "" {
+		if err := whDispatcher.EnableAMQPQueue(subCtx, webhook.WebhookQueueConfig{
+			URL:     amqpURL,
+			Workers: 2,
+		}); err == nil {
+			log.Printf("[API-GATEWAY] Decoupled RabbitMQ Webhook Dispatcher enabled on exchange '%s'", webhook.DefaultWebhookExchange)
+		} else {
+			log.Printf("[API-GATEWAY] Warning: failed to enable AMQP webhook queue (%v); operating in direct dispatch mode", err)
+		}
+	}
+
 	gw := &Gateway{
 		activeTarget:      "PRIMARY",
 		coordinator:       coord,
