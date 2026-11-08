@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"wallet-system/pkg/cache"
 	"wallet-system/pkg/observability"
 	walletv1 "wallet-system/proto/wallet"
 )
@@ -209,6 +210,8 @@ func TestServer_TransferSuccess_InvalidatesCache(t *testing.T) {
 
 type fakeBusForTest struct {
 	subscribers []func(walletIDs []string)
+	callbacks   []cache.StatusCallback
+	connected   bool
 }
 
 func (f *fakeBusForTest) PublishInvalidation(_ context.Context, walletIDs ...string) error {
@@ -225,6 +228,23 @@ func (f *fakeBusForTest) Subscribe(_ context.Context, onInvalidate func(walletID
 
 func (f *fakeBusForTest) Close() error {
 	return nil
+}
+
+func (f *fakeBusForTest) IsConnected() bool {
+	return f.connected
+}
+
+func (f *fakeBusForTest) OnConnectionStatusChange(cb cache.StatusCallback) {
+	f.callbacks = append(f.callbacks, cb)
+}
+
+func (f *fakeBusForTest) setConnected(connected bool) {
+	f.connected = connected
+	for _, cb := range f.callbacks {
+		if cb != nil {
+			cb(connected)
+		}
+	}
 }
 
 func TestBalanceCache_MultiPodInvalidationBus(t *testing.T) {
@@ -328,5 +348,53 @@ func TestBalanceCache_L2FallbackAndBackfill(t *testing.T) {
 	c.Invalidate("l2_wallet")
 	if _, hit := c.Get("l2_wallet"); hit {
 		t.Fatal("expected miss after Invalidate")
+	}
+}
+
+func TestBalanceCache_DegradedModeOnDisconnect(t *testing.T) {
+	bus := &fakeBusForTest{connected: false}
+	c := NewBalanceCache(60*time.Second, 100, "test-degraded", WithInvalidationBus(bus))
+	defer c.Close()
+
+	// Initial state with bus disconnected: should start in degraded mode
+	if !c.IsDegraded() {
+		t.Fatal("expected cache to be in degraded mode when bus starts disconnected")
+	}
+
+	// Stored entry in degraded mode should have bounded TTL (5s instead of 60s)
+	resp := &walletv1.GetBalanceResponse{
+		WalletId: "w_degraded",
+		Balances: []*walletv1.Money{{Currency: "USD", Units: 1000}},
+	}
+	c.Set("w_degraded", resp)
+
+	c.mu.RLock()
+	entry, exists := c.entries["w_degraded"]
+	c.mu.RUnlock()
+	if !exists {
+		t.Fatal("expected entry to exist in cache")
+	}
+	remainingTTL := time.Until(entry.expiresAt)
+	if remainingTTL > 6*time.Second {
+		t.Fatalf("expected degraded TTL under 6s, got %v", remainingTTL)
+	}
+
+	// When bus reconnects: clears cache and exits degraded mode
+	bus.setConnected(true)
+	if c.IsDegraded() {
+		t.Fatal("expected cache to exit degraded mode upon bus reconnect")
+	}
+	if _, hit := c.Get("w_degraded"); hit {
+		t.Fatal("expected cache to be flushed upon bus reconnection")
+	}
+
+	// Re-inserting in connected mode: should have normal 60s TTL
+	c.Set("w_normal", resp)
+	c.mu.RLock()
+	entryNormal := c.entries["w_normal"]
+	c.mu.RUnlock()
+	remainingNormalTTL := time.Until(entryNormal.expiresAt)
+	if remainingNormalTTL < 50*time.Second {
+		t.Fatalf("expected normal TTL near 60s, got %v", remainingNormalTTL)
 	}
 }
