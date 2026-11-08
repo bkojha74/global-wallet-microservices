@@ -13,7 +13,9 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/status"
 
 	"wallet-system/pkg/coordinator"
 	"wallet-system/pkg/db"
@@ -479,8 +481,8 @@ func TestExchangeCurrency_Validation(t *testing.T) {
 		ToCurrency:     "EUR",
 		FromAmount:     100,
 	})
-	if errStandby != nil || respStandby == nil || respStandby.Status != walletv1.ExchangeCurrencyResponse_INVALID_ARGUMENT {
-		t.Errorf("expected standby rejection response, got resp=%+v, err=%v", respStandby, errStandby)
+	if status.Code(errStandby) != codes.FailedPrecondition {
+		t.Errorf("expected FailedPrecondition on standby rejection, got resp=%+v, err=%v", respStandby, errStandby)
 	}
 }
 
@@ -673,8 +675,8 @@ func TestDepositFunds_Validations(t *testing.T) {
 		Amount:         &walletv1.Money{Currency: "USD", Units: 100},
 		PaymentRail:    walletv1.PaymentRail_ACH,
 	})
-	if errStandby != nil || respStandby == nil || respStandby.Status != walletv1.DepositFundsResponse_INVALID_ARGUMENT {
-		t.Errorf("expected standby rejection response, got resp=%+v, err=%v", respStandby, errStandby)
+	if status.Code(errStandby) != codes.FailedPrecondition {
+		t.Errorf("expected FailedPrecondition on standby rejection, got resp=%+v, err=%v", respStandby, errStandby)
 	}
 }
 
@@ -733,8 +735,8 @@ func TestWithdrawFunds_Validations(t *testing.T) {
 		Amount:         &walletv1.Money{Currency: "USD", Units: 100},
 		PaymentRail:    walletv1.PaymentRail_WIRE,
 	})
-	if errStandby != nil || respStandby == nil || respStandby.Status != walletv1.WithdrawFundsResponse_INVALID_ARGUMENT {
-		t.Errorf("expected standby rejection response, got resp=%+v, err=%v", respStandby, errStandby)
+	if status.Code(errStandby) != codes.FailedPrecondition {
+		t.Errorf("expected FailedPrecondition on standby rejection, got resp=%+v, err=%v", respStandby, errStandby)
 	}
 }
 

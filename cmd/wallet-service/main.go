@@ -1236,7 +1236,7 @@ func (s *server) ExchangeCurrency(ctx context.Context, req *walletv1.ExchangeCur
 			Status:          walletv1.ExchangeCurrencyResponse_INVALID_ARGUMENT,
 			ErrorMessage:    fmt.Sprintf(errStandbyReplicaFmt, s.region),
 			HandledByRegion: s.region,
-		}, nil
+		}, status.Errorf(codes.FailedPrecondition, errStandbyReplicaFmt, s.region)
 	}
 
 	if s.db() == nil {
@@ -1544,7 +1544,7 @@ func (s *server) DepositFunds(ctx context.Context, req *walletv1.DepositFundsReq
 			Status:          walletv1.DepositFundsResponse_INVALID_ARGUMENT,
 			ErrorMessage:    fmt.Sprintf(errStandbyReplicaFmt, s.region),
 			HandledByRegion: s.region,
-		}, nil
+		}, status.Errorf(codes.FailedPrecondition, errStandbyReplicaFmt, s.region)
 	}
 
 	if s.db() == nil {
@@ -1749,7 +1749,7 @@ func (s *server) WithdrawFunds(ctx context.Context, req *walletv1.WithdrawFundsR
 			Status:          walletv1.WithdrawFundsResponse_INVALID_ARGUMENT,
 			ErrorMessage:    fmt.Sprintf(errStandbyReplicaFmt, s.region),
 			HandledByRegion: s.region,
-		}, nil
+		}, status.Errorf(codes.FailedPrecondition, errStandbyReplicaFmt, s.region)
 	}
 
 	if s.db() == nil {
@@ -1929,6 +1929,9 @@ func (s *server) WithdrawFunds(ctx context.Context, req *walletv1.WithdrawFundsR
 }
 
 func (s *server) UpdateWalletStatus(ctx context.Context, walletID, newStatus string) error {
+	if !s.isWritable(ctx) {
+		return status.Errorf(codes.FailedPrecondition, errStandbyReplicaFmt, s.region)
+	}
 	db := s.db()
 	if db == nil {
 		return fmt.Errorf("database unavailable")
@@ -2027,6 +2030,16 @@ func (s *server) handleAdminWalletStatusUpdate(w http.ResponseWriter, r *http.Re
 		_ = json.NewEncoder(w).Encode(AdminWalletStatusResponse{
 			Success: false,
 			Message: fmt.Sprintf("invalid status %q: must be ACTIVE, FROZEN, or CLOSED", req.Status),
+		})
+		return
+	}
+
+	if !s.isWritable(r.Context()) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(AdminWalletStatusResponse{
+			Success:  false,
+			WalletID: req.WalletID,
+			Message:  fmt.Sprintf(errStandbyReplicaFmt, s.region),
 		})
 		return
 	}

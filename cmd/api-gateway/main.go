@@ -260,6 +260,10 @@ func handleWalletGRPCError(w http.ResponseWriter, err error, action string) {
 			http.Error(w, st.Message(), http.StatusNotFound)
 			return
 		}
+		if st.Code() == codes.FailedPrecondition {
+			http.Error(w, st.Message(), http.StatusServiceUnavailable)
+			return
+		}
 	}
 	http.Error(w, fmt.Sprintf("Error %s: %v", action, err), http.StatusInternalServerError)
 }

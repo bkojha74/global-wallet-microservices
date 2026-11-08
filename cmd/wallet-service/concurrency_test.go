@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -65,7 +67,85 @@ func TestStandbyWriteFencing(t *testing.T) {
 		t.Fatalf("expected INTERNAL_ERROR in proto response, got %v", resp.Status)
 	}
 
-	// 3. HealthCheck must report STANDBY and is_active=false
+	// 3. DepositFunds must be rejected on standby
+	_, err = srv.DepositFunds(ctx, &walletv1.DepositFundsRequest{
+		IdempotencyKey: "standby-deposit-test",
+		WalletId:       "wallet-a",
+		Amount:         &walletv1.Money{Currency: "USD", Units: 100},
+		PaymentRail:    walletv1.PaymentRail_ACH,
+	})
+	if err == nil {
+		t.Fatal("expected error on standby DepositFunds, got nil")
+	}
+	st, ok = status.FromError(err)
+	if !ok || st.Code() != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition on DepositFunds, got %v", err)
+	}
+
+	// 4. WithdrawFunds must be rejected on standby
+	_, err = srv.WithdrawFunds(ctx, &walletv1.WithdrawFundsRequest{
+		IdempotencyKey: "standby-withdraw-test",
+		WalletId:       "wallet-a",
+		Amount:         &walletv1.Money{Currency: "USD", Units: 50},
+		PaymentRail:    walletv1.PaymentRail_WIRE,
+	})
+	if err == nil {
+		t.Fatal("expected error on standby WithdrawFunds, got nil")
+	}
+	st, ok = status.FromError(err)
+	if !ok || st.Code() != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition on WithdrawFunds, got %v", err)
+	}
+
+	// 5. ExchangeCurrency must be rejected on standby
+	_, err = srv.ExchangeCurrency(ctx, &walletv1.ExchangeCurrencyRequest{
+		IdempotencyKey: "standby-exchange-test",
+		WalletId:       "wallet-a",
+		FromCurrency:   "USD",
+		ToCurrency:     "EUR",
+		FromAmount:     50,
+	})
+	if err == nil {
+		t.Fatal("expected error on standby ExchangeCurrency, got nil")
+	}
+	st, ok = status.FromError(err)
+	if !ok || st.Code() != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition on ExchangeCurrency, got %v", err)
+	}
+
+	// 6. UpdateWalletKYC must be rejected on standby
+	_, err = srv.UpdateWalletKYC(ctx, &walletv1.UpdateWalletKYCRequest{
+		WalletId: "wallet-a",
+		KycTier:  "TIER_2",
+	})
+	if err == nil {
+		t.Fatal("expected error on standby UpdateWalletKYC, got nil")
+	}
+	st, ok = status.FromError(err)
+	if !ok || st.Code() != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition on UpdateWalletKYC, got %v", err)
+	}
+
+	// 7. UpdateWalletStatus must be rejected on standby
+	err = srv.UpdateWalletStatus(ctx, "wallet-a", "FROZEN")
+	if err == nil {
+		t.Fatal("expected error on standby UpdateWalletStatus, got nil")
+	}
+	st, ok = status.FromError(err)
+	if !ok || st.Code() != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition on UpdateWalletStatus, got %v", err)
+	}
+
+	// 8. Admin HTTP status update must be rejected with 503 on standby
+	adminReqBody := bytes.NewBufferString(`{"wallet_id":"wallet-a","status":"FROZEN"}`)
+	adminReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, "/admin/wallets/status", adminReqBody)
+	adminRec := httptest.NewRecorder()
+	srv.handleAdminWalletStatusUpdate(adminRec, adminReq)
+	if adminRec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected HTTP 503 on standby admin status update, got %d", adminRec.Code)
+	}
+
+	// 9. HealthCheck must report STANDBY and is_active=false
 	healthResp, err := srv.HealthCheck(ctx, &walletv1.HealthRequest{})
 	if err != nil {
 		t.Fatalf("HealthCheck failed: %v", err)
