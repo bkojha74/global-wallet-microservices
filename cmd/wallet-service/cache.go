@@ -31,11 +31,29 @@ func WithL2Cache(l2 cache.DistributedCache) BalanceCacheOption {
 	}
 }
 
+const (
+	// DefaultDegradedTTL is the short bounded TTL applied when the AMQP invalidation bus is disconnected.
+	DefaultDegradedTTL = 5 * time.Second
+)
+
 // WithInvalidationBus configures an AMQP invalidation bus for multi-pod cache coherence.
 func WithInvalidationBus(bus cache.InvalidationBus) BalanceCacheOption {
 	return func(c *BalanceCache) {
 		c.bus = bus
 		if bus != nil {
+			if !bus.IsConnected() {
+				c.setDegraded(true)
+			}
+			bus.OnConnectionStatusChange(func(connected bool) {
+				if connected {
+					log.Printf("[WALLET-CACHE] AMQP Invalidation bus connected; clearing local cache to flush stale balances and restoring normal TTL")
+					c.Clear()
+					c.setDegraded(false)
+				} else {
+					log.Printf("[WALLET-CACHE] Warning: AMQP Invalidation bus disconnected; switching to degraded TTL (%v)", c.degradedTTL)
+					c.setDegraded(true)
+				}
+			})
 			err := bus.Subscribe(context.Background(), func(walletIDs []string) {
 				c.InvalidateLocal(walletIDs...)
 			})
@@ -53,6 +71,8 @@ type BalanceCache struct {
 	mu          sync.RWMutex
 	entries     map[string]cachedBalanceEntry
 	ttl         time.Duration
+	degradedTTL time.Duration
+	isDegraded  bool
 	maxEntries  int
 	serviceName string
 	stopCleanup chan struct{}
@@ -80,6 +100,7 @@ func NewBalanceCache(ttl time.Duration, maxEntries int, serviceName string, opts
 	c := &BalanceCache{
 		entries:     make(map[string]cachedBalanceEntry),
 		ttl:         ttl,
+		degradedTTL: DefaultDegradedTTL,
 		maxEntries:  maxEntries,
 		serviceName: serviceName,
 		stopCleanup: make(chan struct{}),
@@ -234,9 +255,31 @@ func (c *BalanceCache) Set(walletID string, resp *walletv1.GetBalanceResponse) {
 	}
 }
 
+func (c *BalanceCache) effectiveTTL() time.Duration {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.isDegraded && c.degradedTTL > 0 && c.degradedTTL < c.ttl {
+		return c.degradedTTL
+	}
+	return c.ttl
+}
+
+func (c *BalanceCache) setDegraded(degraded bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.isDegraded = degraded
+}
+
+// IsDegraded returns whether the cache is operating with degraded TTL due to invalidation bus disconnection.
+func (c *BalanceCache) IsDegraded() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.isDegraded
+}
+
 func (c *BalanceCache) setLocal(walletID string, resp *walletv1.GetBalanceResponse) {
 	cloned := cloneGetBalanceResponse(resp)
-	expiresAt := time.Now().Add(c.ttl)
+	expiresAt := time.Now().Add(c.effectiveTTL())
 
 	c.mu.Lock()
 	defer c.mu.Unlock()

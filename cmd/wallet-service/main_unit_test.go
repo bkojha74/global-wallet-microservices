@@ -13,10 +13,13 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/status"
 
 	"wallet-system/pkg/coordinator"
 	"wallet-system/pkg/db"
+	fxv1 "wallet-system/proto/fx"
 	ledgerv1 "wallet-system/proto/ledger"
 	walletv1 "wallet-system/proto/wallet"
 )
@@ -479,8 +482,8 @@ func TestExchangeCurrency_Validation(t *testing.T) {
 		ToCurrency:     "EUR",
 		FromAmount:     100,
 	})
-	if errStandby != nil || respStandby == nil || respStandby.Status != walletv1.ExchangeCurrencyResponse_INVALID_ARGUMENT {
-		t.Errorf("expected standby rejection response, got resp=%+v, err=%v", respStandby, errStandby)
+	if status.Code(errStandby) != codes.FailedPrecondition {
+		t.Errorf("expected FailedPrecondition on standby rejection, got resp=%+v, err=%v", respStandby, errStandby)
 	}
 }
 
@@ -673,8 +676,8 @@ func TestDepositFunds_Validations(t *testing.T) {
 		Amount:         &walletv1.Money{Currency: "USD", Units: 100},
 		PaymentRail:    walletv1.PaymentRail_ACH,
 	})
-	if errStandby != nil || respStandby == nil || respStandby.Status != walletv1.DepositFundsResponse_INVALID_ARGUMENT {
-		t.Errorf("expected standby rejection response, got resp=%+v, err=%v", respStandby, errStandby)
+	if status.Code(errStandby) != codes.FailedPrecondition {
+		t.Errorf("expected FailedPrecondition on standby rejection, got resp=%+v, err=%v", respStandby, errStandby)
 	}
 }
 
@@ -733,8 +736,8 @@ func TestWithdrawFunds_Validations(t *testing.T) {
 		Amount:         &walletv1.Money{Currency: "USD", Units: 100},
 		PaymentRail:    walletv1.PaymentRail_WIRE,
 	})
-	if errStandby != nil || respStandby == nil || respStandby.Status != walletv1.WithdrawFundsResponse_INVALID_ARGUMENT {
-		t.Errorf("expected standby rejection response, got resp=%+v, err=%v", respStandby, errStandby)
+	if status.Code(errStandby) != codes.FailedPrecondition {
+		t.Errorf("expected FailedPrecondition on standby rejection, got resp=%+v, err=%v", respStandby, errStandby)
 	}
 }
 
@@ -782,4 +785,125 @@ func TestMultiCurrencyTransferBalanceIntegrity(t *testing.T) {
 	if _, touchesBase := incDest["balance"]; touchesBase {
 		t.Fatalf("VULN-02 regression: crediting foreign USD pot must NOT alter EUR base balance")
 	}
+}
+
+type mockFXSagaClient struct {
+	fxv1.FXServiceClient
+	reserved   bool
+	finalized  bool
+	released   bool
+	quoteID    string
+	reserveErr error
+}
+
+func (m *mockFXSagaClient) ReserveQuote(_ context.Context, req *fxv1.ReserveQuoteRequest, _ ...grpc.CallOption) (*fxv1.ReserveQuoteResponse, error) {
+	if m.reserveErr != nil {
+		return nil, m.reserveErr
+	}
+	m.reserved = true
+	m.quoteID = req.QuoteId
+	return &fxv1.ReserveQuoteResponse{
+		Success:       true,
+		ReservationId: "res_" + req.QuoteId,
+		Status:        "RESERVED",
+		Quote: &fxv1.Quote{
+			QuoteId:       req.QuoteId,
+			TargetAmount:  9200,
+			EffectiveRate: 0.92,
+		},
+	}, nil
+}
+
+func (m *mockFXSagaClient) FinalizeQuote(_ context.Context, req *fxv1.FinalizeQuoteRequest, _ ...grpc.CallOption) (*fxv1.FinalizeQuoteResponse, error) {
+	m.finalized = true
+	return &fxv1.FinalizeQuoteResponse{
+		Success: true,
+		Status:  "EXECUTED",
+	}, nil
+}
+
+func (m *mockFXSagaClient) ReleaseQuote(_ context.Context, req *fxv1.ReleaseQuoteRequest, _ ...grpc.CallOption) (*fxv1.ReleaseQuoteResponse, error) {
+	m.released = true
+	return &fxv1.ReleaseQuoteResponse{
+		Success: true,
+		Status:  "RELEASED",
+	}, nil
+}
+
+func TestCompensatingSaga_TransferLifecycle(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("successful transfer reserves and finalizes quote", func(t *testing.T) {
+		fxMock := &mockFXSagaClient{}
+		srv := &server{fxClient: fxMock, region: "us-east-1", isActive: true}
+
+		req := &walletv1.TransferFundsRequest{
+			IdempotencyKey:      "idemp_saga_tx_1",
+			SourceWalletId:      "w_src",
+			DestinationWalletId: "w_dst",
+			Amount:              &walletv1.Money{Currency: "USD", Units: 10000},
+			FxQuoteId:           "fxq_test_101",
+		}
+		state := &transferExecutionState{
+			finalTxnID: "txn_101",
+		}
+
+		err := srv.prepareFXConversion(ctx, req, state)
+		if err != nil {
+			t.Fatalf("prepareFXConversion failed: %v", err)
+		}
+		if !fxMock.reserved || state.reservationID != "res_fxq_test_101" || state.destUnits != 9200 {
+			t.Fatalf("expected quote to be reserved with units 9200, got: %+v", state)
+		}
+
+		// On commit: handleTransferSuccess
+		state.txnStatus = walletv1.TransferFundsResponse_SUCCESS
+		srv.handleTransferSuccess(ctx, req, state, 10)
+
+		if !fxMock.finalized {
+			t.Fatal("expected FX quote to be finalized on transfer success")
+		}
+		if fxMock.released {
+			t.Fatal("FX quote should not be released on success")
+		}
+	})
+
+	t.Run("failed transfer reserves and releases quote via compensating Saga", func(t *testing.T) {
+		fxMock := &mockFXSagaClient{}
+		srv := &server{fxClient: fxMock, region: "us-east-1", isActive: true}
+
+		req := &walletv1.TransferFundsRequest{
+			IdempotencyKey:      "idemp_saga_tx_2",
+			SourceWalletId:      "w_src",
+			DestinationWalletId: "w_dst",
+			Amount:              &walletv1.Money{Currency: "USD", Units: 10000},
+			FxQuoteId:           "fxq_test_102",
+		}
+		state := &transferExecutionState{
+			finalTxnID: "txn_102",
+		}
+
+		err := srv.prepareFXConversion(ctx, req, state)
+		if err != nil {
+			t.Fatalf("prepareFXConversion failed: %v", err)
+		}
+		if !fxMock.reserved {
+			t.Fatal("expected quote to be reserved")
+		}
+
+		// On abort/failure: handleTransferFailure
+		state.txnStatus = walletv1.TransferFundsResponse_FAILED_INSUFFICIENT_FUNDS
+		state.txnErrMsg = "insufficient funds in source wallet"
+		resp := srv.handleTransferFailure(ctx, req, state, fmt.Errorf("insufficient funds"), 10)
+
+		if resp == nil || resp.Status != walletv1.TransferFundsResponse_FAILED_INSUFFICIENT_FUNDS {
+			t.Fatalf("unexpected response: %+v", resp)
+		}
+		if !fxMock.released {
+			t.Fatal("expected FX quote to be released via compensating Saga on failure")
+		}
+		if fxMock.finalized {
+			t.Fatal("FX quote should not be finalized on failure")
+		}
+	})
 }

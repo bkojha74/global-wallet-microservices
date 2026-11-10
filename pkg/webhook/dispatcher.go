@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	amqp "github.com/rabbitmq/amqp091-go"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -31,6 +33,11 @@ const (
 
 	CollectionSubscriptions = "webhook_subscriptions"
 	CollectionDeliveries    = "webhook_deliveries"
+
+	DefaultWebhookExchange  = "wallet.events.v1"
+	DefaultWebhookQueue     = "wallet.webhooks.dispatch.v1"
+	DefaultWebhookDLQ       = "wallet.webhooks.dead.v1"
+	DefaultRoutingKeyPrefix = "webhook.dispatch."
 )
 
 // lookupIPFunc is the DNS IP lookup function used by ValidateWebhookURL.
@@ -91,6 +98,29 @@ func ValidateWebhookURL(targetURL string) error {
 	return nil
 }
 
+// WebhookJob represents an asynchronous dispatch job serialized to RabbitMQ.
+type WebhookJob struct {
+	DeliveryID     string          `json:"delivery_id"`
+	SubscriptionID string          `json:"subscription_id"`
+	URL            string          `json:"url"`
+	Secret         string          `json:"secret"`
+	Event          string          `json:"event"`
+	Payload        json.RawMessage `json:"payload"`
+	Attempts       int             `json:"attempts"`
+	MaxAttempts    int             `json:"max_attempts"`
+	CreatedAt      time.Time       `json:"created_at"`
+}
+
+// WebhookQueueConfig configures the decoupled RabbitMQ queue dispatcher.
+type WebhookQueueConfig struct {
+	URL       string
+	Exchange  string
+	Queue     string
+	DLQ       string
+	Workers   int
+	TLSConfig *tls.Config
+}
+
 // Dispatcher manages outbound partner webhook subscriptions, deliveries, and retries.
 type Dispatcher struct {
 	db          *mongo.Database
@@ -98,6 +128,16 @@ type Dispatcher struct {
 	maxAttempts int
 	mu          sync.RWMutex
 	memSubs     map[primitive.ObjectID]*WebhookSubscription
+
+	// Decoupled RabbitMQ queue pipeline
+	amqpConn  *amqp.Connection
+	amqpChan  *amqp.Channel
+	amqpExch  string
+	amqpQueue string
+	amqpDLQ   string
+	hasAMQP   bool
+	amqpStop  chan struct{}
+	closeOnce sync.Once
 }
 
 // NewDispatcher initializes a new Webhook Dispatcher instance.
@@ -110,6 +150,7 @@ func NewDispatcher(db *mongo.Database, client *http.Client) *Dispatcher {
 		httpClient:  client,
 		maxAttempts: DefaultMaxAttempts,
 		memSubs:     make(map[primitive.ObjectID]*WebhookSubscription),
+		amqpStop:    make(chan struct{}),
 	}
 }
 
@@ -257,6 +298,289 @@ func newEventID() string {
 	return "whevt_" + hex.EncodeToString(b)
 }
 
+// EnableAMQPQueue connects to RabbitMQ and declares the durable exchange, queue, and DLQ.
+func (d *Dispatcher) EnableAMQPQueue(ctx context.Context, cfg WebhookQueueConfig) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if cfg.URL == "" {
+		return errors.New("rabbitmq url is required")
+	}
+	if cfg.Exchange == "" {
+		cfg.Exchange = DefaultWebhookExchange
+	}
+	if cfg.Queue == "" {
+		cfg.Queue = DefaultWebhookQueue
+	}
+	if cfg.DLQ == "" {
+		cfg.DLQ = DefaultWebhookDLQ
+	}
+	if cfg.Workers <= 0 {
+		cfg.Workers = 2
+	}
+
+	var conn *amqp.Connection
+	var err error
+	if cfg.TLSConfig != nil {
+		conn, err = amqp.DialTLS(cfg.URL, cfg.TLSConfig)
+	} else {
+		conn, err = amqp.Dial(cfg.URL)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to dial rabbitmq for webhook queue: %w", err)
+	}
+
+	ch, err := conn.Channel()
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("failed to open channel for webhook queue: %w", err)
+	}
+
+	// 1. Declare Dead Letter Queue (DLQ)
+	_, err = ch.QueueDeclare(
+		cfg.DLQ,
+		true,  // durable
+		false, // auto-delete
+		false, // exclusive
+		false, // no-wait
+		nil,
+	)
+	if err != nil {
+		_ = ch.Close()
+		_ = conn.Close()
+		return fmt.Errorf("failed to declare DLQ %s: %w", cfg.DLQ, err)
+	}
+
+	// 2. Declare Topic Exchange
+	if err := ch.ExchangeDeclare(
+		cfg.Exchange,
+		"topic",
+		true,  // durable
+		false, // auto-delete
+		false, // internal
+		false, // no-wait
+		nil,
+	); err != nil {
+		_ = ch.Close()
+		_ = conn.Close()
+		return fmt.Errorf("failed to declare webhook exchange %s: %w", cfg.Exchange, err)
+	}
+
+	// 3. Declare Primary Dispatch Queue with Dead Letter routing to DLQ
+	queueArgs := amqp.Table{
+		"x-dead-letter-exchange":    "",
+		"x-dead-letter-routing-key": cfg.DLQ,
+	}
+	q, err := ch.QueueDeclare(
+		cfg.Queue,
+		true,  // durable
+		false, // auto-delete
+		false, // exclusive
+		false, // no-wait
+		queueArgs,
+	)
+	if err != nil {
+		_ = ch.Close()
+		_ = conn.Close()
+		return fmt.Errorf("failed to declare webhook queue %s: %w", cfg.Queue, err)
+	}
+
+	// 4. Bind Queue to Exchange
+	if err := ch.QueueBind(q.Name, DefaultRoutingKeyPrefix+"#", cfg.Exchange, false, nil); err != nil {
+		_ = ch.Close()
+		_ = conn.Close()
+		return fmt.Errorf("failed to bind queue to exchange: %w", err)
+	}
+
+	d.amqpConn = conn
+	d.amqpChan = ch
+	d.amqpExch = cfg.Exchange
+	d.amqpQueue = cfg.Queue
+	d.amqpDLQ = cfg.DLQ
+	d.hasAMQP = true
+
+	// 5. Start Worker Pool
+	for i := 1; i <= cfg.Workers; i++ {
+		workerChan, err := conn.Channel()
+		if err != nil {
+			log.Printf("[WEBHOOK-QUEUE] Warning: failed to open channel for worker %d: %v", i, err)
+			continue
+		}
+		_ = workerChan.Qos(5, 0, false)
+		msgs, err := workerChan.Consume(
+			q.Name,
+			fmt.Sprintf("worker-%d", i),
+			false, // manual ack
+			false,
+			false,
+			false,
+			nil,
+		)
+		if err != nil {
+			log.Printf("[WEBHOOK-QUEUE] Warning: worker %d failed to consume: %v", i, err)
+			continue
+		}
+		go d.startAMQPWorker(ctx, i, msgs)
+	}
+
+	log.Printf("[WEBHOOK-QUEUE] RabbitMQ decoupled dispatcher active: exchange=%s, queue=%s, dlq=%s, workers=%d",
+		cfg.Exchange, cfg.Queue, cfg.DLQ, cfg.Workers)
+	return nil
+}
+
+func (d *Dispatcher) hasAMQPQueue() bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.hasAMQP && d.amqpChan != nil && !d.amqpChan.IsClosed()
+}
+
+func (d *Dispatcher) publishToQueue(ctx context.Context, job WebhookJob) error {
+	d.mu.RLock()
+	ch := d.amqpChan
+	exch := d.amqpExch
+	d.mu.RUnlock()
+
+	if ch == nil || ch.IsClosed() {
+		return errors.New("amqp channel unavailable")
+	}
+
+	// #nosec G117 -- internal AMQP broker message payload for webhook retry worker
+	body, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("failed to marshal webhook job: %w", err)
+	}
+
+	routingKey := DefaultRoutingKeyPrefix + job.Event
+	return ch.PublishWithContext(ctx, exch, routingKey, false, false, amqp.Publishing{
+		ContentType:  "application/json",
+		DeliveryMode: amqp.Persistent, // durable messages
+		Timestamp:    job.CreatedAt,
+		Body:         body,
+	})
+}
+
+func (d *Dispatcher) startAMQPWorker(ctx context.Context, workerID int, msgs <-chan amqp.Delivery) {
+	log.Printf("[WEBHOOK-WORKER-%d] Worker started, listening on %s", workerID, d.amqpQueue)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-d.amqpStop:
+			return
+		case msg, ok := <-msgs:
+			if !ok {
+				log.Printf("[WEBHOOK-WORKER-%d] Queue consumer channel closed", workerID)
+				return
+			}
+
+			var job WebhookJob
+			if err := json.Unmarshal(msg.Body, &job); err != nil {
+				log.Printf("[WEBHOOK-WORKER-%d] Malformed job body: %v", workerID, err)
+				_ = msg.Nack(false, false) // discard malformed message to DLQ
+				continue
+			}
+
+			job.Attempts++
+			statusCode, sendErr := d.sendHTTP(ctx, job.URL, job.Secret, job.Event, job.DeliveryID, job.Payload)
+
+			var delID primitive.ObjectID
+			if objID, err := primitive.ObjectIDFromHex(job.DeliveryID); err == nil {
+				delID = objID
+			}
+
+			if sendErr == nil && statusCode >= 200 && statusCode < 300 {
+				now := time.Now().UTC()
+				if d.deliveriesCol() != nil && !delID.IsZero() {
+					_, _ = d.deliveriesCol().UpdateOne(ctx, bson.M{"_id": delID}, bson.M{
+						"$set": bson.M{
+							"status":           DeliveryStatusDelivered,
+							"delivered_at":     now,
+							"last_status_code": statusCode,
+							"attempts":         job.Attempts,
+							"updated_at":       now,
+							"last_error":       "",
+						},
+					})
+				}
+				_ = msg.Ack(false)
+			} else {
+				errMsg := ""
+				if sendErr != nil {
+					errMsg = sendErr.Error()
+				} else {
+					errMsg = fmt.Sprintf("HTTP status %d", statusCode)
+				}
+
+				if job.Attempts >= job.MaxAttempts {
+					log.Printf("[WEBHOOK-WORKER-%d] Delivery %s exceeded max attempts (%d), routing to DLQ: %s",
+						workerID, job.DeliveryID, job.MaxAttempts, errMsg)
+					now := time.Now().UTC()
+					if d.deliveriesCol() != nil && !delID.IsZero() {
+						_, _ = d.deliveriesCol().UpdateOne(ctx, bson.M{"_id": delID}, bson.M{
+							"$set": bson.M{
+								"status":           DeliveryStatusFailed,
+								"last_status_code": statusCode,
+								"attempts":         job.Attempts,
+								"last_error":       errMsg,
+								"updated_at":       now,
+							},
+						})
+					}
+					_ = msg.Nack(false, false)
+				} else {
+					now := time.Now().UTC()
+					nextRetry := now.Add(computeBackoff(job.Attempts))
+					if d.deliveriesCol() != nil && !delID.IsZero() {
+						_, _ = d.deliveriesCol().UpdateOne(ctx, bson.M{"_id": delID}, bson.M{
+							"$set": bson.M{
+								"status":           DeliveryStatusRetrying,
+								"last_status_code": statusCode,
+								"attempts":         job.Attempts,
+								"next_retry_at":    nextRetry,
+								"last_error":       errMsg,
+								"updated_at":       now,
+							},
+						})
+					}
+					_ = msg.Ack(false)
+					// #nosec G118 -- worker loop uses worker context for retry backoff
+					go func(j WebhookJob, delay time.Duration) {
+						select {
+						case <-time.After(delay):
+							_ = d.publishToQueue(ctx, j)
+						case <-d.amqpStop:
+						case <-ctx.Done():
+						}
+					}(job, computeBackoff(job.Attempts))
+				}
+			}
+		}
+	}
+}
+
+// Close gracefully closes all AMQP channels and connections.
+func (d *Dispatcher) Close() error {
+	if d == nil {
+		return nil
+	}
+	var err error
+	d.closeOnce.Do(func() {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if d.amqpStop != nil {
+			close(d.amqpStop)
+		}
+		if d.amqpChan != nil {
+			_ = d.amqpChan.Close()
+		}
+		if d.amqpConn != nil {
+			err = d.amqpConn.Close()
+		}
+		d.hasAMQP = false
+	})
+	return err
+}
+
 // Dispatch broadcasts an event to all matching active partner subscriptions.
 func (d *Dispatcher) Dispatch(ctx context.Context, event string, data interface{}) error {
 	subs, err := d.ListSubscriptions(ctx, "")
@@ -275,6 +599,47 @@ func (d *Dispatcher) Dispatch(ctx context.Context, event string, data interface{
 	payloadBytes, err := json.Marshal(payloadObj)
 	if err != nil {
 		return fmt.Errorf("failed to serialize webhook payload: %w", err)
+	}
+
+	// REQ-ASYNC-01: If AMQP queue is enabled, publish jobs asynchronously without blocking!
+	if d.hasAMQPQueue() {
+		for _, sub := range subs {
+			if !sub.MatchesEvent(event) {
+				continue
+			}
+			deliveryID := primitive.NewObjectID()
+			if d.deliveriesCol() != nil {
+				_, _ = d.deliveriesCol().InsertOne(context.Background(), WebhookDelivery{
+					ID:             deliveryID,
+					SubscriptionID: sub.ID,
+					URL:            sub.URL,
+					Event:          event,
+					Payload:        payloadBytes,
+					Status:         DeliveryStatusPending,
+					Attempts:       0,
+					MaxAttempts:    d.maxAttempts,
+					CreatedAt:      now,
+					UpdatedAt:      now,
+				})
+			}
+			job := WebhookJob{
+				DeliveryID:     deliveryID.Hex(),
+				SubscriptionID: sub.ID.Hex(),
+				URL:            sub.URL,
+				Secret:         sub.Secret,
+				Event:          event,
+				Payload:        payloadBytes,
+				Attempts:       0,
+				MaxAttempts:    d.maxAttempts,
+				CreatedAt:      now,
+			}
+			if pubErr := d.publishToQueue(ctx, job); pubErr != nil {
+				log.Printf("[WEBHOOK-QUEUE] Failed to publish job to queue: %v, falling back to direct dispatch", pubErr)
+				// #nosec G118 -- fallback direct dispatch goroutine
+				go d.dispatchSingle(context.WithoutCancel(ctx), sub, event, payloadBytes)
+			}
+		}
+		return nil
 	}
 
 	var wg sync.WaitGroup

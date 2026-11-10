@@ -361,3 +361,126 @@ func TestCompositeRateProvider_StaleFallback(t *testing.T) {
 		t.Fatalf("expected /metrics to include fx_provider_degraded_total")
 	}
 }
+
+func TestCompensatingSaga_ReserveFinalizeAndRelease(t *testing.T) {
+	ctx := context.Background()
+	engine := NewFXEngine(nil, &BaselineProvider{}, 25, 0)
+
+	// 1. CreateQuote
+	q, err := engine.CreateQuote(ctx, "USD", "EUR", 5000, "saga-test-client", 60)
+	if err != nil {
+		t.Fatalf("CreateQuote failed: %v", err)
+	}
+	if q.Status != QuoteStatusActive {
+		t.Fatalf("expected quote status ACTIVE, got %s", q.Status)
+	}
+
+	// 2. ReserveQuote
+	res1, err := engine.ReserveQuote(ctx, &fxv1.ReserveQuoteRequest{
+		QuoteId:        q.QuoteId,
+		WalletId:       "wal_alice",
+		IdempotencyKey: "idemp_saga_001",
+		TtlSeconds:     30,
+	})
+	if err != nil {
+		t.Fatalf("ReserveQuote failed: %v", err)
+	}
+	if !res1.Success || res1.Status != QuoteStatusReserved || res1.ReservationId != "idemp_saga_001" {
+		t.Fatalf("unexpected reservation response: %+v", res1)
+	}
+
+	// 3. Concurrent ReserveQuote with different key must be rejected
+	_, err = engine.ReserveQuote(ctx, &fxv1.ReserveQuoteRequest{
+		QuoteId:        q.QuoteId,
+		WalletId:       "wal_bob",
+		IdempotencyKey: "idemp_saga_002",
+		TtlSeconds:     30,
+	})
+	if err == nil {
+		t.Fatal("expected concurrent reservation on already reserved quote to fail, got nil")
+	}
+
+	// 4. Idempotent ReserveQuote with same key succeeds
+	resReplay, err := engine.ReserveQuote(ctx, &fxv1.ReserveQuoteRequest{
+		QuoteId:        q.QuoteId,
+		WalletId:       "wal_alice",
+		IdempotencyKey: "idemp_saga_001",
+		TtlSeconds:     30,
+	})
+	if err != nil || !resReplay.Success {
+		t.Fatalf("expected idempotent reservation replay to succeed, got %v / %+v", err, resReplay)
+	}
+
+	// 5. ReleaseQuote: compensation returns quote to ACTIVE
+	rel, err := engine.ReleaseQuote(ctx, &fxv1.ReleaseQuoteRequest{
+		QuoteId:       q.QuoteId,
+		ReservationId: res1.ReservationId,
+		Reason:        "insufficient balance in counterparty",
+	})
+	if err != nil {
+		t.Fatalf("ReleaseQuote failed: %v", err)
+	}
+	if !rel.Success || rel.Status != QuoteStatusActive {
+		t.Fatalf("expected quote to be released back to ACTIVE, got %+v", rel)
+	}
+
+	// 6. Quote can now be re-reserved by a new transaction
+	res2, err := engine.ReserveQuote(ctx, &fxv1.ReserveQuoteRequest{
+		QuoteId:        q.QuoteId,
+		WalletId:       "wal_bob",
+		IdempotencyKey: "idemp_saga_003",
+		TtlSeconds:     30,
+	})
+	if err != nil || !res2.Success {
+		t.Fatalf("failed to re-reserve previously released quote: %v", err)
+	}
+
+	// 7. FinalizeQuote commits the reserved quote
+	fin, err := engine.FinalizeQuote(ctx, &fxv1.FinalizeQuoteRequest{
+		QuoteId:       q.QuoteId,
+		ReservationId: res2.ReservationId,
+		TransactionId: "txn_commited_123",
+	})
+	if err != nil {
+		t.Fatalf("FinalizeQuote failed: %v", err)
+	}
+	if !fin.Success || fin.Status != QuoteStatusExecuted {
+		t.Fatalf("expected quote status EXECUTED, got %+v", fin)
+	}
+
+	// 8. Releasing an already EXECUTED quote must fail
+	_, err = engine.ReleaseQuote(ctx, &fxv1.ReleaseQuoteRequest{
+		QuoteId:       q.QuoteId,
+		ReservationId: res2.ReservationId,
+		Reason:        "attempted release after finalize",
+	})
+	if err == nil {
+		t.Fatal("expected error releasing an already finalized quote, got nil")
+	}
+
+	// 9. Auto-expiry of reservation after TTL expires
+	qAuto, err := engine.CreateQuote(ctx, "USD", "EUR", 1000, "client-ttl", 60)
+	if err != nil {
+		t.Fatalf("CreateQuote for auto-expiry failed: %v", err)
+	}
+	resAuto, err := engine.ReserveQuote(ctx, &fxv1.ReserveQuoteRequest{
+		QuoteId:        qAuto.QuoteId,
+		WalletId:       "wal_ttl",
+		IdempotencyKey: "idemp_ttl_1",
+		TtlSeconds:     1, // 1s lock
+	})
+	if err != nil || !resAuto.Success {
+		t.Fatalf("ReserveQuote with 1s TTL failed: %v", err)
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+
+	// After 1s, reservation expires and quote automatically reconciles to ACTIVE
+	qFetched, err := engine.GetQuote(ctx, qAuto.QuoteId)
+	if err != nil {
+		t.Fatalf("GetQuote failed: %v", err)
+	}
+	if qFetched.Status != QuoteStatusActive {
+		t.Fatalf("expected quote to automatically revert to ACTIVE after reservation expired, got %s", qFetched.Status)
+	}
+}

@@ -250,3 +250,88 @@ func TestComputeBackoff(t *testing.T) {
 		}
 	}
 }
+
+func TestDecoupledAMQPWebhookPipeline(t *testing.T) {
+	t.Setenv("ALLOW_LOCAL_WEBHOOKS", "true")
+	ctx := context.Background()
+
+	// 1. Validation: empty URL returns error
+	d := NewDispatcher(nil, nil)
+	defer d.Close()
+
+	if d.hasAMQPQueue() {
+		t.Fatal("expected hasAMQPQueue to be false when unconfigured")
+	}
+
+	err := d.EnableAMQPQueue(ctx, WebhookQueueConfig{URL: ""})
+	if err == nil {
+		t.Fatal("expected error on empty RabbitMQ URL, got nil")
+	}
+
+	// 2. WebhookJob serialization & signature roundtrip
+	secret, _ := GenerateSecret()
+	jobPayload := []byte(`{"id":"whevt_123","event":"transfer.completed","data":{"amount":5000}}`)
+	now := time.Now().UTC()
+	job := WebhookJob{
+		DeliveryID:     primitive.NewObjectID().Hex(),
+		SubscriptionID: primitive.NewObjectID().Hex(),
+		URL:            "http://127.0.0.1:49999/webhook",
+		Secret:         secret,
+		Event:          "transfer.completed",
+		Payload:        jobPayload,
+		Attempts:       1,
+		MaxAttempts:    5,
+		CreatedAt:      now,
+	}
+
+	jobBytes, err := json.Marshal(job)
+	if err != nil {
+		t.Fatalf("failed to marshal WebhookJob: %v", err)
+	}
+
+	var unmarshaled WebhookJob
+	if err := json.Unmarshal(jobBytes, &unmarshaled); err != nil {
+		t.Fatalf("failed to unmarshal WebhookJob: %v", err)
+	}
+
+	if unmarshaled.Event != "transfer.completed" || unmarshaled.MaxAttempts != 5 {
+		t.Fatalf("unexpected unmarshaled job: %+v", unmarshaled)
+	}
+
+	// Sign payload and verify signature header
+	sig := SignPayload(unmarshaled.Secret, unmarshaled.CreatedAt.Unix(), unmarshaled.Payload)
+	if !VerifySignature(unmarshaled.Secret, sig, unmarshaled.Payload, 5*time.Minute) {
+		t.Fatal("expected HMAC-SHA256 signature to verify for job payload")
+	}
+
+	// 3. Fallback direct dispatch when AMQP unconfigured
+	var receivedCount int32
+	mockClient := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			atomic.AddInt32(&receivedCount, 1)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewBufferString(`{"status":"ok"}`)),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+	dDirect := NewDispatcher(nil, mockClient)
+	defer dDirect.Close()
+
+	_ = dDirect.RegisterSubscription(ctx, &WebhookSubscription{
+		ID:       primitive.NewObjectID(),
+		URL:      "http://127.0.0.1:49999/partner-webhook",
+		Events:   []string{"wallet.transfer.completed"},
+		Secret:   secret,
+		IsActive: true,
+	})
+
+	err = dDirect.Dispatch(ctx, "wallet.transfer.completed", map[string]int{"amount": 5000})
+	if err != nil {
+		t.Fatalf("fallback direct dispatch failed: %v", err)
+	}
+	if atomic.LoadInt32(&receivedCount) != 1 {
+		t.Fatalf("expected 1 delivery received via fallback dispatch, got %d", receivedCount)
+	}
+}

@@ -12,6 +12,9 @@ import (
 
 	"wallet-system/pkg/db"
 	walletv1 "wallet-system/proto/wallet"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -206,6 +209,13 @@ func (s *server) RecordVelocityUsageWithDest(sessCtx mongo.SessionContext, walle
 
 // UpdateWalletKYC implements the gRPC method to modify a wallet's KYC tier.
 func (s *server) UpdateWalletKYC(ctx context.Context, req *walletv1.UpdateWalletKYCRequest) (*walletv1.UpdateWalletKYCResponse, error) {
+	if !s.isWritable(ctx) {
+		return &walletv1.UpdateWalletKYCResponse{
+			Success: false,
+			Message: fmt.Sprintf(errStandbyReplicaFmt, s.region),
+		}, status.Errorf(codes.FailedPrecondition, errStandbyReplicaFmt, s.region)
+	}
+
 	if req == nil || req.WalletId == "" || req.KycTier == "" {
 		return &walletv1.UpdateWalletKYCResponse{
 			Success: false,

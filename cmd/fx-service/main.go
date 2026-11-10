@@ -146,6 +146,54 @@ func (s *fxServer) ConvertCurrency(ctx context.Context, req *fxv1.ConvertCurrenc
 	return resp, nil
 }
 
+func (s *fxServer) ReserveQuote(ctx context.Context, req *fxv1.ReserveQuoteRequest) (*fxv1.ReserveQuoteResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "reserve quote request is required")
+	}
+	resp, err := s.engine.ReserveQuote(ctx, req)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+	}
+	s.emit(ctx, "fx.quote.reserved", observability.LevelInfo, "FX quote reserved for Saga", map[string]any{
+		"quote_id":        req.QuoteId,
+		"reservation_id":  resp.ReservationId,
+		"idempotency_key": req.IdempotencyKey,
+	})
+	return resp, nil
+}
+
+func (s *fxServer) FinalizeQuote(ctx context.Context, req *fxv1.FinalizeQuoteRequest) (*fxv1.FinalizeQuoteResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "finalize quote request is required")
+	}
+	resp, err := s.engine.FinalizeQuote(ctx, req)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+	}
+	s.emit(ctx, "fx.quote.finalized", observability.LevelAudit, "FX quote finalized after transaction commit", map[string]any{
+		"quote_id":       req.QuoteId,
+		"reservation_id": req.ReservationId,
+		"transaction_id": req.TransactionId,
+	})
+	return resp, nil
+}
+
+func (s *fxServer) ReleaseQuote(ctx context.Context, req *fxv1.ReleaseQuoteRequest) (*fxv1.ReleaseQuoteResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "release quote request is required")
+	}
+	resp, err := s.engine.ReleaseQuote(ctx, req)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	s.emit(ctx, "fx.quote.released", observability.LevelWarn, "FX quote released due to transaction rollback/failure", map[string]any{
+		"quote_id":       req.QuoteId,
+		"reservation_id": req.ReservationId,
+		"reason":         req.Reason,
+	})
+	return resp, nil
+}
+
 func (s *fxServer) UpdateExchangeRate(ctx context.Context, req *fxv1.UpdateExchangeRateRequest) (*fxv1.UpdateExchangeRateResponse, error) {
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "update request is required")
