@@ -23,6 +23,15 @@ service FXService {
   // for 3rd-party B2B callers or internal cross-currency wallet transfers.
   rpc ConvertCurrency (ConvertCurrencyRequest) returns (ConvertCurrencyResponse);
 
+  // ReserveQuote places an atomic, time-bounded lock on an active FX quote for two-phase Saga execution.
+  rpc ReserveQuote (ReserveQuoteRequest) returns (ReserveQuoteResponse);
+
+  // FinalizeQuote commits a reserved quote upon successful wallet balance ledger commit.
+  rpc FinalizeQuote (FinalizeQuoteRequest) returns (FinalizeQuoteResponse);
+
+  // ReleaseQuote compensates/releases a reserved quote if the wallet transaction aborts or fails.
+  rpc ReleaseQuote (ReleaseQuoteRequest) returns (ReleaseQuoteResponse);
+
   // UpdateExchangeRate allows administrative rate overrides or triggers an immediate 3rd-party API sync.
   rpc UpdateExchangeRate (UpdateExchangeRateRequest) returns (UpdateExchangeRateResponse);
 
@@ -153,5 +162,49 @@ message FXHealthResponse {
   int32 supported_currencies = 3;
   int32 active_pairs = 4;
   string last_synced_at = 5;
+}
+
+message ReserveQuoteRequest {
+  string quote_id = 1;
+  string wallet_id = 2;
+  string idempotency_key = 3;
+  int32 ttl_seconds = 4; // Default: 30s
+}
+
+message ReserveQuoteResponse {
+  bool success = 1;
+  Quote quote = 2;
+  string reservation_id = 3;
+  string status = 4; // "RESERVED"
+  string expires_at = 5;
+  string message = 6;
+}
+
+message FinalizeQuoteRequest {
+  string quote_id = 1;
+  string reservation_id = 2;
+  string transaction_id = 3;
+}
+
+message FinalizeQuoteResponse {
+  bool success = 1;
+  Quote quote = 2;
+  string status = 3; // "EXECUTED"
+  string conversion_id = 4;
+  string executed_at = 5;
+  string message = 6;
+}
+
+message ReleaseQuoteRequest {
+  string quote_id = 1;
+  string reservation_id = 2;
+  string reason = 3;
+}
+
+message ReleaseQuoteResponse {
+  bool success = 1;
+  Quote quote = 2;
+  string status = 3; // "RELEASED"
+  string message = 4;
 }
 

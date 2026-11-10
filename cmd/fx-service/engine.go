@@ -23,6 +23,8 @@ const (
 	QuoteStatusActive   = "ACTIVE"
 	QuoteStatusExecuted = "EXECUTED"
 	QuoteStatusExpired  = "EXPIRED"
+	QuoteStatusReserved = "RESERVED"
+	QuoteStatusReleased = "RELEASED"
 
 	ConversionStatusCompleted = "COMPLETED"
 	ConversionStatusReplay    = "DUPLICATE_REPLAY"
@@ -59,6 +61,8 @@ type QuoteDoc struct {
 	Status         string    `bson:"status" json:"status"`
 	ClientID       string    `bson:"client_id" json:"client_id"`
 	SourceProvider string    `bson:"source_provider" json:"source_provider"`
+	ReservationID  string    `bson:"reservation_id,omitempty" json:"reservation_id,omitempty"`
+	ReservedUntil  time.Time `bson:"reserved_until,omitempty" json:"reserved_until,omitempty"`
 	CreatedAt      time.Time `bson:"created_at" json:"created_at"`
 	ExpiresAt      time.Time `bson:"expires_at" json:"expires_at"`
 }
@@ -485,40 +489,59 @@ func (e *FXEngine) GetQuote(ctx context.Context, quoteID string) (*fxv1.Quote, e
 		return nil, err
 	}
 
-	if doc.Status == QuoteStatusActive && time.Now().UTC().After(doc.ExpiresAt) {
-		doc.Status = QuoteStatusExpired
-		e.mu.Lock()
-		e.quotesMem[quoteID] = doc
-		e.mu.Unlock()
-		if e.fxDB != nil {
-			_, _ = e.fxDB.Collection("fx_quotes").UpdateOne(ctx, bson.M{"_id": quoteID}, bson.M{"$set": bson.M{"status": QuoteStatusExpired}})
-		}
-	}
-
 	return quoteDocToProto(doc), nil
 }
 
 func (e *FXEngine) loadQuoteDoc(ctx context.Context, quoteID string) (*QuoteDoc, error) {
 	e.mu.RLock()
-	if cached, ok := e.quotesMem[quoteID]; ok {
-		copyDoc := *cached
-		e.mu.RUnlock()
-		return &copyDoc, nil
-	}
+	cached, ok := e.quotesMem[quoteID]
 	e.mu.RUnlock()
 
-	if e.fxDB != nil {
-		var doc QuoteDoc
-		err := e.fxDB.Collection("fx_quotes").FindOne(ctx, bson.M{"_id": quoteID}).Decode(&doc)
+	var doc *QuoteDoc
+	if ok && cached != nil {
+		copyDoc := *cached
+		doc = &copyDoc
+	} else if e.fxDB != nil {
+		var dbDoc QuoteDoc
+		err := e.fxDB.Collection("fx_quotes").FindOne(ctx, bson.M{"_id": quoteID}).Decode(&dbDoc)
 		if err == nil {
-			e.mu.Lock()
-			e.quotesMem[quoteID] = &doc
-			e.mu.Unlock()
-			return &doc, nil
+			doc = &dbDoc
 		}
 	}
 
-	return nil, fmt.Errorf("quote %s not found", quoteID)
+	if doc == nil {
+		return nil, fmt.Errorf("quote %s not found", quoteID)
+	}
+
+	now := time.Now().UTC()
+	// Reconcile expired reservation
+	if doc.Status == QuoteStatusReserved && !doc.ReservedUntil.IsZero() && now.After(doc.ReservedUntil) {
+		if now.After(doc.ExpiresAt) {
+			doc.Status = QuoteStatusExpired
+		} else {
+			doc.Status = QuoteStatusActive
+		}
+		doc.ReservationID = ""
+		doc.ReservedUntil = time.Time{}
+		if e.fxDB != nil {
+			_, _ = e.fxDB.Collection("fx_quotes").UpdateOne(ctx, bson.M{"_id": quoteID},
+				bson.M{
+					"$set":   bson.M{"status": doc.Status, "updated_at": now},
+					"$unset": bson.M{"reservation_id": "", "reserved_until": ""},
+				})
+		}
+	} else if doc.Status == QuoteStatusActive && now.After(doc.ExpiresAt) {
+		doc.Status = QuoteStatusExpired
+		if e.fxDB != nil {
+			_, _ = e.fxDB.Collection("fx_quotes").UpdateOne(ctx, bson.M{"_id": quoteID}, bson.M{"$set": bson.M{"status": QuoteStatusExpired}})
+		}
+	}
+
+	e.mu.Lock()
+	e.quotesMem[quoteID] = doc
+	e.mu.Unlock()
+
+	return doc, nil
 }
 
 func quoteDocToProto(doc *QuoteDoc) *fxv1.Quote {
@@ -750,4 +773,237 @@ func (e *FXEngine) HealthSummary() (string, int32, int32, string) {
 	numCurrencies := int32(len(db.SupportedCurrencies))
 	activePairs := numCurrencies * (numCurrencies - 1)
 	return e.sourceProvider, numCurrencies, activePairs, e.lastSyncedAt.UTC().Format(time.RFC3339)
+}
+
+// ReserveQuote places an atomic, time-bounded lock on an active FX quote for Saga execution.
+func (e *FXEngine) ReserveQuote(ctx context.Context, req *fxv1.ReserveQuoteRequest) (*fxv1.ReserveQuoteResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("reserve request is required")
+	}
+	quoteID := strings.TrimSpace(req.QuoteId)
+	if quoteID == "" {
+		return nil, fmt.Errorf("quote_id is required")
+	}
+
+	ttlSeconds := req.TtlSeconds
+	if ttlSeconds <= 0 {
+		ttlSeconds = 30
+	}
+
+	doc, err := e.loadQuoteDoc(ctx, quoteID)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	// Check if already executed
+	if doc.Status == QuoteStatusExecuted {
+		return nil, fmt.Errorf("quote %s has already been executed", quoteID)
+	}
+
+	// Check if expired
+	if doc.Status == QuoteStatusExpired || now.After(doc.ExpiresAt) {
+		doc.Status = QuoteStatusExpired
+		return nil, fmt.Errorf("quote %s has expired", quoteID)
+	}
+
+	// Check if actively reserved
+	if doc.Status == QuoteStatusReserved && now.Before(doc.ReservedUntil) {
+		// Idempotent retry: if same wallet/idempotency_key or same reservation, return success
+		if req.IdempotencyKey != "" && doc.ReservationID == req.IdempotencyKey {
+			return &fxv1.ReserveQuoteResponse{
+				Success:       true,
+				Quote:         quoteDocToProto(doc),
+				ReservationId: doc.ReservationID,
+				Status:        QuoteStatusReserved,
+				ExpiresAt:     doc.ReservedUntil.Format(time.RFC3339),
+				Message:       "quote already reserved (idempotent replay)",
+			}, nil
+		}
+		return nil, fmt.Errorf("quote %s is already reserved by active transaction until %s", quoteID, doc.ReservedUntil.Format(time.RFC3339))
+	}
+
+	reservationID := req.IdempotencyKey
+	if reservationID == "" {
+		reservationID = "res_" + primitive.NewObjectID().Hex()
+	}
+	reservedUntil := now.Add(time.Duration(ttlSeconds) * time.Second)
+
+	// Atomic update in MongoDB
+	if e.fxDB != nil {
+		filter := bson.M{
+			"_id": quoteID,
+			"$or": []bson.M{
+				{"status": QuoteStatusActive},
+				{"status": QuoteStatusReserved, "reserved_until": bson.M{"$lt": now}},
+			},
+			"expires_at": bson.M{"$gt": now},
+		}
+		update := bson.M{
+			"$set": bson.M{
+				"status":         QuoteStatusReserved,
+				"reservation_id": reservationID,
+				"reserved_until": reservedUntil,
+				"updated_at":     now,
+			},
+		}
+		res, err := e.fxDB.Collection("fx_quotes").UpdateOne(ctx, filter, update)
+		if err != nil {
+			return nil, fmt.Errorf("failed to reserve quote %s: %w", quoteID, err)
+		}
+		if res.MatchedCount == 0 {
+			return nil, fmt.Errorf("quote %s could not be reserved (concurrent conflict or expired)", quoteID)
+		}
+	}
+
+	// Update memory
+	e.mu.Lock()
+	doc.Status = QuoteStatusReserved
+	doc.ReservationID = reservationID
+	doc.ReservedUntil = reservedUntil
+	e.quotesMem[quoteID] = doc
+	e.mu.Unlock()
+
+	return &fxv1.ReserveQuoteResponse{
+		Success:       true,
+		Quote:         quoteDocToProto(doc),
+		ReservationId: reservationID,
+		Status:        QuoteStatusReserved,
+		ExpiresAt:     reservedUntil.Format(time.RFC3339),
+		Message:       "quote reserved successfully",
+	}, nil
+}
+
+// FinalizeQuote commits a reserved quote upon successful wallet balance ledger commit.
+func (e *FXEngine) FinalizeQuote(ctx context.Context, req *fxv1.FinalizeQuoteRequest) (*fxv1.FinalizeQuoteResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("finalize request is required")
+	}
+	quoteID := strings.TrimSpace(req.QuoteId)
+	if quoteID == "" {
+		return nil, fmt.Errorf("quote_id is required")
+	}
+
+	doc, err := e.loadQuoteDoc(ctx, quoteID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Idempotent check
+	if doc.Status == QuoteStatusExecuted {
+		return &fxv1.FinalizeQuoteResponse{
+			Success:      true,
+			Quote:        quoteDocToProto(doc),
+			Status:       QuoteStatusExecuted,
+			ConversionId: "conv_" + quoteID,
+			ExecutedAt:   time.Now().UTC().Format(time.RFC3339),
+			Message:      "quote already executed (idempotent replay)",
+		}, nil
+	}
+
+	now := time.Now().UTC()
+	if e.fxDB != nil {
+		res, err := e.fxDB.Collection("fx_quotes").UpdateOne(ctx,
+			bson.M{"_id": quoteID, "status": bson.M{"$in": []string{QuoteStatusReserved, QuoteStatusActive}}},
+			bson.M{"$set": bson.M{"status": QuoteStatusExecuted, "updated_at": now}},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to finalize quote %s: %w", quoteID, err)
+		}
+		if res.MatchedCount == 0 {
+			return nil, fmt.Errorf("quote %s could not be finalized (invalid status)", quoteID)
+		}
+
+		convDoc := &ConversionDoc{
+			ConversionID:   "conv_" + primitive.NewObjectID().Hex(),
+			IdempotencyKey: "fin_" + quoteID,
+			QuoteID:        quoteID,
+			BaseCurrency:   doc.BaseCurrency,
+			TargetCurrency: doc.TargetCurrency,
+			SourceAmount:   doc.SourceAmount,
+			TargetAmount:   doc.TargetAmount,
+			FeeAmount:      doc.FeeAmount,
+			MidRate:        doc.MidRate,
+			EffectiveRate:  doc.EffectiveRate,
+			SpreadBps:      doc.SpreadBps,
+			ClientID:       doc.ClientID,
+			ReferenceID:    req.TransactionId,
+			SourceProvider: doc.SourceProvider,
+			ExecutedAt:     now,
+		}
+		_, _ = e.fxDB.Collection("fx_conversions").InsertOne(ctx, convDoc)
+	}
+
+	e.mu.Lock()
+	doc.Status = QuoteStatusExecuted
+	e.quotesMem[quoteID] = doc
+	e.mu.Unlock()
+
+	return &fxv1.FinalizeQuoteResponse{
+		Success:      true,
+		Quote:        quoteDocToProto(doc),
+		Status:       QuoteStatusExecuted,
+		ConversionId: "conv_" + quoteID,
+		ExecutedAt:   now.Format(time.RFC3339),
+		Message:      "quote finalized successfully",
+	}, nil
+}
+
+// ReleaseQuote compensates/releases a reserved quote when transaction fails or aborts.
+func (e *FXEngine) ReleaseQuote(ctx context.Context, req *fxv1.ReleaseQuoteRequest) (*fxv1.ReleaseQuoteResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("release request is required")
+	}
+	quoteID := strings.TrimSpace(req.QuoteId)
+	if quoteID == "" {
+		return nil, fmt.Errorf("quote_id is required")
+	}
+
+	doc, err := e.loadQuoteDoc(ctx, quoteID)
+	if err != nil {
+		return nil, err
+	}
+
+	if doc.Status == QuoteStatusExecuted {
+		return nil, fmt.Errorf("cannot release quote %s: already executed", quoteID)
+	}
+
+	now := time.Now().UTC()
+	targetStatus := QuoteStatusActive
+	if now.After(doc.ExpiresAt) {
+		targetStatus = QuoteStatusExpired
+	}
+
+	if e.fxDB != nil {
+		_, err := e.fxDB.Collection("fx_quotes").UpdateOne(ctx,
+			bson.M{"_id": quoteID, "status": QuoteStatusReserved},
+			bson.M{
+				"$set": bson.M{
+					"status":     targetStatus,
+					"updated_at": now,
+				},
+				"$unset": bson.M{
+					"reservation_id": "",
+					"reserved_until": "",
+				},
+			},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to release quote %s: %w", quoteID, err)
+		}
+	}
+
+	e.mu.Lock()
+	doc.Status = targetStatus
+	doc.ReservationID = ""
+	doc.ReservedUntil = time.Time{}
+	e.quotesMem[quoteID] = doc
+	e.mu.Unlock()
+
+	return &fxv1.ReleaseQuoteResponse{
+		Success: true,
+		Quote:   quoteDocToProto(doc),
+		Status:  targetStatus,
+		Message: fmt.Sprintf("quote released back to %s (reason: %s)", targetStatus, req.Reason),
+	}, nil
 }

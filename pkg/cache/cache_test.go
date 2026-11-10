@@ -37,6 +37,13 @@ func (m *mockInvalidationBus) Close() error {
 	return nil
 }
 
+func (m *mockInvalidationBus) IsConnected() bool {
+	return true
+}
+
+func (m *mockInvalidationBus) OnConnectionStatusChange(cb StatusCallback) {
+}
+
 func (m *mockInvalidationBus) simulateBroadcast(walletIDs ...string) {
 	m.mu.Lock()
 	subs := make([]func(walletIDs []string), len(m.subscribers))
@@ -236,7 +243,57 @@ func TestAMQPInvalidationBus_NilSafe(t *testing.T) {
 	if err := bus.Subscribe(ctx, nil); err == nil {
 		t.Fatal("expected error on nil subscriber")
 	}
+	if bus.IsConnected() {
+		t.Fatal("expected nil bus IsConnected to return false")
+	}
 	if err := bus.Close(); err != nil {
 		t.Fatalf("expected nil bus close to return nil, got %v", err)
+	}
+}
+
+func TestAMQPInvalidationBus_ComputeJitterBackoff(t *testing.T) {
+	bus := NewAMQPInvalidationBus(InvalidationBusConfig{
+		BaseBackoff: 50 * time.Millisecond,
+		MaxBackoff:  2 * time.Second,
+	})
+
+	if bus.IsConnected() {
+		t.Fatal("expected newly constructed bus to not be connected")
+	}
+
+	// 1. Backoff should never exceed MaxBackoff
+	for attempt := 0; attempt < 40; attempt++ {
+		b := bus.ComputeJitterBackoff(attempt)
+		if b < 0 {
+			t.Fatalf("backoff should never be negative, got %v", b)
+		}
+		if b > 2*time.Second {
+			t.Fatalf("backoff at attempt %d exceeded max (2s): got %v", attempt, b)
+		}
+	}
+
+	// 2. Status change callbacks
+	var statusChanges []bool
+	var mu sync.Mutex
+	bus.OnConnectionStatusChange(func(connected bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		statusChanges = append(statusChanges, connected)
+	})
+
+	bus.setConnected(true)
+	if !bus.IsConnected() {
+		t.Fatal("expected bus to be connected")
+	}
+	bus.setConnected(false)
+	if bus.IsConnected() {
+		t.Fatal("expected bus to be disconnected")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(statusChanges) != 2 || statusChanges[0] != true || statusChanges[1] != false {
+		t.Fatalf("unexpected status changes recorded: %v", statusChanges)
 	}
 }

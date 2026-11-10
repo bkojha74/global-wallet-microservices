@@ -47,7 +47,7 @@ func TestWalletModelEffectiveStatus(t *testing.T) {
 }
 
 func TestAdminWalletStatusValidation(t *testing.T) {
-	srv := &server{region: "test-region"}
+	srv := &server{region: "test-region", isActive: true}
 
 	// 1. Method not allowed (DELETE)
 	req := httptest.NewRequest(http.MethodDelete, "/admin/wallet/status", nil)
