@@ -524,3 +524,4 @@ Proceed immediately with **Sprint 3**, completing the remaining items from [`doc
 5. **`REQ-DEV-02`**: OpenAPI 3.1 & Bruno E2E Suite Contract Parity.
 
 Following Sprint 3, the platform will be primed to execute **Sprint 4 (ISO 20022 & Real-Time Clearing Rails)**, establishing true Tier-1 core banking capability.
+
