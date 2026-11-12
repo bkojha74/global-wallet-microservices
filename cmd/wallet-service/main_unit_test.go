@@ -117,15 +117,15 @@ func TestServerIsWritableAndEmit(t *testing.T) {
 
 func TestInitWalletOutboxDisabled(t *testing.T) {
 	t.Setenv("LOGGING_OUTBOX_ENABLED", "false")
-	ob, pub := initWalletOutbox(context.Background(), nil)
-	if ob != nil || pub != nil {
+	ob, pub, rel := initWalletOutbox(context.Background(), nil)
+	if ob != nil || pub != nil || rel != nil {
 		t.Fatalf("expected nil outbox and publisher when disabled")
 	}
 
 	t.Setenv("LOGGING_OUTBOX_ENABLED", "true")
 	os.Unsetenv("LOGGING_RABBITMQ_URL")
-	ob, pub = initWalletOutbox(context.Background(), nil)
-	if ob != nil || pub != nil {
+	ob, pub, rel = initWalletOutbox(context.Background(), nil)
+	if ob != nil || pub != nil || rel != nil {
 		t.Fatalf("expected nil outbox when RABBITMQ_URL missing")
 	}
 }

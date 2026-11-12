@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -312,6 +313,7 @@ func TestHandleLedgerRejectsMissingWalletID(t *testing.T) {
 type fakeMainAuthClient struct {
 	issueResponse *authv1.IssueTokenResponse
 	issueErr      error
+	revokedReq    *authv1.RevokeTokenRequest
 }
 
 func (f *fakeMainAuthClient) IssueToken(_ context.Context, _ *authv1.IssueTokenRequest, _ ...grpc.CallOption) (*authv1.IssueTokenResponse, error) {
@@ -323,7 +325,8 @@ func (f *fakeMainAuthClient) ValidateToken(_ context.Context, _ *authv1.Validate
 func (f *fakeMainAuthClient) RefreshToken(_ context.Context, _ *authv1.RefreshTokenRequest, _ ...grpc.CallOption) (*authv1.IssueTokenResponse, error) {
 	return nil, nil
 }
-func (f *fakeMainAuthClient) RevokeToken(_ context.Context, _ *authv1.RevokeTokenRequest, _ ...grpc.CallOption) (*authv1.RevokeTokenResponse, error) {
+func (f *fakeMainAuthClient) RevokeToken(_ context.Context, req *authv1.RevokeTokenRequest, _ ...grpc.CallOption) (*authv1.RevokeTokenResponse, error) {
+	f.revokedReq = req
 	return &authv1.RevokeTokenResponse{Success: true}, nil
 }
 func (f *fakeMainAuthClient) Authorize(_ context.Context, _ *authv1.AuthorizeRequest, _ ...grpc.CallOption) (*authv1.AuthorizeResponse, error) {
@@ -696,6 +699,60 @@ func TestHandleLedgerEdgeCases(t *testing.T) {
 	gw.handleLedger(recErr, reqErr)
 	if recErr.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 on ledger client error, got %d", recErr.Code)
+	}
+}
+
+func TestHandleLedgerCounterpartyAccess(t *testing.T) {
+	fakeClient := &fakeLedgerClient{
+		getLedgerResponse: &ledgerv1.GetLedgerResponse{
+			Entries: []*ledgerv1.LedgerEntry{
+				{
+					TransactionId:       "txn-alice-to-bob-101",
+					SourceWalletId:      "alice",
+					DestinationWalletId: "bob",
+					Amount:              5000,
+					Currency:            "USD",
+				},
+			},
+			TotalCount: 1,
+		},
+	}
+	gw := &Gateway{ledgerClient: fakeClient}
+
+	// 1. Bob (recipient) queries by transaction_id -> should be allowed (200 OK)
+	bobCtx := ContextWithClaims(context.Background(), &auth.Claims{Subject: "bob"})
+	reqBob := httptest.NewRequest(http.MethodGet, "/api/v1/ledger?transaction_id=txn-alice-to-bob-101", nil).WithContext(bobCtx)
+	recBob := httptest.NewRecorder()
+	gw.handleLedger(recBob, reqBob)
+	if recBob.Code != http.StatusOK {
+		t.Fatalf("expected recipient Bob to view counterparty ledger entry (200 OK), got %d: %s", recBob.Code, recBob.Body.String())
+	}
+
+	// 2. Alice (sender) queries by transaction_id -> should be allowed (200 OK)
+	aliceCtx := ContextWithClaims(context.Background(), &auth.Claims{Subject: "alice"})
+	reqAlice := httptest.NewRequest(http.MethodGet, "/api/v1/ledger?transaction_id=txn-alice-to-bob-101", nil).WithContext(aliceCtx)
+	recAlice := httptest.NewRecorder()
+	gw.handleLedger(recAlice, reqAlice)
+	if recAlice.Code != http.StatusOK {
+		t.Fatalf("expected sender Alice to view counterparty ledger entry (200 OK), got %d: %s", recAlice.Code, recAlice.Body.String())
+	}
+
+	// 3. Charlie (unrelated third party) queries by transaction_id -> must be blocked (403 Forbidden)
+	charlieCtx := ContextWithClaims(context.Background(), &auth.Claims{Subject: "charlie"})
+	reqCharlie := httptest.NewRequest(http.MethodGet, "/api/v1/ledger?transaction_id=txn-alice-to-bob-101", nil).WithContext(charlieCtx)
+	recCharlie := httptest.NewRecorder()
+	gw.handleLedger(recCharlie, reqCharlie)
+	if recCharlie.Code != http.StatusForbidden {
+		t.Fatalf("expected third-party Charlie to be blocked with 403 Forbidden, got %d", recCharlie.Code)
+	}
+
+	// 4. Admin queries by transaction_id -> should be allowed (200 OK)
+	adminCtx := ContextWithClaims(context.Background(), &auth.Claims{Subject: "admin_user", Roles: []string{"admin"}})
+	reqAdmin := httptest.NewRequest(http.MethodGet, "/api/v1/ledger?transaction_id=txn-alice-to-bob-101", nil).WithContext(adminCtx)
+	recAdmin := httptest.NewRecorder()
+	gw.handleLedger(recAdmin, reqAdmin)
+	if recAdmin.Code != http.StatusOK {
+		t.Fatalf("expected Admin to view counterparty ledger entry (200 OK), got %d: %s", recAdmin.Code, recAdmin.Body.String())
 	}
 }
 
@@ -1145,5 +1202,72 @@ func TestVerifyWalletAccess_REQ_SEC_01(t *testing.T) {
 	gw.handleGetBalance(recBalDeny, reqBalDeny)
 	if recBalDeny.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden on foreign opaque wallet balance, got %d: %s", recBalDeny.Code, recBalDeny.Body.String())
+	}
+}
+
+func TestHandleBackchannelLogout(t *testing.T) {
+	fakeAuth := &fakeMainAuthClient{}
+	claimsC := newClaimsCache("test-fingerprint")
+	gw := &Gateway{
+		authClient:  fakeAuth,
+		claimsCache: claimsC,
+	}
+
+	// Prime claimsCache with alice's token
+	aliceToken := "token-alice-12345"
+	claimsC.set(aliceToken, &auth.Claims{Subject: "alice", ExpiresAt: time.Now().Add(10 * time.Minute).Unix()})
+	if _, ok := claimsC.get(aliceToken); !ok {
+		t.Fatal("expected alice token in cache before logout")
+	}
+
+	// 1. Method Not Allowed (GET)
+	reqGet := httptest.NewRequest(http.MethodGet, "/api/v1/auth/backchannel-logout", nil)
+	recGet := httptest.NewRecorder()
+	gw.handleBackchannelLogout(recGet, reqGet)
+	if recGet.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 Method Not Allowed, got %d", recGet.Code)
+	}
+
+	// 2. Missing params (neither logout_token nor subject)
+	reqEmpty := httptest.NewRequest(http.MethodPost, "/api/v1/auth/backchannel-logout", strings.NewReader(""))
+	recEmpty := httptest.NewRecorder()
+	gw.handleBackchannelLogout(recEmpty, reqEmpty)
+	if recEmpty.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for empty logout, got %d", recEmpty.Code)
+	}
+
+	// 3. Valid backchannel logout with subject in form
+	formData := strings.NewReader("subject=alice")
+	reqSub := httptest.NewRequest(http.MethodPost, "/api/v1/auth/backchannel-logout", formData)
+	reqSub.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	recSub := httptest.NewRecorder()
+	gw.handleBackchannelLogout(recSub, reqSub)
+	if recSub.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for backchannel logout, got %d: %s", recSub.Code, recSub.Body.String())
+	}
+	if recSub.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("expected Cache-Control: no-store header, got %q", recSub.Header().Get("Cache-Control"))
+	}
+	if fakeAuth.revokedReq == nil || fakeAuth.revokedReq.Subject != "alice" {
+		t.Fatalf("expected authClient.RevokeToken called with subject=alice, got %+v", fakeAuth.revokedReq)
+	}
+	// Verify cache was invalidated for alice
+	if _, ok := claimsC.get(aliceToken); ok {
+		t.Fatal("expected alice token to be purged from claimsCache after backchannel logout")
+	}
+
+	// 4. Valid backchannel logout with JWT logout_token (sub=bob)
+	// Header: {"alg":"none"} -> eyJhbGciOiJub25lIn0
+	// Payload: {"sub":"bob"} -> eyJzdWIiOiJib2IifQ
+	validLogoutJWT := "eyJhbGciOiJub25lIn0.eyJzdWIiOiJib2IifQ."
+	reqJWT := httptest.NewRequest(http.MethodPost, "/api/v1/auth/backchannel-logout", strings.NewReader("logout_token="+validLogoutJWT))
+	reqJWT.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	recJWT := httptest.NewRecorder()
+	gw.handleBackchannelLogout(recJWT, reqJWT)
+	if recJWT.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for JWT backchannel logout, got %d: %s", recJWT.Code, recJWT.Body.String())
+	}
+	if fakeAuth.revokedReq == nil || fakeAuth.revokedReq.Subject != "bob" {
+		t.Fatalf("expected authClient.RevokeToken called with extracted subject=bob, got %+v", fakeAuth.revokedReq)
 	}
 }

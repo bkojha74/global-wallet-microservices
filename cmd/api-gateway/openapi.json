@@ -217,6 +217,45 @@
         }
       }
     },
+    "/api/v1/auth/backchannel-logout": {
+      "post": {
+        "tags": ["Authentication"],
+        "summary": "Keycloak OIDC Backchannel Logout",
+        "description": "Processes OpenID Connect Backchannel Logout notifications from Keycloak, instantly revoking user sessions across the cluster.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "logout_token": { "type": "string", "description": "Signed OIDC logout token" },
+                  "subject": { "type": "string", "description": "Subject ID to revoke" }
+                }
+              }
+            },
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "logout_token": { "type": "string" },
+                  "subject": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Session revoked successfully",
+            "headers": {
+              "Cache-Control": { "schema": { "type": "string", "example": "no-store" } }
+            }
+          },
+          "400": { "description": "Missing logout_token or subject" }
+        }
+      }
+    },
     "/api/v1/wallets": {
       "post": {
         "tags": ["Wallets"],
@@ -657,9 +696,16 @@
           {
             "name": "wallet_id",
             "in": "query",
-            "required": true,
-            "description": "Wallet ID to inspect",
+            "required": false,
+            "description": "Wallet ID to inspect (required if transaction_id is omitted)",
             "schema": { "type": "string", "example": "alice" }
+          },
+          {
+            "name": "transaction_id",
+            "in": "query",
+            "required": false,
+            "description": "Transaction ID to inspect (counterparty authorization enforced: sender, recipient, or admin)",
+            "schema": { "type": "string", "example": "txn_8f192b45" }
           },
           {
             "name": "limit",

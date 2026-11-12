@@ -64,8 +64,78 @@ func (s *RevocationStore) ensureIndexes(ctx context.Context) error {
 		return fmt.Errorf("revoked_tokens token_id index: %w", err)
 	}
 
+	// Indexes for revoked_subjects (REQ-SEC-03: Keycloak Session Revocation Sync)
+	if s.subjectsCol() != nil {
+		_, _ = s.subjectsCol().Indexes().CreateOne(ctx, mongo.IndexModel{
+			Keys:    bson.D{bson.E{Key: "expires_at", Value: 1}},
+			Options: options.Index().SetExpireAfterSeconds(0).SetName("idx_revoked_subjects_ttl"),
+		})
+		_, _ = s.subjectsCol().Indexes().CreateOne(ctx, mongo.IndexModel{
+			Keys:    bson.D{bson.E{Key: "subject", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("idx_revoked_subject_unique"),
+		})
+	}
+
 	log.Println("[REVOCATION-STORE] Indexes verified")
 	return nil
+}
+
+// RevokedSubjectRecord represents subject-level session revocation (e.g., Keycloak backchannel logout).
+// Any token issued prior to RevokedBefore is invalidated.
+type RevokedSubjectRecord struct {
+	ID            primitive.ObjectID `bson:"_id,omitempty"`
+	Subject       string             `bson:"subject"`
+	Reason        string             `bson:"reason"`
+	RevokedBefore time.Time          `bson:"revoked_before"`
+	ExpiresAt     time.Time          `bson:"expires_at"` // TTL index
+}
+
+// RevokeSubject marks all active sessions for a subject as revoked as of now.
+func (s *RevocationStore) RevokeSubject(ctx context.Context, subject, reason string, ttl time.Duration) error {
+	if s == nil || s.db == nil || strings.TrimSpace(subject) == "" {
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = 24 * time.Hour
+	}
+	now := time.Now().UTC()
+	_, err := s.subjectsCol().UpdateOne(ctx,
+		bson.M{"subject": subject},
+		bson.M{
+			"$set": bson.M{
+				"reason":         reason,
+				"revoked_before": now,
+				"expires_at":     now.Add(ttl),
+			},
+			"$setOnInsert": bson.M{"_id": primitive.NewObjectID()},
+		},
+		options.Update().SetUpsert(true),
+	)
+	if err != nil {
+		return fmt.Errorf("revocation_store: revoke subject failed: %w", err)
+	}
+	log.Printf("[REVOCATION-STORE] Subject revoked: subject=%s reason=%s revoked_before=%s", subject, reason, now.Format(time.RFC3339))
+	return nil
+}
+
+// IsSubjectRevoked returns true if a subject has a blanket revocation recorded and
+// the token was issued before the revocation timestamp.
+func (s *RevocationStore) IsSubjectRevoked(ctx context.Context, subject string, issuedAt time.Time) (bool, error) {
+	if s == nil || s.db == nil || strings.TrimSpace(subject) == "" {
+		return false, nil
+	}
+	var rec RevokedSubjectRecord
+	err := s.subjectsCol().FindOne(ctx, bson.M{"subject": subject}).Decode(&rec)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return false, nil
+		}
+		return false, err
+	}
+	if issuedAt.IsZero() {
+		return true, nil
+	}
+	return !issuedAt.After(rec.RevokedBefore), nil
 }
 
 // Revoke adds a token to the blocklist.
@@ -127,4 +197,11 @@ func (s *RevocationStore) col() *mongo.Collection {
 		return nil
 	}
 	return s.db.Collection("revoked_tokens")
+}
+
+func (s *RevocationStore) subjectsCol() *mongo.Collection {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Collection("revoked_subjects")
 }

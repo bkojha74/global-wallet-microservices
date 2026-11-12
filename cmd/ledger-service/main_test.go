@@ -87,6 +87,12 @@ func TestGetLedgerEntriesRejectsMissingWalletID(t *testing.T) {
 	if respNil != nil || status.Code(errNil) != codes.InvalidArgument {
 		t.Fatalf("expected InvalidArgument for nil request, got %v", errNil)
 	}
+
+	// REQ-SEC-02: Supplying TransactionId without WalletId is valid request syntax (fails with Unavailable on nil db)
+	_, errTxn := service.GetLedgerEntries(context.Background(), &ledgerv1.GetLedgerRequest{TransactionId: "txn-12345"})
+	if status.Code(errTxn) != codes.Unavailable {
+		t.Fatalf("expected Unavailable for nil db with valid TransactionId, got %v", errTxn)
+	}
 }
 
 func TestParseTransactionDocID(t *testing.T) {

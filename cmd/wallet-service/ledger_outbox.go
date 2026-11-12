@@ -292,6 +292,14 @@ func WithMaxBackoff(d time.Duration) RelayOption {
 	}
 }
 
+// WithOutboxRelay configures a consolidated audit outbox relay that runs in lockstep with
+// the elected leader's ledger relay cycle (REQ-ASYNC-02).
+func WithOutboxRelay(or *observability.OutboxRelay) RelayOption {
+	return func(r *LedgerRelay) {
+		r.outboxRelay = or
+	}
+}
+
 // LedgerRelay polls pending ledger tasks and guarantees reliable asynchronous delivery
 // to the Ledger Service. When running with a LeaseManager, only the elected leader pod processes outbox tasks.
 // If downstream errors occur, it backs off exponentially with full randomized jitter.
@@ -307,6 +315,7 @@ type LedgerRelay struct {
 	leaseManager LeaseManager
 	leaderMu     sync.RWMutex
 	isLeader     bool
+	outboxRelay  *observability.OutboxRelay
 }
 
 func NewLedgerRelay(db *mongo.Database, client ledgerv1.LedgerServiceClient, pollInterval time.Duration, batchSize int64, logger observability.Logger, opts ...RelayOption) *LedgerRelay {
@@ -467,6 +476,14 @@ func (r *LedgerRelay) Start(ctx context.Context) {
 						hadError = true
 					} else if count > 0 {
 						log.Printf("[LEDGER-RELAY] Relayed %d pending ledger entries successfully", count)
+					}
+
+					// REQ-ASYNC-02: Consolidated Single Outbox Engine
+					// When leadership is held, also execute audit outbox relay in lockstep
+					if r.outboxRelay != nil {
+						if oErr := r.outboxRelay.ProcessBatch(relayCtx); oErr != nil {
+							log.Printf("[LEDGER-RELAY] Consolidated audit outbox batch error: %v", oErr)
+						}
 					}
 				}
 

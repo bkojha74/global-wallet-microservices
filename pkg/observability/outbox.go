@@ -139,7 +139,7 @@ func NewOutboxRelay(db *mongo.Database, collectionName string, publisher EventPu
 }
 
 // Start launches the relay goroutine. It runs until ctx is cancelled.
-// Call this once at service startup when LOGGING_OUTBOX_ENABLED=true.
+// Call this once at service startup when LOGGING_OUTBOX_ENABLED=true and not using a consolidated relay.
 func (r *OutboxRelay) Start(ctx context.Context) {
 	ticker := time.NewTicker(r.pollInterval)
 	go func() {
@@ -156,6 +156,12 @@ func (r *OutboxRelay) Start(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// ProcessBatch executes a single outbox relay cycle. Used when coordinating outbox execution
+// with a unified leader-election loop (REQ-ASYNC-02).
+func (r *OutboxRelay) ProcessBatch(ctx context.Context) error {
+	return r.relay(ctx)
 }
 
 // relay fetches a batch of pending entries and publishes them.

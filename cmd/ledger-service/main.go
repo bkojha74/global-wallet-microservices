@@ -376,19 +376,40 @@ func decodeLedgerEntries(ctx context.Context, cursor *mongo.Cursor) []*ledgerv1.
 }
 
 func (s *server) GetLedgerEntries(ctx context.Context, req *ledgerv1.GetLedgerRequest) (*ledgerv1.GetLedgerResponse, error) {
-	if req == nil || strings.TrimSpace(req.WalletId) == "" {
-		return nil, status.Errorf(codes.InvalidArgument, "wallet_id is required")
+	if req == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "request is required")
+	}
+
+	walletID := strings.TrimSpace(req.WalletId)
+	txnID := strings.TrimSpace(req.TransactionId)
+
+	if walletID == "" && txnID == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "either wallet_id or transaction_id is required")
 	}
 
 	if s.db() == nil {
 		return nil, status.Errorf(codes.Unavailable, "database unavailable")
 	}
 	col := s.db().Collection("ledger_entries")
-	filter := bson.M{
-		"$or": []bson.M{
-			{"source_wallet_id": req.WalletId},
-			{"destination_wallet_id": req.WalletId},
-		},
+
+	var filter bson.M
+	if txnID != "" && walletID != "" {
+		filter = bson.M{
+			"transaction_id": txnID,
+			"$or": []bson.M{
+				{"source_wallet_id": walletID},
+				{"destination_wallet_id": walletID},
+			},
+		}
+	} else if txnID != "" {
+		filter = bson.M{"transaction_id": txnID}
+	} else {
+		filter = bson.M{
+			"$or": []bson.M{
+				{"source_wallet_id": walletID},
+				{"destination_wallet_id": walletID},
+			},
+		}
 	}
 
 	limit, offset := parseLedgerPagination(req)
