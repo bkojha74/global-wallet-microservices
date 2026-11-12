@@ -104,6 +104,20 @@ func (c *claimsCache) invalidate(token string) {
 	c.mu.Unlock()
 }
 
+// invalidateSubject removes all cached claims for a given user subject (REQ-SEC-03).
+func (c *claimsCache) invalidateSubject(subject string) {
+	if subject == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, v := range c.entries {
+		if v.claims != nil && v.claims.Subject == subject {
+			delete(c.entries, k)
+		}
+	}
+}
+
 // ContextWithClaims stores the verified JWT claims into the request context.
 func ContextWithClaims(ctx context.Context, claims *auth.Claims) context.Context {
 	return context.WithValue(ctx, ClaimsContextKey, claims)

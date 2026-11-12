@@ -67,6 +67,20 @@ try {
     Record-Test "02-Admin-Login" "200 with token" $_.Exception.Response.StatusCode.value__ $false $_.Message
 }
 
+try {
+    # Generate mock logout token with sub: "test_revoked_subject"
+    $hdr = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes('{"alg":"none","typ":"JWT"}')).TrimEnd('=').Replace('+','-').Replace('/','_')
+    $pay = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes('{"iss":"keycloak","sub":"test_revoked_subject","events":{"http://schemas.openid.net/event/backchannel-logout":{}}}')).TrimEnd('=').Replace('+','-').Replace('/','_')
+    $mockLogoutToken = "$hdr.$pay."
+    
+    $r = Invoke-WebRequest -Uri "$baseUrl/api/v1/auth/backchannel-logout" -Method Post -ContentType "application/x-www-form-urlencoded" -Body "logout_token=$mockLogoutToken"
+    $cacheCtrl = $r.Headers["Cache-Control"]
+    Record-Test "04-Backchannel-Logout" "200 with no-store" "$($r.StatusCode)" ($r.StatusCode -eq 200 -and $cacheCtrl -match "no-store") "Cache-Control: $cacheCtrl"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "04-Backchannel-Logout" "200 with no-store" "$code" $false $_.Message
+}
+
 # --- 03. Wallet Lifecycle ---
 try {
     $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/wallets" -Method Post -ContentType "application/json" -Headers @{ Authorization = "Bearer $aliceToken" } -Body '{"wallet_id":"alice_usd","currency":"USD","owner_id":"alice"}'
@@ -220,6 +234,15 @@ try {
 } catch {
     $code = $_.Exception.Response.StatusCode.value__
     Record-Test "02-Get-Latest-Merkle-Root" "200 or 404" "$code" ($code -eq 404 -or $code -eq 200) "Status $code"
+}
+
+if ($sameTxnId) {
+    try {
+        $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/ledger?transaction_id=$sameTxnId" -Method Get -Headers @{ Authorization = "Bearer $aliceToken" }
+        Record-Test "03-Get-Ledger-By-TxnID-Counterparty" "200" "200" ($null -ne $r.entries -and $r.entries.Count -gt 0) "Entries count: $($r.entries.Count)"
+    } catch {
+        Record-Test "03-Get-Ledger-By-TxnID-Counterparty" "200" $_.Exception.Response.StatusCode.value__ $false $_.Message
+    }
 }
 
 # --- 09. Webhooks ---

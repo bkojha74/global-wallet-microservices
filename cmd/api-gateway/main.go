@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -59,6 +60,7 @@ type Gateway struct {
 	httpClient        *http.Client
 	logger            observability.Logger
 	webhookDispatcher *webhook.Dispatcher
+	claimsCache       *claimsCache
 }
 
 func (g *Gateway) emit(ctx context.Context, eventType, level, message string, attributes map[string]any) {
@@ -1528,17 +1530,23 @@ func (g *Gateway) handleLedger(w http.ResponseWriter, r *http.Request) {
 	}
 
 	walletID := strings.TrimSpace(r.URL.Query().Get("wallet_id"))
-	if walletID == "" {
-		http.Error(w, "wallet_id query parameter is required", http.StatusBadRequest)
+	txnID := strings.TrimSpace(r.URL.Query().Get("transaction_id"))
+	if walletID == "" && txnID == "" {
+		http.Error(w, "either 'wallet_id' or 'transaction_id' query parameter is required", http.StatusBadRequest)
 		return
 	}
-	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+
+	claims, hasClaims := ClaimsFromContext(r.Context())
+
+	// If wallet_id is explicitly provided, verify caller's authorization to that wallet
+	if walletID != "" && hasClaims && claims != nil {
 		if err := g.verifyWalletAccess(r.Context(), claims, walletID); err != nil {
 			log.Printf("[SECURITY] IDOR blocked: subject %s tried to view ledger of %s", claims.Subject, walletID)
 			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
 			return
 		}
 	}
+
 	limitStr := r.URL.Query().Get("limit")
 	pageToken := r.URL.Query().Get("page_token")
 
@@ -1556,21 +1564,51 @@ func (g *Gateway) handleLedger(w http.ResponseWriter, r *http.Request) {
 
 	callCtx = withOutgoingAuthContext(observability.WithOutgoingMetadata(callCtx, correlation))
 	resp, err := g.ledgerClient.GetLedgerEntries(callCtx, &ledgerv1.GetLedgerRequest{
-		WalletId:  walletID,
-		Limit:     limit,
-		PageToken: pageToken,
+		WalletId:      walletID,
+		TransactionId: txnID,
+		Limit:         limit,
+		PageToken:     pageToken,
 	})
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Ledger query failure: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"wallet_id":       walletID,
+	// REQ-SEC-02: Counterparty Ledger Access Control
+	// When querying by transaction_id without a pre-validated wallet_id, verify that
+	// the non-admin caller is either the sender (source_wallet_id) or the recipient (destination_wallet_id)
+	if walletID == "" && txnID != "" && hasClaims && claims != nil && !claims.HasRole("admin") && !claims.HasScope("wallet:admin") {
+		hasCounterpartyAccess := false
+		for _, entry := range resp.Entries {
+			if entry.SourceWalletId != "" && g.verifyWalletAccess(r.Context(), claims, entry.SourceWalletId) == nil {
+				hasCounterpartyAccess = true
+				break
+			}
+			if entry.DestinationWalletId != "" && g.verifyWalletAccess(r.Context(), claims, entry.DestinationWalletId) == nil {
+				hasCounterpartyAccess = true
+				break
+			}
+		}
+		if len(resp.Entries) > 0 && !hasCounterpartyAccess {
+			log.Printf("[SECURITY] IDOR blocked: subject %s tried to view counterparty transaction %s", claims.Subject, txnID)
+			writeAuthError(w, http.StatusForbidden, "Access forbidden: you are neither the sender nor recipient of this transaction")
+			return
+		}
+	}
+
+	responsePayload := map[string]interface{}{
 		"entries":         resp.Entries,
 		"next_page_token": resp.NextPageToken,
 		"total_count":     resp.TotalCount,
-	})
+	}
+	if walletID != "" {
+		responsePayload["wallet_id"] = walletID
+	}
+	if txnID != "" {
+		responsePayload["transaction_id"] = txnID
+	}
+
+	writeJSON(w, http.StatusOK, responsePayload)
 }
 
 // DEV-03: handleLedgerMerkle proxies cryptographic Merkle checkpoint and audit proof requests.
@@ -1837,12 +1875,100 @@ func (g *Gateway) handleLogout(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 
-	_, _ = g.authClient.RevokeToken(ctx, &authv1.RevokeTokenRequest{
-		Token:  tokenStr,
-		Reason: "logout",
-	})
+	if g.authClient != nil {
+		_, _ = g.authClient.RevokeToken(ctx, &authv1.RevokeTokenRequest{
+			Token:  tokenStr,
+			Reason: "logout",
+		})
+	}
+
+	// Invalidate local in-process cache immediately (REQ-SEC-03)
+	if g.claimsCache != nil {
+		g.claimsCache.invalidate(tokenStr)
+	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "logged out successfully"})
+}
+
+// extractSubjectFromLogoutToken parses the unverified payload of an OIDC logout_token
+// to extract the "sub" (subject) claim per OpenID Connect Back-Channel Logout 1.0.
+func extractSubjectFromLogoutToken(tokenStr string) string {
+	parts := strings.Split(tokenStr, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		payloadBytes, err = base64.URLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return ""
+		}
+	}
+	var claims struct {
+		Subject string `json:"sub"`
+	}
+	if err := json.Unmarshal(payloadBytes, &claims); err != nil {
+		return ""
+	}
+	return claims.Subject
+}
+
+// REQ-SEC-03: handleBackchannelLogout handles OIDC Backchannel Logout notifications from Keycloak.
+func (g *Gateway) handleBackchannelLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	logoutToken := strings.TrimSpace(r.FormValue("logout_token"))
+	subject := strings.TrimSpace(r.FormValue("subject"))
+
+	if logoutToken == "" && subject == "" && r.Body != nil {
+		var req struct {
+			LogoutToken string `json:"logout_token"`
+			Subject     string `json:"subject"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+			if req.LogoutToken != "" {
+				logoutToken = strings.TrimSpace(req.LogoutToken)
+			}
+			if req.Subject != "" {
+				subject = strings.TrimSpace(req.Subject)
+			}
+		}
+	}
+
+	if logoutToken == "" && subject == "" {
+		http.Error(w, "missing logout_token or subject parameter", http.StatusBadRequest)
+		return
+	}
+
+	if subject == "" && logoutToken != "" {
+		subject = extractSubjectFromLogoutToken(logoutToken)
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	if g.authClient != nil {
+		_, _ = g.authClient.RevokeToken(ctx, &authv1.RevokeTokenRequest{
+			Token:   logoutToken,
+			Subject: subject,
+			Reason:  "keycloak_backchannel_logout",
+		})
+	}
+
+	if g.claimsCache != nil {
+		if subject != "" {
+			g.claimsCache.invalidateSubject(subject)
+		} else if logoutToken != "" {
+			g.claimsCache.invalidate(logoutToken)
+		}
+	}
+
+	log.Printf("[SECURITY] Keycloak backchannel logout processed: subject=%s", subject)
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]string{"message": "backchannel logout processed"})
 }
 
 func parseAuthTokenParams(r *http.Request) (string, string, string) {
@@ -2351,6 +2477,7 @@ func registerGatewayRoutes(mux *http.ServeMux, gw *Gateway) {
 	mux.HandleFunc("/api/v1/auth/login", gw.handleLogin)
 	mux.HandleFunc("/api/v1/auth/refresh", gw.handleRefresh)
 	mux.HandleFunc("/api/v1/auth/logout", gw.handleLogout)
+	mux.HandleFunc("/api/v1/auth/backchannel-logout", gw.handleBackchannelLogout)
 	mux.HandleFunc("/api/v1/auth/token", gw.handleAuthToken)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "UP"})
@@ -2366,7 +2493,7 @@ func registerGatewayRoutes(mux *http.ServeMux, gw *Gateway) {
 	mux.HandleFunc("/api-docs/openapi.json", handleOpenAPISpec)
 }
 
-func wrapGatewayMiddleware(handler http.Handler, authClient authv1.AuthServiceClient) http.Handler {
+func wrapGatewayMiddleware(handler http.Handler, gw *Gateway) http.Handler {
 	publicPaths := map[string]bool{
 		"/healthz":                          true,
 		"/readyz":                           true,
@@ -2378,6 +2505,7 @@ func wrapGatewayMiddleware(handler http.Handler, authClient authv1.AuthServiceCl
 		"/api-docs/openapi.json":            true,
 		"/api/v1/auth/login":                true,
 		"/api/v1/auth/refresh":              true,
+		"/api/v1/auth/backchannel-logout":   true,
 		"/api/v1/cluster/status":            true,
 		"/api/v1/ledger/merkle":             true,
 		"/api/v1/ledger/merkle/latest":      true,
@@ -2391,11 +2519,22 @@ func wrapGatewayMiddleware(handler http.Handler, authClient authv1.AuthServiceCl
 		publicPaths["/api/v1/auth/token"] = true
 	}
 
-	cacheFingerprintSecret := os.Getenv("CACHE_FINGERPRINT_SECRET")
-	if cacheFingerprintSecret == "" {
-		cacheFingerprintSecret = "gateway-cache-fingerprint-key"
+	var claimsC *claimsCache
+	var authClient authv1.AuthServiceClient
+	if gw != nil {
+		authClient = gw.authClient
+		if gw.claimsCache == nil {
+			cacheFingerprintSecret := os.Getenv("CACHE_FINGERPRINT_SECRET")
+			if cacheFingerprintSecret == "" {
+				cacheFingerprintSecret = "gateway-cache-fingerprint-key"
+			}
+			gw.claimsCache = newClaimsCache(cacheFingerprintSecret)
+		}
+		claimsC = gw.claimsCache
+	} else {
+		claimsC = newClaimsCache("fallback-secret")
 	}
-	claimsC := newClaimsCache(cacheFingerprintSecret)
+
 	rateLimiter := NewRateLimiter(60, 100)
 
 	wrapped := MaxBytesMiddleware(1<<20, handler)
@@ -2409,7 +2548,7 @@ func wrapGatewayMiddleware(handler http.Handler, authClient authv1.AuthServiceCl
 func buildGatewayRouter(gw *Gateway) http.Handler {
 	mux := http.NewServeMux()
 	registerGatewayRoutes(mux, gw)
-	return wrapGatewayMiddleware(mux, gw.authClient)
+	return wrapGatewayMiddleware(mux, gw)
 }
 
 func runGatewayServer(ctx context.Context) error {

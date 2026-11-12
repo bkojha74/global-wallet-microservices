@@ -47,6 +47,7 @@ message GetLedgerRequest {
   string wallet_id = 1;
   int32 limit = 2;
   string page_token = 3;
+  string transaction_id = 4;
 }
 
 message GetLedgerResponse {

@@ -375,16 +375,16 @@ func TestInitWalletOutboxAndMetricsServer(t *testing.T) {
 
 	// 1. initWalletOutbox disabled
 	t.Setenv("LOGGING_OUTBOX_ENABLED", "false")
-	ob1, pub1 := initWalletOutbox(ctx, nil)
-	if ob1 != nil || pub1 != nil {
+	ob1, pub1, r1 := initWalletOutbox(ctx, nil)
+	if ob1 != nil || pub1 != nil || r1 != nil {
 		t.Fatal("expected nil outbox when disabled")
 	}
 
 	// 2. initWalletOutbox enabled but missing URL
 	t.Setenv("LOGGING_OUTBOX_ENABLED", "true")
 	t.Setenv("LOGGING_RABBITMQ_URL", "")
-	ob2, pub2 := initWalletOutbox(ctx, nil)
-	if ob2 != nil || pub2 != nil {
+	ob2, pub2, r2 := initWalletOutbox(ctx, nil)
+	if ob2 != nil || pub2 != nil || r2 != nil {
 		t.Fatal("expected nil outbox when URL empty")
 	}
 

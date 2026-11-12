@@ -60,6 +60,7 @@ services:
       - "127.0.0.1:9094:9094"
     depends_on:
       - ledger-service
+      - redis
     networks:
       - banking_net
 
@@ -99,6 +100,7 @@ services:
       - "127.0.0.1:9093:9093"
     depends_on:
       - ledger-service
+      - redis
     networks:
       - banking_net
 
@@ -132,6 +134,26 @@ services:
       - ledger-service
     networks:
       - banking_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: wallet_redis
+    restart: always
+    ports:
+      - "127.0.0.1:6379:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - wallet_redis_data:/data
+    networks:
+      - banking_net
+
+volumes:
+  wallet_redis_data:
 
 networks:
   banking_net:

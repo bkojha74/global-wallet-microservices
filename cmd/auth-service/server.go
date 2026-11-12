@@ -75,6 +75,16 @@ func (s *authServer) ValidateToken(ctx context.Context, req *authv1.ValidateToke
 		return &authv1.ValidateTokenResponse{Valid: false, Error: authv1.TokenErrorCode_TOKEN_REVOKED}, nil
 	}
 
+	// REQ-SEC-03: Subject-level revocation check (e.g. Keycloak backchannel logout)
+	issuedAt := time.Unix(claims.IssuedAt, 0)
+	subjRevoked, sErr := s.revStore.IsSubjectRevoked(ctx, claims.Subject, issuedAt)
+	if sErr != nil {
+		log.Printf("[AUTH-SERVER] subject revocation check error: %v", sErr)
+	}
+	if subjRevoked {
+		return &authv1.ValidateTokenResponse{Valid: false, Error: authv1.TokenErrorCode_TOKEN_REVOKED}, nil
+	}
+
 	return &authv1.ValidateTokenResponse{
 		Valid:     true,
 		Subject:   claims.Subject,
@@ -110,8 +120,8 @@ func (s *authServer) RefreshToken(ctx context.Context, req *authv1.RefreshTokenR
 
 // RevokeToken adds a token to the blocklist and invalidates refresh sessions.
 func (s *authServer) RevokeToken(ctx context.Context, req *authv1.RevokeTokenRequest) (*authv1.RevokeTokenResponse, error) {
-	if req.Token == "" {
-		return nil, grpcstatus.Error(codes.InvalidArgument, "token is required")
+	if req == nil || (req.Token == "" && req.Subject == "") {
+		return nil, grpcstatus.Error(codes.InvalidArgument, "either token or subject is required")
 	}
 
 	reason := req.Reason
@@ -119,23 +129,33 @@ func (s *authServer) RevokeToken(ctx context.Context, req *authv1.RevokeTokenReq
 		reason = "logout"
 	}
 
-	claims, err := s.provider.ValidateToken(ctx, req.Token)
-	if err == nil {
-		tokenID := claims.TokenID
-		if tokenID == "" {
-			tokenID = deriveTokenID(&auth.Claims{Subject: claims.Subject, IssuedAt: claims.IssuedAt})
+	// REQ-SEC-03: Subject-level revocation (e.g. from Keycloak backchannel logout)
+	if req.Subject != "" {
+		if err := s.revStore.RevokeSubject(ctx, req.Subject, reason, 24*time.Hour); err != nil {
+			log.Printf("[AUTH-SERVER] RevokeSubject error: %v", err)
 		}
-		expiresAt := time.Unix(claims.ExpiresAt, 0)
-		if rErr := s.revStore.Revoke(ctx, tokenID, claims.Subject, reason, expiresAt); rErr != nil {
-			log.Printf("[AUTH-SERVER] RevokeToken blocklist error: %v", rErr)
+		log.Printf("[AUTH-SERVER] subject sessions revoked: subject=%s reason=%s", req.Subject, reason)
+	}
+
+	if req.Token != "" {
+		claims, err := s.provider.ValidateToken(ctx, req.Token)
+		if err == nil {
+			tokenID := claims.TokenID
+			if tokenID == "" {
+				tokenID = deriveTokenID(&auth.Claims{Subject: claims.Subject, IssuedAt: claims.IssuedAt})
+			}
+			expiresAt := time.Unix(claims.ExpiresAt, 0)
+			if rErr := s.revStore.Revoke(ctx, tokenID, claims.Subject, reason, expiresAt); rErr != nil {
+				log.Printf("[AUTH-SERVER] RevokeToken blocklist error: %v", rErr)
+			}
+			log.Printf("[AUTH-SERVER] access token revoked: subject=%s reason=%s", claims.Subject, reason)
+		} else {
+			// Attempt to revoke as refresh token in local user store
+			if rErr := s.store.RevokeRefreshToken(ctx, req.Token); rErr != nil {
+				log.Printf("[AUTH-SERVER] RevokeToken refresh token error: %v", rErr)
+			}
+			log.Printf("[AUTH-SERVER] refresh token revoked: reason=%s", reason)
 		}
-		log.Printf("[AUTH-SERVER] access token revoked: subject=%s reason=%s", claims.Subject, reason)
-	} else {
-		// Attempt to revoke as refresh token in local user store
-		if rErr := s.store.RevokeRefreshToken(ctx, req.Token); rErr != nil {
-			log.Printf("[AUTH-SERVER] RevokeToken refresh token error: %v", rErr)
-		}
-		log.Printf("[AUTH-SERVER] refresh token revoked: reason=%s", reason)
 	}
 
 	return &authv1.RevokeTokenResponse{Success: true, Message: "token revoked"}, nil
