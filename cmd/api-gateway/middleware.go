@@ -118,13 +118,6 @@ func (c *claimsCache) invalidateSubject(subject string) {
 	}
 }
 
-// clear flushes all entries in the claims cache.
-func (c *claimsCache) clear() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.entries = make(map[string]claimsCacheEntry)
-}
-
 // ContextWithClaims stores the verified JWT claims into the request context.
 func ContextWithClaims(ctx context.Context, claims *auth.Claims) context.Context {
 	return context.WithValue(ctx, ClaimsContextKey, claims)
