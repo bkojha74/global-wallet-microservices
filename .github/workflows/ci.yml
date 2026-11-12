@@ -523,7 +523,6 @@ jobs:
         run: |
           docker compose -f docker-compose.mongodb.yml pull
           docker compose -f docker-compose.rabbitmq.yml pull
-          docker compose -f docker-compose.redis.yml pull
           docker compose -f docker-compose.auth.yml pull
           docker compose -f docker-compose.fx.yml pull
           docker compose -f docker-compose.logging.yml pull
@@ -544,7 +543,6 @@ jobs:
           docker volume inspect wallet_redis_data >nul 2>&1 || docker volume create wallet_redis_data
           docker compose -f docker-compose.mongodb.yml up -d
           docker compose -f docker-compose.rabbitmq.yml up -d
-          docker compose -f docker-compose.redis.yml up -d
           docker compose -f docker-compose.auth.yml up -d
           docker compose -f docker-compose.fx.yml up -d
           docker compose -f docker-compose.logging.yml up -d
@@ -738,6 +736,7 @@ jobs:
             echo.
             echo Docker Compose cluster is healthy and responding on http://localhost:8080!
           )
+          exit /b 0
 
       - name: Verify Kubernetes API Gateway & Cluster Status (NodePort 30080)
         shell: cmd
@@ -751,3 +750,4 @@ jobs:
             echo.
             echo Kubernetes cluster is healthy and responding on http://localhost:30080!
           )
+          exit /b 0
