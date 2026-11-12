@@ -346,11 +346,11 @@ Recent core banking additions (deposit payment rails `ACH`/`CARD`, withdrawal ra
 | **REQ-DIST-02** | `pkg/cache` | 🟡 P1 | AMQP Invalidation Bus auto-reconnect with full jitter exponential backoff | ✅ Completed |
 | **REQ-DIST-03** | `wallet-service` | 🟡 P1 | Enforce Standby Write Fencing across 100% of mutation RPCs | ✅ Completed |
 | **REQ-ASYNC-01**| `api-gateway` / `pkg/webhook` | 🟡 P1 | Decouple outbound partner webhooks to RabbitMQ quorum queues | ✅ Completed |
-| **REQ-SEC-02** | `api-gateway` / `ledger-service`| 🟡 P1 | Counterparty transaction-level ledger journal access control | Sprint 3 |
-| **REQ-SEC-03** | `auth-service` | 🟡 P1 | Keycloak backchannel logout & instant token revocation sync | Sprint 3 |
-| **REQ-DIST-01** | `docker-compose.yml` | 🟢 P2 | Include Redis L2 cache container by default in primary compose | Sprint 3 |
-| **REQ-ASYNC-02**| `wallet-service` | 🟢 P2 | Consolidate ledger outbox and audit outbox polling workers | Sprint 3 |
-| **REQ-DEV-02** | `api-gateway` / `bruno/` | 🟢 P2 | Complete OpenAPI 3.0 schema and Bruno E2E test suite alignment | Sprint 3 |
+| **REQ-SEC-02** | `api-gateway` / `ledger-service`| 🟡 P1 | Counterparty transaction-level ledger journal access control | ✅ Completed |
+| **REQ-SEC-03** | `auth-service` | 🟡 P1 | Keycloak backchannel logout & instant token revocation sync | ✅ Completed |
+| **REQ-DIST-01** | `docker-compose.yml` | 🟢 P2 | Include Redis L2 cache container by default in primary compose | ✅ Completed |
+| **REQ-ASYNC-02**| `wallet-service` | 🟢 P2 | Consolidate ledger outbox and audit outbox polling workers | ✅ Completed |
+| **REQ-DEV-02** | `api-gateway` / `bruno/` | 🟢 P2 | Complete OpenAPI 3.0 schema and Bruno E2E test suite alignment | ✅ Completed |
 
 ---
 

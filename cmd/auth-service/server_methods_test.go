@@ -211,4 +211,13 @@ func TestAuthServer_FullTokenLifecycle(t *testing.T) {
 	if err != nil || !revResp.Success {
 		t.Fatalf("RevokeToken failed: %v", err)
 	}
+
+	// 5. REQ-SEC-03: Revoke by Subject (Keycloak backchannel logout)
+	revSubResp, err := srv.RevokeToken(ctx, &authv1.RevokeTokenRequest{
+		Subject: "alice",
+		Reason:  "keycloak_backchannel_logout",
+	})
+	if err != nil || !revSubResp.Success {
+		t.Fatalf("RevokeToken by subject failed: %v", err)
+	}
 }

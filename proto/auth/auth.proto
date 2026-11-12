@@ -79,8 +79,9 @@ message RefreshTokenRequest {
 // ── Token Revocation ────────────────────────────────────────────────────────
 
 message RevokeTokenRequest {
-  string token  = 1; // access or refresh token
-  string reason = 2; // "logout", "admin_forced", "suspicious_activity"
+  string token   = 1; // access or refresh token
+  string reason  = 2; // "logout", "admin_forced", "suspicious_activity"
+  string subject = 3; // optional: explicitly revoke all active sessions for this subject
 }
 
 message RevokeTokenResponse {

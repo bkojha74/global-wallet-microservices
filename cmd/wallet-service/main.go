@@ -2226,14 +2226,14 @@ func dialLedgerClient(ledgerAddr string) (*grpc.ClientConn, ledgerv1.LedgerServi
 	return conn, ledgerv1.NewLedgerServiceClient(conn), nil
 }
 
-func initWalletOutbox(ctx context.Context, client *mongo.Client) (*observability.MongoOutbox, *observability.RabbitPublisher) {
+func initWalletOutbox(ctx context.Context, client *mongo.Client) (*observability.MongoOutbox, *observability.RabbitPublisher, *observability.OutboxRelay) {
 	if !observability.OutboxEnabled() {
-		return nil, nil
+		return nil, nil, nil
 	}
 	rabbitURL := os.Getenv("LOGGING_RABBITMQ_URL")
 	if rabbitURL == "" {
 		log.Println("[WALLET-SERVICE] LOGGING_OUTBOX_ENABLED=true but LOGGING_RABBITMQ_URL is not set — outbox disabled")
-		return nil, nil
+		return nil, nil, nil
 	}
 	log.Println("[WALLET-SERVICE] Transactional outbox ENABLED")
 	walletOutbox := observability.NewMongoOutbox(client.Database("banking_db"), "wallet_outbox")
@@ -2245,8 +2245,7 @@ func initWalletOutbox(ctx context.Context, client *mongo.Client) (*observability
 	tlsCfg, _ := observability.TLSConfigFromEnv()
 	outboxPublisher := observability.NewRabbitPublisherWithTLS(rabbitURL, "", tlsCfg)
 	relay := observability.NewOutboxRelay(client.Database("banking_db"), "wallet_outbox", outboxPublisher)
-	relay.Start(ctx)
-	return walletOutbox, outboxPublisher
+	return walletOutbox, outboxPublisher, relay
 }
 
 func startWalletMetricsServer(srv *server, region string, isActive bool) *http.Server {
@@ -2465,6 +2464,8 @@ func runWalletServer(ctx context.Context) error {
 		return fmt.Errorf("failed to setup gRPC server: %w", err)
 	}
 
+	walletOutbox, outboxPublisher, outboxRelay := initWalletOutbox(subCtx, client)
+
 	var ledgerRelay *LedgerRelay
 	if client != nil {
 		leaseTTL := 10 * time.Second
@@ -2476,11 +2477,17 @@ func runWalletServer(ctx context.Context) error {
 		db := client.Database("banking_db")
 		instanceID := observability.ResolveInstanceID()
 		leaseManager := NewMongoRelayLeaseManager(db, instanceID, leaseTTL)
-		ledgerRelay = NewLedgerRelay(db, ledgerClient, 2*time.Second, 50, nil, WithLeaseManager(leaseManager))
+		// REQ-ASYNC-02: Consolidated Single Outbox Engine
+		// Pass outboxRelay to LedgerRelay so both outbox collections are polled in lockstep
+		// by the elected leader pod, eliminating redundant polling queries on standby pods.
+		ledgerRelay = NewLedgerRelay(db, ledgerClient, 2*time.Second, 50, nil,
+			WithLeaseManager(leaseManager),
+			WithOutboxRelay(outboxRelay),
+		)
 		ledgerRelay.Start(subCtx)
+	} else if outboxRelay != nil {
+		outboxRelay.Start(subCtx)
 	}
-
-	walletOutbox, outboxPublisher := initWalletOutbox(subCtx, client)
 
 	// ── AI Fraud Detection (Phase AI-01) ─────────────────────────────────────
 	// NewClient returns nil (not an error) when GEMINI_API_KEY is not set,
