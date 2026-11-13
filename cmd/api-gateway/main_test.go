@@ -86,9 +86,15 @@ func (f *fakeWalletClient) WithdrawFunds(context.Context, *walletv1.WithdrawFund
 }
 
 type fakeLedgerClient struct {
-	getLedgerRequest  *ledgerv1.GetLedgerRequest
-	getLedgerResponse *ledgerv1.GetLedgerResponse
-	getLedgerError    error
+	getLedgerRequest        *ledgerv1.GetLedgerRequest
+	getLedgerResponse       *ledgerv1.GetLedgerResponse
+	getLedgerError          error
+	getTrialBalanceRequest  *ledgerv1.GetTrialBalanceRequest
+	getTrialBalanceResponse *ledgerv1.GetTrialBalanceResponse
+	getTrialBalanceError    error
+	generateEODRequest      *ledgerv1.GenerateEODReportRequest
+	generateEODResponse     *ledgerv1.GenerateEODReportResponse
+	generateEODError        error
 }
 
 func (f *fakeLedgerClient) RecordTransaction(context.Context, *ledgerv1.RecordTransactionRequest, ...grpc.CallOption) (*ledgerv1.RecordTransactionResponse, error) {
@@ -98,6 +104,31 @@ func (f *fakeLedgerClient) RecordTransaction(context.Context, *ledgerv1.RecordTr
 func (f *fakeLedgerClient) GetLedgerEntries(_ context.Context, req *ledgerv1.GetLedgerRequest, _ ...grpc.CallOption) (*ledgerv1.GetLedgerResponse, error) {
 	f.getLedgerRequest = req
 	return f.getLedgerResponse, f.getLedgerError
+}
+
+func (f *fakeLedgerClient) GetTrialBalance(_ context.Context, req *ledgerv1.GetTrialBalanceRequest, _ ...grpc.CallOption) (*ledgerv1.GetTrialBalanceResponse, error) {
+	f.getTrialBalanceRequest = req
+	if f.getTrialBalanceResponse != nil || f.getTrialBalanceError != nil {
+		return f.getTrialBalanceResponse, f.getTrialBalanceError
+	}
+	return &ledgerv1.GetTrialBalanceResponse{
+		IsBalanced: true,
+		Currency:   "USD",
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+	}, nil
+}
+
+func (f *fakeLedgerClient) GenerateEODReport(_ context.Context, req *ledgerv1.GenerateEODReportRequest, _ ...grpc.CallOption) (*ledgerv1.GenerateEODReportResponse, error) {
+	f.generateEODRequest = req
+	if f.generateEODResponse != nil || f.generateEODError != nil {
+		return f.generateEODResponse, f.generateEODError
+	}
+	return &ledgerv1.GenerateEODReportResponse{
+		ReportId:   "eod-rpt-123",
+		Date:       req.Date,
+		Verified:   true,
+		Camt053Xml: "<Document></Document>",
+	}, nil
 }
 
 func TestHandleTransferRejectsInvalidCurrency(t *testing.T) {
@@ -1269,5 +1300,169 @@ func TestHandleBackchannelLogout(t *testing.T) {
 	}
 	if fakeAuth.revokedReq == nil || fakeAuth.revokedReq.Subject != "bob" {
 		t.Fatalf("expected authClient.RevokeToken called with extracted subject=bob, got %+v", fakeAuth.revokedReq)
+	}
+}
+
+func TestHandleClearingISO20022(t *testing.T) {
+	fakeWallet := &fakeWalletClient{
+		transferFundsResponse: &walletv1.TransferFundsResponse{
+			Status:        walletv1.TransferFundsResponse_SUCCESS,
+			TransactionId: "txn-settled-999",
+		},
+	}
+	gw := &Gateway{
+		primaryClient: fakeWallet,
+		activeTarget:  "PRIMARY",
+	}
+
+	// 1. Success ACTC
+	validPacs008 := `<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:pacs.008.001.08">
+  <FIToFICstmrCdtTrf>
+    <GrpHdr>
+      <MsgId>MSG-2026-CLEAR-01</MsgId>
+      <CreDtTm>2026-11-13T10:00:00Z</CreDtTm>
+      <NbOfTxs>1</NbOfTxs>
+      <SttlmInf>
+        <SttlmMtd>CLRG</SttlmMtd>
+      </SttlmInf>
+    </GrpHdr>
+    <CdtTrfTxInf>
+      <PmtId>
+        <EndToEndId>E2E-2026-001</EndToEndId>
+        <TxId>TX-2026-001</TxId>
+      </PmtId>
+      <IntrBkSttlmAmt Ccy="EUR">250.00</IntrBkSttlmAmt>
+      <DbtrAgt>
+        <FinInstnId>
+          <BICFI>BARCGB22XXX</BICFI>
+        </FinInstnId>
+      </DbtrAgt>
+      <CdtrAgt>
+        <FinInstnId>
+          <BICFI>DEUTDEDDFXX</BICFI>
+        </FinInstnId>
+      </CdtrAgt>
+      <DbtrAcct>
+        <Id>
+          <IBAN>GB29NWBK60161331926819</IBAN>
+        </Id>
+      </DbtrAcct>
+      <CdtrAcct>
+        <Id>
+          <IBAN>DE89370400440532013000</IBAN>
+        </Id>
+      </CdtrAcct>
+    </CdtTrfTxInf>
+  </FIToFICstmrCdtTrf>
+</Document>`
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/clearing/iso20022", strings.NewReader(validPacs008))
+	rec := httptest.NewRecorder()
+	gw.handleClearingISO20022(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for valid pacs.008 clearing, got %d: %s", rec.Code, rec.Body.String())
+	}
+	bodyStr := rec.Body.String()
+	if !strings.Contains(bodyStr, "ACTC") {
+		t.Fatalf("expected pacs.002 ACTC in response, got: %s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "MSG-2026-CLEAR-01") {
+		t.Fatalf("expected original msg id in pacs.002, got: %s", bodyStr)
+	}
+
+	// 2. Invalid IBAN -> pacs.002 RJCT (AC01)
+	invalidIBANXml := strings.Replace(validPacs008, "GB29NWBK60161331926819", "GB99INVALIDIBAN12345", 1)
+	reqBadIBAN := httptest.NewRequest(http.MethodPost, "/api/v1/clearing/iso20022", strings.NewReader(invalidIBANXml))
+	recBadIBAN := httptest.NewRecorder()
+	gw.handleClearingISO20022(recBadIBAN, reqBadIBAN)
+
+	if recBadIBAN.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK with RJCT payload, got %d", recBadIBAN.Code)
+	}
+	if !strings.Contains(recBadIBAN.Body.String(), "RJCT") || !strings.Contains(recBadIBAN.Body.String(), "AC01") {
+		t.Fatalf("expected pacs.002 RJCT AC01 for invalid IBAN, got: %s", recBadIBAN.Body.String())
+	}
+
+	// 3. Malformed XML -> pacs.002 RJCT (FF01)
+	reqMalformed := httptest.NewRequest(http.MethodPost, "/api/v1/clearing/iso20022", strings.NewReader("<invalid>xml</broken>"))
+	recMalformed := httptest.NewRecorder()
+	gw.handleClearingISO20022(recMalformed, reqMalformed)
+
+	if recMalformed.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK with RJCT FF01, got %d", recMalformed.Code)
+	}
+	if !strings.Contains(recMalformed.Body.String(), "RJCT") || !strings.Contains(recMalformed.Body.String(), "FF01") {
+		t.Fatalf("expected pacs.002 RJCT FF01 for malformed XML, got: %s", recMalformed.Body.String())
+	}
+}
+
+func TestHandleTrialBalanceAndEOD(t *testing.T) {
+	fakeLedger := &fakeLedgerClient{
+		getTrialBalanceResponse: &ledgerv1.GetTrialBalanceResponse{
+			IsBalanced:       true,
+			TotalAssets:      100000,
+			TotalLiabilities: 80000,
+			TotalEquity:      20000,
+			Currency:         "USD",
+			Timestamp:        "2026-11-13T12:00:00Z",
+		},
+		generateEODResponse: &ledgerv1.GenerateEODReportResponse{
+			ReportId:   "eod-rpt-2026-11-13",
+			Date:       "2026-11-13",
+			Verified:   true,
+			Camt053Xml: "<camt.053>STATEMENT</camt.053>",
+		},
+	}
+	gw := &Gateway{ledgerClient: fakeLedger}
+
+	// 1. Trial balance as admin
+	adminCtx := ContextWithClaims(context.Background(), &auth.Claims{
+		Subject: "admin-user",
+		Roles:   []string{"admin"},
+	})
+	reqTB := httptest.NewRequest(http.MethodGet, "/api/v1/ledger/trial-balance?currency=USD", nil).WithContext(adminCtx)
+	recTB := httptest.NewRecorder()
+	gw.handleTrialBalance(recTB, reqTB)
+
+	if recTB.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for admin trial balance, got %d: %s", recTB.Code, recTB.Body.String())
+	}
+	var tbResp map[string]interface{}
+	if err := json.Unmarshal(recTB.Body.Bytes(), &tbResp); err != nil {
+		t.Fatalf("failed to decode trial balance json: %v", err)
+	}
+	if tbResp["is_balanced"] != true || tbResp["currency"] != "USD" {
+		t.Fatalf("unexpected trial balance response: %+v", tbResp)
+	}
+
+	// 2. Trial balance as non-admin -> 403 Forbidden
+	userCtx := ContextWithClaims(context.Background(), &auth.Claims{
+		Subject: "regular-user",
+		Roles:   []string{"user"},
+	})
+	reqTBForbidden := httptest.NewRequest(http.MethodGet, "/api/v1/ledger/trial-balance", nil).WithContext(userCtx)
+	recTBForbidden := httptest.NewRecorder()
+	gw.handleTrialBalance(recTBForbidden, reqTBForbidden)
+
+	if recTBForbidden.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for non-admin trial balance, got %d", recTBForbidden.Code)
+	}
+
+	// 3. EOD generation as admin
+	reqEOD := httptest.NewRequest(http.MethodPost, "/api/v1/ledger/eod", strings.NewReader(`{"date":"2026-11-13","currency":"USD"}`)).WithContext(adminCtx)
+	recEOD := httptest.NewRecorder()
+	gw.handleLedgerEOD(recEOD, reqEOD)
+
+	if recEOD.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for admin EOD generation, got %d: %s", recEOD.Code, recEOD.Body.String())
+	}
+	var eodResp map[string]interface{}
+	if err := json.Unmarshal(recEOD.Body.Bytes(), &eodResp); err != nil {
+		t.Fatalf("failed to decode EOD json: %v", err)
+	}
+	if eodResp["report_id"] != "eod-rpt-2026-11-13" || eodResp["verified"] != true {
+		t.Fatalf("unexpected EOD response: %+v", eodResp)
 	}
 }

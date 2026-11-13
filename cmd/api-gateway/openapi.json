@@ -63,6 +63,10 @@
     {
       "name": "Cluster Management",
       "description": "Multi-region failover and distributed routing control"
+    },
+    {
+      "name": "Global Clearing Rails",
+      "description": "ISO 20022 financial messaging engine, IBAN/BIC validation, and institutional clearing settlements"
     }
   ],
   "paths": {
@@ -771,6 +775,123 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/MerkleProofResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/ledger/trial-balance": {
+      "get": {
+        "tags": ["Ledger & Auditing"],
+        "summary": "Query GAAP/IFRS Trial Balance",
+        "description": "Calculates multi-tier chart of accounts balances and verifies ledger accounting equation (Assets = Liabilities + Equity + Revenue - Expenses). Admin role required.",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "currency",
+            "in": "query",
+            "required": false,
+            "description": "Optional ISO 4217 currency filter",
+            "schema": { "type": "string", "example": "USD" }
+          },
+          {
+            "name": "as_of",
+            "in": "query",
+            "required": false,
+            "description": "Optional cutoff date (YYYY-MM-DD)",
+            "schema": { "type": "string", "example": "2026-11-13" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Trial balance statement",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "is_balanced": { "type": "boolean" },
+                    "as_of": { "type": "string" },
+                    "currency": { "type": "string" },
+                    "total_assets": { "type": "integer" },
+                    "total_liabilities": { "type": "integer" },
+                    "total_equity": { "type": "integer" },
+                    "total_revenue": { "type": "integer" },
+                    "total_expenses": { "type": "integer" },
+                    "accounts": { "type": "array" }
+                  }
+                }
+              }
+            }
+          },
+          "403": { "description": "Forbidden - Admin role required" }
+        }
+      }
+    },
+    "/api/v1/ledger/eod": {
+      "post": {
+        "tags": ["Ledger & Auditing"],
+        "summary": "Execute End-of-Day Cutoff & CAMT.053 Report",
+        "description": "Performs institutional EOD cutoff, closes daily journals, validates trial balance parity, and generates certified ISO 20022 camt.053.001.08 bank statement XML. Admin role required.",
+        "security": [{ "BearerAuth": [] }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "date": { "type": "string", "example": "2026-11-13" },
+                  "currency": { "type": "string", "example": "USD" },
+                  "generated_by": { "type": "string", "example": "treasury-audit-admin" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "EOD report output with certified CAMT.053 XML",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "report_id": { "type": "string" },
+                    "date": { "type": "string" },
+                    "verified": { "type": "boolean" },
+                    "trial_balance": { "type": "object" },
+                    "camt053_xml": { "type": "string" },
+                    "error_message": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "403": { "description": "Forbidden - Admin role required" }
+        }
+      }
+    },
+    "/api/v1/clearing/iso20022": {
+      "post": {
+        "tags": ["Global Clearing Rails"],
+        "summary": "Ingest ISO 20022 Clearing Message (pacs.008)",
+        "description": "Ingests institutional ISO 20022 pacs.008.001.08 FI-to-FI credit transfer XML, executes ISO 13616 IBAN and ISO 9362 BIC validation, routes clearing settlement, and responds synchronously with ISO 20022 pacs.002.001.10 Payment Status Report (ACTC or RJCT).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/xml": {
+              "schema": { "type": "string" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ISO 20022 pacs.002.001.10 XML payment status report",
+            "content": {
+              "application/xml": {
+                "schema": { "type": "string" }
               }
             }
           }

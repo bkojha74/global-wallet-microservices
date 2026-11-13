@@ -1,0 +1,20 @@
+meta {
+  name: 02 - Readiness Probe
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/readyz
+  body: none
+  auth: none
+}
+
+vars:pre-request {
+  baseUrl: http://localhost:8080
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq READY
+}

@@ -1,0 +1,38 @@
+meta {
+  name: 01 - Alice Customer Login
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/api/v1/auth/login
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "username": "alice",
+    "password": "password123"
+  }
+}
+
+vars:pre-request {
+  baseUrl: http://localhost:8080
+}
+
+assert {
+  res.status: eq 200
+  res.body.access_token: isDefined
+}
+
+script:post-response {
+  if (res.getStatus() === 200) {
+    bru.setEnvVar("authToken", res.getBody().access_token);
+    bru.setEnvVar("refreshToken", res.getBody().refresh_token);
+  }
+}

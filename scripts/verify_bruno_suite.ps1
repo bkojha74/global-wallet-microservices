@@ -204,6 +204,35 @@ try {
     Record-Test "03-Idempotency-Replay-Transfer" "200 (Replay matched ID)" $_.Exception.Response.StatusCode.value__ $false $_.Message
 }
 
+try {
+    $pacsXml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:pacs.008.001.08">
+  <FIToFICstmrCdtTrf>
+    <GrpHdr>
+      <MsgId>MSG-BRUNO-001</MsgId>
+      <CreDtTm>2026-11-13T12:00:00Z</CreDtTm>
+      <NbOfTxs>1</NbOfTxs>
+      <SttlmInf><SttlmMtd>CLRG</SttlmMtd></SttlmInf>
+    </GrpHdr>
+    <CdtTrfTxInf>
+      <PmtId><EndToEndId>E2E-001</EndToEndId><TxId>TX-001</TxId></PmtId>
+      <IntrBkSttlmAmt Ccy="EUR">100.00</IntrBkSttlmAmt>
+      <DbtrAgt><FinInstnId><BICFI>BARCGB22XXX</BICFI></FinInstnId></DbtrAgt>
+      <CdtrAgt><FinInstnId><BICFI>DEUTDEDDFXX</BICFI></FinInstnId></CdtrAgt>
+      <DbtrAcct><Id><IBAN>GB29NWBK60161331926819</IBAN></Id></DbtrAcct>
+      <CdtrAcct><Id><IBAN>DE89370400440532013000</IBAN></Id></CdtrAcct>
+    </CdtTrfTxInf>
+  </FIToFICstmrCdtTrf>
+</Document>
+"@
+    $r = Invoke-WebRequest -Uri "$baseUrl/api/v1/clearing/iso20022" -Method Post -ContentType "application/xml" -Body $pacsXml
+    Record-Test "04-Ingest-ISO20022-Clearing" "200 XML" "$($r.StatusCode)" ($r.StatusCode -eq 200 -and ($r.Content -match "ACTC" -or $r.Content -match "RJCT")) "Response contains valid pacs.002 XML"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "04-Ingest-ISO20022-Clearing" "200 XML" "$code" $false $_.Message
+}
+
 # --- 07. Compliance & KYC ---
 try {
     $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/wallets/limits?wallet_id=alice_usd" -Method Get -Headers @{ Authorization = "Bearer $aliceToken" }
@@ -243,6 +272,21 @@ if ($sameTxnId) {
     } catch {
         Record-Test "03-Get-Ledger-By-TxnID-Counterparty" "200" $_.Exception.Response.StatusCode.value__ $false $_.Message
     }
+}
+
+try {
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/ledger/trial-balance?currency=USD" -Method Get -Headers @{ Authorization = "Bearer $adminToken" }
+    Record-Test "05-Get-Trial-Balance" "200" "200" ($null -ne $r.is_balanced -and $r.currency -eq "USD") "Balanced: $($r.is_balanced), Total Assets: $($r.total_assets)"
+} catch {
+    Record-Test "05-Get-Trial-Balance" "200" $_.Exception.Response.StatusCode.value__ $false $_.Message
+}
+
+try {
+    $eodBody = '{"date":"2026-11-13","currency":"USD","generated_by":"treasury-admin"}'
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/ledger/eod" -Method Post -ContentType "application/json" -Headers @{ Authorization = "Bearer $adminToken" } -Body $eodBody
+    Record-Test "06-Generate-EOD-Report" "200" "200" ($null -ne $r.report_id -and $r.verified -eq $true) "Report ID: $($r.report_id), Verified: $($r.verified)"
+} catch {
+    Record-Test "06-Generate-EOD-Report" "200" $_.Exception.Response.StatusCode.value__ $false $_.Message
 }
 
 # --- 09. Webhooks ---

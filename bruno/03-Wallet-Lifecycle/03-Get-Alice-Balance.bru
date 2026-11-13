@@ -1,0 +1,21 @@
+meta {
+  name: 03 - Get Alice Wallet Balance
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{baseUrl}}/api/v1/wallets/{{aliceWallet}}/balance
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{authToken}}
+}
+
+assert {
+  res.status: eq 200
+  res.body.wallet_id: eq {{aliceWallet}}
+  res.body.status: eq ACTIVE
+}

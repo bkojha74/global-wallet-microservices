@@ -1,0 +1,31 @@
+meta {
+  name: 01 - Create Alice USD Wallet
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/api/v1/wallets
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{authToken}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "wallet_id": "{{aliceWallet}}",
+    "currency": "USD",
+    "owner_id": "alice"
+  }
+}
+
+assert {
+  res.status: in [200, 409]
+}

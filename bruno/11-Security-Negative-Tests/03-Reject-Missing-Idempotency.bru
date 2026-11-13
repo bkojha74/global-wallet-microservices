@@ -1,0 +1,34 @@
+meta {
+  name: 03 - Negative: Reject Missing Idempotency Key
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/api/v1/wallets/deposit
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{authToken}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "wallet_id": "{{aliceWallet}}",
+    "amount": {
+      "units": 1000,
+      "currency": "USD"
+    },
+    "rail": "ACH"
+  }
+}
+
+assert {
+  res.status: eq 400
+}

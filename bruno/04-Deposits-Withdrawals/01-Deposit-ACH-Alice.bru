@@ -1,0 +1,37 @@
+meta {
+  name: 01 - Inbound Deposit ACH Alice
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/api/v1/wallets/deposit
+  body: json
+  auth: bearer
+}
+
+headers {
+  Content-Type: application/json
+  Idempotency-Key: dep_ach_alice_1001
+}
+
+auth:bearer {
+  token: {{authToken}}
+}
+
+body:json {
+  {
+    "wallet_id": "{{aliceWallet}}",
+    "amount": {
+      "units": 50000,
+      "currency": "USD"
+    },
+    "rail": "ACH",
+    "reference": "Payroll direct deposit"
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq SUCCESS
+}
