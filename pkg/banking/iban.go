@@ -66,7 +66,7 @@ func ValidateIBAN(raw string) error {
 		if char >= '0' && char <= '9' {
 			numericStr.WriteRune(char)
 		} else if char >= 'A' && char <= 'Z' {
-			numericStr.WriteString(fmt.Sprintf("%d", char-'A'+10))
+			fmt.Fprintf(&numericStr, "%d", char-'A'+10)
 		} else {
 			return ErrInvalidIBANFormat
 		}
@@ -111,7 +111,7 @@ func GenerateIBAN(countryCode, bban string) (string, error) {
 		if char >= '0' && char <= '9' {
 			numericStr.WriteRune(char)
 		} else if char >= 'A' && char <= 'Z' {
-			numericStr.WriteString(fmt.Sprintf("%d", char-'A'+10))
+			fmt.Fprintf(&numericStr, "%d", char-'A'+10)
 		} else {
 			return "", ErrInvalidIBANFormat
 		}
