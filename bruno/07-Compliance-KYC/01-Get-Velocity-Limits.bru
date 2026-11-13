@@ -1,0 +1,21 @@
+meta {
+  name: 01 - Get Velocity Limits
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/api/v1/wallets/limits?wallet_id={{aliceWallet}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{authToken}}
+}
+
+assert {
+  res.status: eq 200
+  res.body.wallet_id: eq {{aliceWallet}}
+  res.body.kyc_tier: isDefined
+}

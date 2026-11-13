@@ -1,0 +1,33 @@
+meta {
+  name: 02 - Upgrade KYC Tier Admin
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/api/v1/wallets/kyc
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{adminToken}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "wallet_id": "{{aliceWallet}}",
+    "kyc_tier": "TIER_2",
+    "verified_by": "Compliance_Officer_Bruno"
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq SUCCESS
+  res.body.kyc_tier: eq TIER_2
+}

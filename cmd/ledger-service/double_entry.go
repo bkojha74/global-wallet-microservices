@@ -41,11 +41,13 @@ const (
 
 // JournalPosting represents a single atomic leg of a double-entry financial entry.
 type JournalPosting struct {
-	AccountID   string           `bson:"account_id" json:"account_id"`
-	AccountType AccountType      `bson:"account_type" json:"account_type"`
-	Direction   PostingDirection `bson:"direction" json:"direction"`
-	Amount      int64            `bson:"amount" json:"amount"`
-	Currency    string           `bson:"currency" json:"currency"`
+	AccountID         string           `bson:"account_id" json:"account_id"`
+	AccountType       AccountType      `bson:"account_type" json:"account_type"`
+	Direction         PostingDirection `bson:"direction" json:"direction"`
+	Amount            int64            `bson:"amount" json:"amount"`
+	Currency          string           `bson:"currency" json:"currency"`
+	GLAccountCode     string           `bson:"gl_account_code,omitempty" json:"gl_account_code,omitempty"`
+	GLAccountCategory string           `bson:"gl_account_category,omitempty" json:"gl_account_category,omitempty"`
 }
 
 func accumulatePostingTotals(postings []JournalPosting) (map[string]int64, map[string]int64, error) {
@@ -122,20 +124,27 @@ func DetermineAccountType(accountID string) AccountType {
 // - Debit Source Liability or Asset (reduces liability to sender or increases clearing asset)
 // - Credit Destination Liability or Asset (increases liability to receiver or settles clearing asset)
 func CreateTransferPostings(sourceWalletID, destWalletID string, amount int64, currency string) ([]JournalPosting, error) {
+	srcGLCode, _, srcGLCat := MapAccountToGL(sourceWalletID, currency)
+	dstGLCode, _, dstGLCat := MapAccountToGL(destWalletID, currency)
+
 	postings := []JournalPosting{
 		{
-			AccountID:   sourceWalletID,
-			AccountType: DetermineAccountType(sourceWalletID),
-			Direction:   PostingDebit,
-			Amount:      amount,
-			Currency:    currency,
+			AccountID:         sourceWalletID,
+			AccountType:       DetermineAccountType(sourceWalletID),
+			Direction:         PostingDebit,
+			Amount:            amount,
+			Currency:          currency,
+			GLAccountCode:     srcGLCode,
+			GLAccountCategory: srcGLCat,
 		},
 		{
-			AccountID:   destWalletID,
-			AccountType: DetermineAccountType(destWalletID),
-			Direction:   PostingCredit,
-			Amount:      amount,
-			Currency:    currency,
+			AccountID:         destWalletID,
+			AccountType:       DetermineAccountType(destWalletID),
+			Direction:         PostingCredit,
+			Amount:            amount,
+			Currency:          currency,
+			GLAccountCode:     dstGLCode,
+			GLAccountCategory: dstGLCat,
 		},
 	}
 
@@ -185,34 +194,47 @@ func CreateMultiCurrencyTransferPostings(
 		return CreateTransferPostings(sourceWalletID, destWalletID, sourceAmount, sourceCurrency)
 	}
 
+	srcGLCode, _, srcGLCat := MapAccountToGL(sourceWalletID, sourceCurrency)
+	fxSrcGLCode, _, fxSrcGLCat := MapAccountToGL("FX_LIQUIDITY_POOL_"+sourceCurrency, sourceCurrency)
+	fxDstGLCode, _, fxDstGLCat := MapAccountToGL("FX_LIQUIDITY_POOL_"+destCurrency, destCurrency)
+	dstGLCode, _, dstGLCat := MapAccountToGL(destWalletID, destCurrency)
+
 	postings := []JournalPosting{
 		{
-			AccountID:   sourceWalletID,
-			AccountType: AccountTypeCustomerLiability,
-			Direction:   PostingDebit,
-			Amount:      sourceAmount,
-			Currency:    sourceCurrency,
+			AccountID:         sourceWalletID,
+			AccountType:       AccountTypeCustomerLiability,
+			Direction:         PostingDebit,
+			Amount:            sourceAmount,
+			Currency:          sourceCurrency,
+			GLAccountCode:     srcGLCode,
+			GLAccountCategory: srcGLCat,
 		},
 		{
-			AccountID:   "FX_LIQUIDITY_POOL_" + sourceCurrency,
-			AccountType: AccountTypeSettlementAsset,
-			Direction:   PostingCredit,
-			Amount:      sourceAmount,
-			Currency:    sourceCurrency,
+			AccountID:         "FX_LIQUIDITY_POOL_" + sourceCurrency,
+			AccountType:       AccountTypeSettlementAsset,
+			Direction:         PostingCredit,
+			Amount:            sourceAmount,
+			Currency:          sourceCurrency,
+			GLAccountCode:     fxSrcGLCode,
+			GLAccountCategory: fxSrcGLCat,
 		},
 		{
-			AccountID:   "FX_LIQUIDITY_POOL_" + destCurrency,
-			AccountType: AccountTypeSettlementAsset,
-			Direction:   PostingDebit,
-			Amount:      destAmount,
-			Currency:    destCurrency,
+			AccountID:         "FX_LIQUIDITY_POOL_" + destCurrency,
+			AccountType:       AccountTypeSettlementAsset,
+			Direction:         PostingDebit,
+			Amount:            destAmount,
+			Currency:          destCurrency,
+			GLAccountCode:     fxDstGLCode,
+			GLAccountCategory: fxDstGLCat,
 		},
 		{
-			AccountID:   destWalletID,
-			AccountType: AccountTypeCustomerLiability,
-			Direction:   PostingCredit,
-			Amount:      destAmount,
-			Currency:    destCurrency,
+			AccountID:         destWalletID,
+			AccountType:       AccountTypeCustomerLiability,
+			Direction:         PostingCredit,
+			Amount:            destAmount,
+			Currency:          destCurrency,
+			GLAccountCode:     dstGLCode,
+			GLAccountCategory: dstGLCat,
 		},
 	}
 
@@ -222,11 +244,29 @@ func CreateMultiCurrencyTransferPostings(
 	return postings, nil
 }
 
+type canonicalPosting struct {
+	AccountID   string           `json:"account_id"`
+	AccountType AccountType      `json:"account_type"`
+	Direction   PostingDirection `json:"direction"`
+	Amount      int64            `json:"amount"`
+	Currency    string           `json:"currency"`
+}
+
 // ComputeEntryHash produces an immutable SHA-256 cryptographic hash of the journal entry,
 // mathematically sealing the sequence number, transaction IDs, timestamp, double-entry postings,
 // and the previous entry hash.
 func ComputeEntryHash(previousHash string, sequenceNumber int64, txID, idempKey string, ts time.Time, postings []JournalPosting) string {
-	postingsBytes, _ := json.Marshal(postings)
+	canonicalPostings := make([]canonicalPosting, len(postings))
+	for i, p := range postings {
+		canonicalPostings[i] = canonicalPosting{
+			AccountID:   p.AccountID,
+			AccountType: p.AccountType,
+			Direction:   p.Direction,
+			Amount:      p.Amount,
+			Currency:    p.Currency,
+		}
+	}
+	postingsBytes, _ := json.Marshal(canonicalPostings)
 	canonical := fmt.Sprintf("%s|%d|%s|%s|%d|%s",
 		previousHash,
 		sequenceNumber,

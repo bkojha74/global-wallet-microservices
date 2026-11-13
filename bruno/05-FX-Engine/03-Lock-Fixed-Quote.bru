@@ -1,0 +1,39 @@
+meta {
+  name: 03 - Lock Fixed-Rate FX Quote
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/api/v1/fx/quotes
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{authToken}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "source_currency": "USD",
+    "target_currency": "EUR",
+    "source_units": 10000
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.quote_id: isDefined
+  res.body.status: eq LOCKED
+}
+
+script:post-response {
+  if (res.getStatus() === 200) {
+    bru.setEnvVar("quoteId", res.getBody().quote_id);
+  }
+}

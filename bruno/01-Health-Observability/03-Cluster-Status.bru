@@ -1,0 +1,21 @@
+meta {
+  name: 03 - Cluster Status
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{baseUrl}}/api/v1/cluster/status
+  body: none
+  auth: none
+}
+
+vars:pre-request {
+  baseUrl: http://localhost:8080
+}
+
+assert {
+  res.status: eq 200
+  res.body.active_target: isDefined
+  res.body.region: isDefined
+}

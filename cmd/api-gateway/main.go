@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -30,8 +31,10 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 
 	"wallet-system/pkg/auth"
+	"wallet-system/pkg/banking"
 	"wallet-system/pkg/coordinator"
 	"wallet-system/pkg/db"
+	"wallet-system/pkg/iso20022"
 	"wallet-system/pkg/observability"
 	"wallet-system/pkg/resilience"
 	"wallet-system/pkg/tlsutil"
@@ -1667,6 +1670,287 @@ func (g *Gateway) handleLedgerMerkle(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
+// REQ-GL-01 & REQ-GL-02: handleTrialBalance returns the multi-tier GAAP/IFRS Chart of Accounts balances.
+func (g *Gateway) handleTrialBalance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	claims, hasClaims := ClaimsFromContext(r.Context())
+	if hasClaims && claims != nil {
+		if !claims.HasRole(auth.RoleAdmin) && !claims.HasScope("ledger:admin") && !claims.HasScope("wallet:admin") {
+			writeAuthError(w, http.StatusForbidden, "Admin role required to view GAAP/IFRS trial balance")
+			return
+		}
+	}
+
+	asOf := strings.TrimSpace(r.URL.Query().Get("as_of"))
+	if asOf == "" {
+		asOf = strings.TrimSpace(r.URL.Query().Get("as_of_date"))
+	}
+	currency := strings.TrimSpace(r.URL.Query().Get("currency"))
+
+	correlation := observability.FromHTTPRequest(r)
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	callCtx = withOutgoingAuthContext(observability.WithOutgoingMetadata(callCtx, correlation))
+
+	resp, err := g.ledgerClient.GetTrialBalance(callCtx, &ledgerv1.GetTrialBalanceRequest{
+		AsOfDate: asOf,
+		Currency: currency,
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Trial balance query failure: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"is_balanced":       resp.IsBalanced,
+		"as_of":             resp.Timestamp,
+		"currency":          resp.Currency,
+		"total_assets":      resp.TotalAssets,
+		"total_liabilities": resp.TotalLiabilities,
+		"total_equity":      resp.TotalEquity,
+		"total_revenue":     resp.TotalRevenue,
+		"total_expenses":    resp.TotalExpenses,
+		"accounts":          resp.Accounts,
+	})
+}
+
+// REQ-GL-02: handleLedgerEOD executes the end-of-day cutoff, verifies trial balance and exports certified CAMT.053 XML.
+func (g *Gateway) handleLedgerEOD(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	claims, hasClaims := ClaimsFromContext(r.Context())
+	if hasClaims && claims != nil {
+		if !claims.HasRole(auth.RoleAdmin) && !claims.HasScope("ledger:admin") && !claims.HasScope("wallet:admin") {
+			writeAuthError(w, http.StatusForbidden, "Admin role required to execute End-of-Day cutoff and CAMT.053 reporting")
+			return
+		}
+	}
+
+	var req struct {
+		Date        string `json:"date"`
+		Currency    string `json:"currency"`
+		GeneratedBy string `json:"generated_by"`
+		PerformedBy string `json:"performed_by"`
+	}
+	if r.Body != nil {
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if len(body) > 0 {
+			_ = json.Unmarshal(body, &req)
+		}
+	}
+
+	if req.Date == "" {
+		req.Date = time.Now().UTC().Format("2006-01-02")
+	}
+	genBy := req.GeneratedBy
+	if genBy == "" {
+		genBy = req.PerformedBy
+	}
+	if genBy == "" && hasClaims && claims != nil {
+		genBy = claims.Subject
+	}
+	if genBy == "" {
+		genBy = "system-treasury-admin"
+	}
+
+	correlation := observability.FromHTTPRequest(r)
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	callCtx = withOutgoingAuthContext(observability.WithOutgoingMetadata(callCtx, correlation))
+
+	resp, err := g.ledgerClient.GenerateEODReport(callCtx, &ledgerv1.GenerateEODReportRequest{
+		Date:        req.Date,
+		Currency:    req.Currency,
+		GeneratedBy: genBy,
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("EOD cutoff generation failure: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"report_id":     resp.ReportId,
+		"date":          resp.Date,
+		"verified":      resp.Verified,
+		"trial_balance": resp.TrialBalance,
+		"camt053_xml":   resp.Camt053Xml,
+		"error_message": resp.ErrorMessage,
+	})
+}
+
+// REQ-ISO-01 & REQ-ISO-02: handleClearingISO20022 ingests pacs.008 credit transfers and returns pacs.002 payment status reports.
+func (g *Gateway) handleClearingISO20022(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to read request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	doc, err := iso20022.ParsePacs008(body)
+	if err != nil {
+		pacs002Xml, bErr := iso20022.BuildPacs002("UNKNOWN", "UNKNOWN", "RJCT", "FF01", fmt.Sprintf("Malformed ISO 20022 XML: %v", err))
+		if bErr != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(pacs002Xml)
+		return
+	}
+
+	msgID := doc.FIToFICstmrCdtTrf.GrpHdr.MsgId
+	if len(doc.FIToFICstmrCdtTrf.CdtTrfTxInf) == 0 {
+		pacs002Xml, _ := iso20022.BuildPacs002(msgID, "N/A", "RJCT", "FF01", "Missing CreditTransferTransactionInformation")
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(pacs002Xml)
+		return
+	}
+
+	txInf := doc.FIToFICstmrCdtTrf.CdtTrfTxInf[0]
+	txID := txInf.PmtId.TxId
+	if txID == "" {
+		txID = txInf.PmtId.EndToEndId
+	}
+
+	dbtrIBAN := txInf.DbtrAcct.Id.IBAN
+	if dbtrIBAN == "" {
+		dbtrIBAN = txInf.DbtrAcct.Id.Othr.Id
+	}
+	cdtrIBAN := txInf.CdtrAcct.Id.IBAN
+	if cdtrIBAN == "" {
+		cdtrIBAN = txInf.CdtrAcct.Id.Othr.Id
+	}
+
+	// Validate IBAN formats if provided
+	if dbtrIBAN != "" {
+		if err := banking.ValidateIBAN(dbtrIBAN); err != nil {
+			pacs002Xml, _ := iso20022.BuildPacs002(msgID, txID, "RJCT", "AC01", fmt.Sprintf("Debtor IBAN invalid: %v", err))
+			w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(pacs002Xml)
+			return
+		}
+	}
+	if cdtrIBAN != "" {
+		if err := banking.ValidateIBAN(cdtrIBAN); err != nil {
+			pacs002Xml, _ := iso20022.BuildPacs002(msgID, txID, "RJCT", "AC01", fmt.Sprintf("Creditor IBAN invalid: %v", err))
+			w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(pacs002Xml)
+			return
+		}
+	}
+
+	// Validate BICs
+	if txInf.DbtrAgt.FinInstnId.BICFI != "" {
+		if err := banking.ValidateBIC(txInf.DbtrAgt.FinInstnId.BICFI); err != nil {
+			pacs002Xml, _ := iso20022.BuildPacs002(msgID, txID, "RJCT", "AC04", fmt.Sprintf("Debtor Agent BIC invalid: %v", err))
+			w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(pacs002Xml)
+			return
+		}
+	}
+	if txInf.CdtrAgt.FinInstnId.BICFI != "" {
+		if err := banking.ValidateBIC(txInf.CdtrAgt.FinInstnId.BICFI); err != nil {
+			pacs002Xml, _ := iso20022.BuildPacs002(msgID, txID, "RJCT", "AC04", fmt.Sprintf("Creditor Agent BIC invalid: %v", err))
+			w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(pacs002Xml)
+			return
+		}
+	}
+
+	currency := txInf.IntrBkSttlmAmt.Ccy
+	amountVal := txInf.IntrBkSttlmAmt.Value
+	if amountVal <= 0 {
+		pacs002Xml, _ := iso20022.BuildPacs002(msgID, txID, "RJCT", "AM04", "Settlement amount must be positive")
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(pacs002Xml)
+		return
+	}
+
+	units := int64(math.Round(amountVal * 100))
+
+	correlation := observability.FromHTTPRequest(r)
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	client, _ := g.getActiveWalletClient(ctx)
+
+	callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	callCtx = withOutgoingAuthContext(observability.WithOutgoingMetadata(callCtx, correlation))
+
+	transferReq := &walletv1.TransferFundsRequest{
+		IdempotencyKey:      msgID,
+		SourceWalletId:      dbtrIBAN,
+		DestinationWalletId: cdtrIBAN,
+		Amount: &walletv1.Money{
+			Currency: currency,
+			Units:    units,
+			Nanos:    0,
+		},
+	}
+
+	resp, err := client.TransferFunds(callCtx, transferReq)
+	if err != nil {
+		reasonCode := "AC01"
+		if st, ok := status.FromError(err); ok {
+			switch st.Code() {
+			case codes.FailedPrecondition, codes.ResourceExhausted:
+				reasonCode = "AM04"
+			case codes.NotFound, codes.InvalidArgument:
+				reasonCode = "AC01"
+			default:
+				reasonCode = "RR04"
+			}
+		}
+		pacs002Xml, _ := iso20022.BuildPacs002(msgID, txID, "RJCT", reasonCode, err.Error())
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(pacs002Xml)
+		return
+	}
+
+	if resp.Status != walletv1.TransferFundsResponse_SUCCESS {
+		reasonCode := "AM04"
+		if strings.Contains(strings.ToLower(resp.ErrorMessage), "not found") {
+			reasonCode = "AC01"
+		}
+		pacs002Xml, _ := iso20022.BuildPacs002(msgID, txID, "RJCT", reasonCode, resp.ErrorMessage)
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(pacs002Xml)
+		return
+	}
+
+	pacs002Xml, err := iso20022.BuildPacs002(msgID, resp.TransactionId, "ACTC", "", "")
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to generate pacs.002: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(pacs002Xml)
+}
+
 func (g *Gateway) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	correlation := observability.FromHTTPRequest(r)
 	ctx := observability.WithCorrelation(r.Context(), correlation)
@@ -2465,8 +2749,11 @@ func registerGatewayRoutes(mux *http.ServeMux, gw *Gateway) {
 	mux.HandleFunc("/api/v1/webhooks/test", gw.handleWebhookTest)
 	mux.HandleFunc("/api/v1/transfers", gw.handleTransfer)
 	mux.HandleFunc("/api/v1/ledger", gw.handleLedger)
+	mux.HandleFunc("/api/v1/ledger/trial-balance", gw.handleTrialBalance)
+	mux.HandleFunc("/api/v1/ledger/eod", gw.handleLedgerEOD)
 	mux.HandleFunc("/api/v1/ledger/merkle", gw.handleLedgerMerkle)
 	mux.HandleFunc("/api/v1/ledger/merkle/", gw.handleLedgerMerkle)
+	mux.HandleFunc("/api/v1/clearing/iso20022", gw.handleClearingISO20022)
 	mux.HandleFunc("/api/v1/fx/currencies", gw.handleFXCurrencies)
 	mux.HandleFunc("/api/v1/fx/rates", gw.handleFXRates)
 	mux.HandleFunc("/api/v1/fx/quotes", gw.handleFXQuotes)
@@ -2513,6 +2800,7 @@ func wrapGatewayMiddleware(handler http.Handler, gw *Gateway) http.Handler {
 		"/api/v1/ledger/merkle/proof":       true,
 		"/api/v1/fx/currencies":             true,
 		"/api/v1/fx/rates":                  true,
+		"/api/v1/clearing/iso20022":         true,
 	}
 
 	if os.Getenv("ENABLE_DEV_TOKEN_ENDPOINT") == "true" {

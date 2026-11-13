@@ -6,6 +6,8 @@ option go_package = "wallet-system/proto/ledger;ledgerv1";
 service LedgerService {
   rpc RecordTransaction (RecordTransactionRequest) returns (RecordTransactionResponse);
   rpc GetLedgerEntries (GetLedgerRequest) returns (GetLedgerResponse);
+  rpc GetTrialBalance (GetTrialBalanceRequest) returns (GetTrialBalanceResponse);
+  rpc GenerateEODReport (GenerateEODReportRequest) returns (GenerateEODReportResponse);
 }
 
 message LedgerEntry {
@@ -21,6 +23,8 @@ message LedgerEntry {
   string destination_currency = 10;
   double exchange_rate = 11;
   string fx_quote_id = 12;
+  string gl_account_code = 13;
+  string gl_account_category = 14;
 }
 
 message RecordTransactionRequest {
@@ -35,6 +39,8 @@ message RecordTransactionRequest {
   string destination_currency = 9;
   double exchange_rate = 10;
   string fx_quote_id = 11;
+  string gl_account_code = 12;
+  string gl_account_category = 13;
 }
 
 message RecordTransactionResponse {
@@ -54,4 +60,46 @@ message GetLedgerResponse {
   repeated LedgerEntry entries = 1;
   string next_page_token = 2;
   int64 total_count = 3;
+}
+
+message GLAccountSummary {
+  string gl_account_code = 1;
+  string gl_account_name = 2;
+  string category = 3; // "ASSET", "LIABILITY", "EQUITY", "REVENUE", "EXPENSE"
+  int64 total_debits = 4;
+  int64 total_credits = 5;
+  int64 net_balance = 6;
+  string currency = 7;
+}
+
+message GetTrialBalanceRequest {
+  string currency = 1;
+  string as_of_date = 2; // YYYY-MM-DD
+}
+
+message GetTrialBalanceResponse {
+  repeated GLAccountSummary accounts = 1;
+  int64 total_assets = 2;
+  int64 total_liabilities = 3;
+  int64 total_equity = 4;
+  int64 total_revenue = 5;
+  int64 total_expenses = 6;
+  bool is_balanced = 7;
+  string currency = 8;
+  string timestamp = 9;
+}
+
+message GenerateEODReportRequest {
+  string date = 1; // YYYY-MM-DD
+  string currency = 2;
+  string generated_by = 3;
+}
+
+message GenerateEODReportResponse {
+  string report_id = 1;
+  string date = 2;
+  GetTrialBalanceResponse trial_balance = 3;
+  string camt053_xml = 4;
+  bool verified = 5;
+  string error_message = 6;
 }

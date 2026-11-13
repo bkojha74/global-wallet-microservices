@@ -1,0 +1,37 @@
+meta {
+  name: 03 - Outbound Withdrawal SEPA Bob
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/api/v1/wallets/withdraw
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{adminToken}}
+}
+
+headers {
+  Content-Type: application/json
+  Idempotency-Key: wth_sepa_bob_1003
+}
+
+body:json {
+  {
+    "wallet_id": "{{bobWallet}}",
+    "amount": {
+      "units": 10000,
+      "currency": "EUR"
+    },
+    "rail": "SEPA",
+    "reference": "SEPA Payout to Bank"
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq SUCCESS
+}
