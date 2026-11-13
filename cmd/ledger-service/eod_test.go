@@ -144,4 +144,3 @@ func TestEODAndTrialBalance(t *testing.T) {
 		}
 	})
 }
-
