@@ -1,0 +1,44 @@
+meta {
+  name: 03 - Transfer with Travel Rule
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/api/v1/transfers
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{authToken}}
+}
+
+body:json {
+  {
+    "source_wallet_id": "{{aliceWallet}}",
+    "destination_wallet_id": "{{bobWallet}}",
+    "amount": 150000,
+    "currency": "USD",
+    "travel_rule": {
+      "originator": {
+        "legal_name": "Alice Wonderland Corp",
+        "account_number": "{{aliceWallet}}",
+        "national_id": "US-TAX-12345",
+        "country": "US"
+      },
+      "beneficiary": {
+        "legal_name": "Bob Builder Ltd",
+        "account_number": "{{bobWallet}}",
+        "national_id": "GB-CO-67890",
+        "country": "GB"
+      }
+    }
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.transaction_id: isDefined
+  res.body.status: eq SUCCESS
+}

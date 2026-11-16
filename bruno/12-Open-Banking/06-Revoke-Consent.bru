@@ -1,0 +1,16 @@
+meta {
+  name: 06 - Revoke Consent
+  type: http
+  seq: 6
+}
+
+delete {
+  url: {{baseUrl}}/api/v1/open-banking/consents?consent_id={{consentId}}
+  body: none
+  auth: none
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq REVOKED
+}
