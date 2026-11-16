@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,7 +17,9 @@ import (
 	"google.golang.org/grpc/status"
 
 	"wallet-system/pkg/auth"
+	"wallet-system/pkg/banking"
 	"wallet-system/pkg/coordinator"
+	"wallet-system/pkg/openbanking"
 	authv1 "wallet-system/proto/auth"
 	ledgerv1 "wallet-system/proto/ledger"
 	walletv1 "wallet-system/proto/wallet"
@@ -1464,5 +1467,320 @@ func TestHandleTrialBalanceAndEOD(t *testing.T) {
 	}
 	if eodResp["report_id"] != "eod-rpt-2026-11-13" || eodResp["verified"] != true {
 		t.Fatalf("unexpected EOD response: %+v", eodResp)
+	}
+}
+
+func TestHandleTransfer_TravelRuleEnforcement(t *testing.T) {
+	fakeClient := &fakeWalletClient{
+		transferFundsResponse: &walletv1.TransferFundsResponse{
+			Status:        walletv1.TransferFundsResponse_SUCCESS,
+			TransactionId: "tx-tr-12345",
+		},
+	}
+	gw := &Gateway{primaryClient: fakeClient}
+
+	// 1. Transfer >= $1,000 without travel rule payload -> 400 Bad Request
+	reqWithoutTR := httptest.NewRequest(http.MethodPost, "/api/v1/transfers", strings.NewReader(`{
+		"source_wallet_id": "wallet-alice",
+		"destination_wallet_id": "wallet-bob",
+		"amount": 150000,
+		"currency": "USD"
+	}`))
+	recWithoutTR := httptest.NewRecorder()
+	gw.handleTransfer(recWithoutTR, reqWithoutTR)
+
+	if recWithoutTR.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for >= $1000 transfer without travel rule, got %d: %s", recWithoutTR.Code, recWithoutTR.Body.String())
+	}
+	var errResp map[string]interface{}
+	if err := json.Unmarshal(recWithoutTR.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if errResp["travel_rule_violation"] != true {
+		t.Fatalf("expected travel_rule_violation: true, got %+v", errResp)
+	}
+
+	// 2. Transfer >= $1,000 with valid travel rule payload -> 200 OK
+	validTRBody := `{
+		"source_wallet_id": "wallet-alice",
+		"destination_wallet_id": "wallet-bob",
+		"amount": 150000,
+		"currency": "USD",
+		"travel_rule": {
+			"originator": {
+				"legal_name": "Alice Wonderland Corp",
+				"account_number": "wallet-alice",
+				"national_id": "US-TAX-12345",
+				"country": "US"
+			},
+			"beneficiary": {
+				"legal_name": "Bob Builder Ltd",
+				"account_number": "wallet-bob",
+				"national_id": "GB-CO-67890",
+				"country": "GB"
+			}
+		}
+	}`
+	reqWithTR := httptest.NewRequest(http.MethodPost, "/api/v1/transfers", strings.NewReader(validTRBody))
+	recWithTR := httptest.NewRecorder()
+	gw.handleTransfer(recWithTR, reqWithTR)
+
+	if recWithTR.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for >= $1000 transfer with valid travel rule, got %d: %s", recWithTR.Code, recWithTR.Body.String())
+	}
+
+	// 3. Transfer < $1,000 without travel rule -> 200 OK
+	reqBelowThreshold := httptest.NewRequest(http.MethodPost, "/api/v1/transfers", strings.NewReader(`{
+		"source_wallet_id": "wallet-alice",
+		"destination_wallet_id": "wallet-bob",
+		"amount": 50000,
+		"currency": "USD"
+	}`))
+	recBelowThreshold := httptest.NewRecorder()
+	gw.handleTransfer(recBelowThreshold, reqBelowThreshold)
+
+	if recBelowThreshold.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for < $1000 transfer without travel rule, got %d: %s", recBelowThreshold.Code, recBelowThreshold.Body.String())
+	}
+}
+
+func TestHandleTransfer_SanctionsBlocking(t *testing.T) {
+	fakeClient := &fakeWalletClient{
+		transferFundsResponse: &walletv1.TransferFundsResponse{
+			Status:        walletv1.TransferFundsResponse_SUCCESS,
+			TransactionId: "tx-sanc-clean",
+		},
+	}
+	gw := &Gateway{primaryClient: fakeClient}
+
+	// 1. Blocked originator
+	blockedOrigBody := `{
+		"source_wallet_id": "wallet-alice",
+		"destination_wallet_id": "wallet-bob",
+		"amount": 200000,
+		"currency": "USD",
+		"travel_rule": {
+			"originator": {
+				"legal_name": "EVIL CORP CYBER SYNDICATE",
+				"account_number": "wallet-alice",
+				"national_id": "RU-CYBER-1001",
+				"country": "RU"
+			},
+			"beneficiary": {
+				"legal_name": "Clean Merchant Inc",
+				"account_number": "wallet-bob",
+				"national_id": "US-TAX-9999",
+				"country": "US"
+			}
+		}
+	}`
+	reqOrigBlocked := httptest.NewRequest(http.MethodPost, "/api/v1/transfers", strings.NewReader(blockedOrigBody))
+	recOrigBlocked := httptest.NewRecorder()
+	gw.handleTransfer(recOrigBlocked, reqOrigBlocked)
+
+	if recOrigBlocked.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for sanctioned originator, got %d: %s", recOrigBlocked.Code, recOrigBlocked.Body.String())
+	}
+	var origResp map[string]interface{}
+	if err := json.Unmarshal(recOrigBlocked.Body.Bytes(), &origResp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if origResp["sanctions_blocked"] != true {
+		t.Fatalf("expected sanctions_blocked: true, got %+v", origResp)
+	}
+
+	// 2. Blocked beneficiary
+	blockedBenefBody := `{
+		"source_wallet_id": "wallet-alice",
+		"destination_wallet_id": "wallet-bob",
+		"amount": 200000,
+		"currency": "USD",
+		"travel_rule": {
+			"originator": {
+				"legal_name": "Alice Clean Corp",
+				"account_number": "wallet-alice",
+				"national_id": "US-TAX-1111",
+				"country": "US"
+			},
+			"beneficiary": {
+				"legal_name": "AL-QALAM WEAPONS LOGISTICS",
+				"account_number": "wallet-bob",
+				"national_id": "SY-WPN-1002",
+				"country": "SY"
+			}
+		}
+	}`
+	reqBenefBlocked := httptest.NewRequest(http.MethodPost, "/api/v1/transfers", strings.NewReader(blockedBenefBody))
+	recBenefBlocked := httptest.NewRecorder()
+	gw.handleTransfer(recBenefBlocked, reqBenefBlocked)
+
+	if recBenefBlocked.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for sanctioned beneficiary, got %d: %s", recBenefBlocked.Code, recBenefBlocked.Body.String())
+	}
+}
+
+func TestHandleVirtualIBANs(t *testing.T) {
+	gw := &Gateway{}
+
+	// 1. Issue a DE virtual IBAN
+	reqPost := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/w-euro-1/vibans", strings.NewReader(`{
+		"country_code": "DE",
+		"currency": "EUR"
+	}`))
+	recPost := httptest.NewRecorder()
+	gw.handleWalletVIBANs(recPost, reqPost, "w-euro-1")
+
+	if recPost.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for vIBAN issuance, got %d: %s", recPost.Code, recPost.Body.String())
+	}
+	var createdVIBAN banking.VirtualIBAN
+	if err := json.Unmarshal(recPost.Body.Bytes(), &createdVIBAN); err != nil {
+		t.Fatalf("failed to parse vIBAN response: %v", err)
+	}
+	if !strings.HasPrefix(createdVIBAN.IBAN, "DE") || createdVIBAN.WalletID != "w-euro-1" {
+		t.Fatalf("unexpected vIBAN created: %+v", createdVIBAN)
+	}
+
+	// 2. List vIBANs for wallet
+	reqGet := httptest.NewRequest(http.MethodGet, "/api/v1/wallets/w-euro-1/vibans", nil)
+	recGet := httptest.NewRecorder()
+	gw.handleWalletVIBANs(recGet, reqGet, "w-euro-1")
+
+	if recGet.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for vIBAN listing, got %d: %s", recGet.Code, recGet.Body.String())
+	}
+	var listResp struct {
+		VIBANs []*banking.VirtualIBAN `json:"vibans"`
+		Count  int                    `json:"count"`
+	}
+	if err := json.Unmarshal(recGet.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("failed to parse vIBAN list: %v", err)
+	}
+	if listResp.Count != 1 || listResp.VIBANs[0].IBAN != createdVIBAN.IBAN {
+		t.Fatalf("unexpected vIBAN list: %+v", listResp)
+	}
+
+	// 3. Lookup vIBAN by IBAN via /api/v1/wallets/vibans?iban=...
+	reqLookup := httptest.NewRequest(http.MethodGet, "/api/v1/wallets/vibans?iban="+createdVIBAN.IBAN, nil)
+	recLookup := httptest.NewRecorder()
+	gw.handleVirtualIBANs(recLookup, reqLookup)
+
+	if recLookup.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for vIBAN lookup, got %d: %s", recLookup.Code, recLookup.Body.String())
+	}
+
+	// 4. Revoke vIBAN
+	reqDel := httptest.NewRequest(http.MethodDelete, "/api/v1/wallets/w-euro-1/vibans?iban="+createdVIBAN.IBAN, nil)
+	recDel := httptest.NewRecorder()
+	gw.handleWalletVIBANs(recDel, reqDel, "w-euro-1")
+
+	if recDel.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for vIBAN revocation, got %d: %s", recDel.Code, recDel.Body.String())
+	}
+}
+
+func TestOpenBankingConsentAndAISP_PISP(t *testing.T) {
+	fakeClient := &fakeWalletClient{
+		getBalanceResponse: &walletv1.GetBalanceResponse{
+			WalletId: "w-ob-1",
+			Balances: []*walletv1.Money{
+				{Currency: "GBP", Units: 500000},
+			},
+		},
+		transferFundsResponse: &walletv1.TransferFundsResponse{
+			Status:        walletv1.TransferFundsResponse_SUCCESS,
+			TransactionId: "ob-payment-tx-999",
+		},
+	}
+	gw := &Gateway{primaryClient: fakeClient}
+
+	// 1. Create Open Banking consent
+	createConsentBody := `{
+		"client_tpp_id": "monzo-bank-tpp",
+		"wallet_ids": ["w-ob-1"],
+		"permissions": ["ReadAccountsDetail", "ReadBalances", "CreatePaymentInitiation"]
+	}`
+	reqConsent := httptest.NewRequest(http.MethodPost, "/api/v1/open-banking/consents", strings.NewReader(createConsentBody))
+	recConsent := httptest.NewRecorder()
+	gw.handleOpenBankingConsents(recConsent, reqConsent)
+
+	if recConsent.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for consent creation, got %d: %s", recConsent.Code, recConsent.Body.String())
+	}
+	var consent openbanking.Consent
+	if err := json.Unmarshal(recConsent.Body.Bytes(), &consent); err != nil {
+		t.Fatalf("failed to decode consent: %v", err)
+	}
+	if consent.Status != openbanking.StatusAwaitingAuthorisation {
+		t.Fatalf("expected StatusAwaitingAuthorisation, got %s", consent.Status)
+	}
+
+	// 2. Authorise consent
+	reqAuth := httptest.NewRequest(http.MethodPost, "/api/v1/open-banking/consents/authorise", strings.NewReader(fmt.Sprintf(`{
+		"consent_id": "%s",
+		"user_id": "cust-openbanking-user"
+	}`, consent.ConsentID)))
+	recAuth := httptest.NewRecorder()
+	gw.handleOpenBankingConsentAuthorise(recAuth, reqAuth)
+
+	if recAuth.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for consent authorise, got %d: %s", recAuth.Code, recAuth.Body.String())
+	}
+
+	// 3. AISP: Read Accounts Detail
+	reqAcc := httptest.NewRequest(http.MethodGet, "/api/v1/open-banking/accounts", nil)
+	reqAcc.Header.Set("Consent-ID", consent.ConsentID)
+	recAcc := httptest.NewRecorder()
+	gw.handleOpenBankingAccounts(recAcc, reqAcc)
+
+	if recAcc.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for accounts detail, got %d: %s", recAcc.Code, recAcc.Body.String())
+	}
+
+	// 4. AISP: Read Balances
+	reqBal := httptest.NewRequest(http.MethodGet, "/api/v1/open-banking/balances?wallet_id=w-ob-1", nil)
+	reqBal.Header.Set("Consent-ID", consent.ConsentID)
+	recBal := httptest.NewRecorder()
+	gw.handleOpenBankingBalances(recBal, reqBal)
+
+	if recBal.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for balances, got %d: %s", recBal.Code, recBal.Body.String())
+	}
+
+	// 5. PISP: Create Payment Initiation
+	pispBody := fmt.Sprintf(`{
+		"instruction_id": "inst-openbanking-001",
+		"consent_id": "%s",
+		"debtor_wallet_id": "w-ob-1",
+		"creditor_wallet_id": "w-merchant-9",
+		"amount": 75.50,
+		"currency": "GBP"
+	}`, consent.ConsentID)
+	reqPayment := httptest.NewRequest(http.MethodPost, "/api/v1/open-banking/payments", strings.NewReader(pispBody))
+	reqPayment.Header.Set("Consent-ID", consent.ConsentID)
+	recPayment := httptest.NewRecorder()
+	gw.handleOpenBankingPayments(recPayment, reqPayment)
+
+	if recPayment.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for PISP payment, got %d: %s", recPayment.Code, recPayment.Body.String())
+	}
+
+	// 6. Revoke consent
+	reqRevoke := httptest.NewRequest(http.MethodDelete, "/api/v1/open-banking/consents?consent_id="+consent.ConsentID, nil)
+	recRevoke := httptest.NewRecorder()
+	gw.handleOpenBankingConsents(recRevoke, reqRevoke)
+
+	if recRevoke.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for revoke consent, got %d: %s", recRevoke.Code, recRevoke.Body.String())
+	}
+
+	// 7. Verify revoked consent is rejected
+	reqBalAfterRevoke := httptest.NewRequest(http.MethodGet, "/api/v1/open-banking/balances?wallet_id=w-ob-1", nil)
+	reqBalAfterRevoke.Header.Set("Consent-ID", consent.ConsentID)
+	recBalAfterRevoke := httptest.NewRecorder()
+	gw.handleOpenBankingBalances(recBalAfterRevoke, reqBalAfterRevoke)
+
+	if recBalAfterRevoke.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden after consent revocation, got %d: %s", recBalAfterRevoke.Code, recBalAfterRevoke.Body.String())
 	}
 }

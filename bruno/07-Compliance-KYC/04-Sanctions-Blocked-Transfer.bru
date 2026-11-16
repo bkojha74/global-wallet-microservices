@@ -1,0 +1,43 @@
+meta {
+  name: 04 - Sanctions Blocked Transfer
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/api/v1/transfers
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{authToken}}
+}
+
+body:json {
+  {
+    "source_wallet_id": "{{aliceWallet}}",
+    "destination_wallet_id": "{{bobWallet}}",
+    "amount": 250000,
+    "currency": "USD",
+    "travel_rule": {
+      "originator": {
+        "legal_name": "EVIL CORP CYBER SYNDICATE",
+        "account_number": "{{aliceWallet}}",
+        "national_id": "RU-CYBER-1001",
+        "country": "RU"
+      },
+      "beneficiary": {
+        "legal_name": "Bob Builder Ltd",
+        "account_number": "{{bobWallet}}",
+        "country": "GB"
+      }
+    }
+  }
+}
+
+assert {
+  res.status: eq 403
+  res.body.sanctions_blocked: eq true
+  res.body.entity_id: isDefined
+}

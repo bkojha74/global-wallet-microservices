@@ -313,7 +313,7 @@ func extractClientIP(r *http.Request) string {
 func AuthMiddleware(authClient authv1.AuthServiceClient, cache *claimsCache, publicPaths map[string]bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-		if publicPaths[path] || strings.HasPrefix(path, "/swagger") || strings.HasPrefix(path, "/docs") || strings.HasPrefix(path, "/api-docs") {
+		if publicPaths[path] || strings.HasPrefix(path, "/swagger") || strings.HasPrefix(path, "/docs") || strings.HasPrefix(path, "/api-docs") || strings.HasPrefix(path, "/api/v1/open-banking/") {
 			next.ServeHTTP(w, r)
 			return
 		}

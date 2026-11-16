@@ -1,0 +1,29 @@
+meta {
+  name: 01 - Create Open Banking Consent
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/api/v1/open-banking/consents
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "client_tpp_id": "fintech-aggregator-01",
+    "wallet_ids": ["{{aliceWallet}}"],
+    "permissions": [
+      "ReadAccountsDetail",
+      "ReadBalances",
+      "CreatePaymentInitiation"
+    ]
+  }
+}
+
+assert {
+  res.status: eq 201
+  res.body.consent_id: isDefined
+  res.body.status: eq AWAITING_AUTHORISATION
+}

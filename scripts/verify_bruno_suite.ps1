@@ -363,6 +363,144 @@ try {
     Record-Test "04-Reject-SSRF-Webhook" "400" "$code" ($code -eq 400) "Properly rejected SSRF internal IP target"
 }
 
+# --- 12. Virtual IBANs (BaaS) ---
+$viban = ""
+try {
+    $vibanBody = '{"country_code":"GB","currency":"GBP","label":"Alice Primary vIBAN"}'
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/wallets/alice_usd/vibans" -Method Post -ContentType "application/json" -Headers @{ Authorization = "Bearer $aliceToken" } -Body $vibanBody
+    $viban = $r.iban
+    Record-Test "01-Issue-Virtual-IBAN" "201 Created" "201" ($null -ne $viban -and $viban.StartsWith("GB")) "Issued vIBAN: $viban"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "01-Issue-Virtual-IBAN" "201 Created" "$code" $false $_.Message
+}
+
+try {
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/wallets/alice_usd/vibans" -Method Get -Headers @{ Authorization = "Bearer $aliceToken" }
+    Record-Test "02-List-Virtual-IBANs" "200 OK" "200" ($r.count -ge 1) "Found $($r.count) vIBANs"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "02-List-Virtual-IBANs" "200 OK" "$code" $false $_.Message
+}
+
+try {
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/wallets/vibans?iban=$viban" -Method Get -Headers @{ Authorization = "Bearer $aliceToken" }
+    Record-Test "03-Lookup-Virtual-IBAN" "200 OK" "200" ($r.wallet_id -eq "alice_usd") "Resolved to wallet: $($r.wallet_id)"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "03-Lookup-Virtual-IBAN" "200 OK" "$code" $false $_.Message
+}
+
+# --- 13. Compliance, Travel Rule & Sanctions ---
+try {
+    $trBody = @{
+        source_wallet_id = "alice_usd"
+        destination_wallet_id = "bob_eur"
+        amount = 150000
+        currency = "USD"
+        travel_rule = @{
+            originator = @{
+                legal_name = "Alice Corp LLC"
+                account_number = "alice_usd"
+                national_id = "US-EIN-998877"
+                country = "US"
+            }
+            beneficiary = @{
+                legal_name = "Bob Trading GmbH"
+                account_number = "bob_eur"
+                national_id = "DE-HRB-112233"
+                country = "DE"
+            }
+        }
+    } | ConvertTo-Json -Depth 5
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/transfers" -Method Post -ContentType "application/json" -Headers @{ Authorization = "Bearer $aliceToken" } -Body $trBody
+    Record-Test "01-Travel-Rule-Valid-Transfer" "200 OK" "200" ($r.status -eq "SUCCESS") "Transfer tx: $($r.transaction_id)"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "01-Travel-Rule-Valid-Transfer" "200 OK" "$code" ($code -eq 200) $_.Message
+}
+
+try {
+    $sancBody = @{
+        source_wallet_id = "alice_usd"
+        destination_wallet_id = "bob_eur"
+        amount = 200000
+        currency = "USD"
+        travel_rule = @{
+            originator = @{
+                legal_name = "EVIL CORP CYBER SYNDICATE"
+                account_number = "alice_usd"
+                national_id = "RU-CYBER-1001"
+                country = "RU"
+            }
+            beneficiary = @{
+                legal_name = "Bob Trading GmbH"
+                account_number = "bob_eur"
+                country = "DE"
+            }
+        }
+    } | ConvertTo-Json -Depth 5
+    Invoke-RestMethod -Uri "$baseUrl/api/v1/transfers" -Method Post -ContentType "application/json" -Headers @{ Authorization = "Bearer $aliceToken" } -Body $sancBody
+    Record-Test "02-Sanctions-Blocked-Transfer" "403 Forbidden" "200" $false "Should have been blocked"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "02-Sanctions-Blocked-Transfer" "403 Forbidden" "$code" ($code -eq 403) "Properly blocked sanctioned entity"
+}
+
+# --- 14. Open Banking PSD2 ---
+$obConsentId = ""
+try {
+    $consentReq = '{"client_tpp_id":"fintech-app-01","wallet_ids":["alice_usd"],"permissions":["ReadAccountsDetail","ReadBalances","CreatePaymentInitiation"]}'
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/open-banking/consents" -Method Post -ContentType "application/json" -Body $consentReq
+    $obConsentId = $r.consent_id
+    Record-Test "01-OpenBanking-Create-Consent" "201 Created" "201" ($null -ne $obConsentId -and $r.status -eq "AWAITING_AUTHORISATION") "Consent ID: $obConsentId"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "01-OpenBanking-Create-Consent" "201 Created" "$code" $false $_.Message
+}
+
+try {
+    $authReq = "{`"consent_id`":`"$obConsentId`",`"user_id`":`"alice`"}"
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/open-banking/consents/authorise" -Method Post -ContentType "application/json" -Headers @{ Authorization = "Bearer $aliceToken" } -Body $authReq
+    Record-Test "02-OpenBanking-Authorise-Consent" "200 OK" "200" ($r.status -eq "AUTHORISED") "Consent authorised"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "02-OpenBanking-Authorise-Consent" "200 OK" "$code" $false $_.Message
+}
+
+try {
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/open-banking/accounts" -Method Get -Headers @{ "Consent-ID" = $obConsentId }
+    Record-Test "03-OpenBanking-AISP-Accounts" "200 OK" "200" ($r.Data.Account -contains "alice_usd") "Accounts: $($r.Data.Account)"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "03-OpenBanking-AISP-Accounts" "200 OK" "$code" $false $_.Message
+}
+
+try {
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/open-banking/balances?wallet_id=alice_usd" -Method Get -Headers @{ "Consent-ID" = $obConsentId }
+    Record-Test "04-OpenBanking-AISP-Balances" "200 OK" "200" ($null -ne $r.Data.Balance) "Balances retrieved"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "04-OpenBanking-AISP-Balances" "200 OK" "$code" $false $_.Message
+}
+
+try {
+    $pispReq = "{`"instruction_id`":`"inst-ob-100`",`"consent_id`":`"$obConsentId`",`"debtor_wallet_id`":`"alice_usd`",`"creditor_wallet_id`":`"bob_eur`",`"amount`":15.00,`"currency`":`"USD`"}"
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/open-banking/payments" -Method Post -ContentType "application/json" -Headers @{ "Consent-ID" = $obConsentId } -Body $pispReq
+    Record-Test "05-OpenBanking-PISP-Payment" "201 Created" "201" ($r.Data.Status -eq "AcceptedSettlementInProcess") "Payment ID: $($r.Data.DomesticPaymentId)"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "05-OpenBanking-PISP-Payment" "201 Created" "$code" ($code -eq 201) $_.Message
+}
+
+try {
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/open-banking/consents?consent_id=$obConsentId" -Method Delete
+    Record-Test "06-OpenBanking-Revoke-Consent" "200 OK" "200" ($r.status -eq "REVOKED") "Consent revoked"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "06-OpenBanking-Revoke-Consent" "200 OK" "$code" $false $_.Message
+}
+
 Write-Host "`n=================== SUMMARY ===================" -ForegroundColor Cyan
 $passedCount = ($results | Where-Object { $_.Passed -eq $true }).Count
 $totalCount = $results.Count
