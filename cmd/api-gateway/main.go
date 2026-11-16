@@ -443,14 +443,14 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		IdempotencyKey      string                       `json:"idempotency_key"`
-		SourceWalletID      string                       `json:"source_wallet_id"`
-		SourceWallet        string                       `json:"source_wallet"`
-		DestinationWalletID string                       `json:"destination_wallet_id"`
-		DestWallet          string                       `json:"dest_wallet"`
-		Amount              json.RawMessage              `json:"amount"`
-		Currency            string                       `json:"currency"`
-		FXQuoteID           string                       `json:"fx_quote_id"`
+		IdempotencyKey      string                        `json:"idempotency_key"`
+		SourceWalletID      string                        `json:"source_wallet_id"`
+		SourceWallet        string                        `json:"source_wallet"`
+		DestinationWalletID string                        `json:"destination_wallet_id"`
+		DestWallet          string                        `json:"dest_wallet"`
+		Amount              json.RawMessage               `json:"amount"`
+		Currency            string                        `json:"currency"`
+		FXQuoteID           string                        `json:"fx_quote_id"`
 		TravelRule          *compliance.TravelRulePayload `json:"travel_rule,omitempty"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
