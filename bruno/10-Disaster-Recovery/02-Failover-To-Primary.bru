@@ -1,0 +1,30 @@
+meta {
+  name: 02 - Restore Failover to Primary (US)
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/api/v1/cluster/failover
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{adminToken}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "target": "PRIMARY"
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.active_target: eq PRIMARY
+}

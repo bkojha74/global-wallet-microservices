@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -30,9 +31,13 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 
 	"wallet-system/pkg/auth"
+	"wallet-system/pkg/banking"
+	"wallet-system/pkg/compliance"
 	"wallet-system/pkg/coordinator"
 	"wallet-system/pkg/db"
+	"wallet-system/pkg/iso20022"
 	"wallet-system/pkg/observability"
+	"wallet-system/pkg/openbanking"
 	"wallet-system/pkg/resilience"
 	"wallet-system/pkg/tlsutil"
 	"wallet-system/pkg/webhook"
@@ -61,6 +66,36 @@ type Gateway struct {
 	logger            observability.Logger
 	webhookDispatcher *webhook.Dispatcher
 	claimsCache       *claimsCache
+	sanctionsEngine   *compliance.SanctionsEngine
+	vibanStore        banking.VirtualIBANStore
+	consentStore      openbanking.ConsentStore
+}
+
+func (g *Gateway) getSanctionsEngine() *compliance.SanctionsEngine {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.sanctionsEngine == nil {
+		g.sanctionsEngine = compliance.NewSanctionsEngine()
+	}
+	return g.sanctionsEngine
+}
+
+func (g *Gateway) getVIBANStore() banking.VirtualIBANStore {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.vibanStore == nil {
+		g.vibanStore = banking.NewMemoryVirtualIBANStore()
+	}
+	return g.vibanStore
+}
+
+func (g *Gateway) getConsentStore() openbanking.ConsentStore {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.consentStore == nil {
+		g.consentStore = openbanking.NewMemoryConsentStore()
+	}
+	return g.consentStore
 }
 
 func (g *Gateway) emit(ctx context.Context, eventType, level, message string, attributes map[string]any) {
@@ -408,14 +443,15 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		IdempotencyKey      string          `json:"idempotency_key"`
-		SourceWalletID      string          `json:"source_wallet_id"`
-		SourceWallet        string          `json:"source_wallet"`
-		DestinationWalletID string          `json:"destination_wallet_id"`
-		DestWallet          string          `json:"dest_wallet"`
-		Amount              json.RawMessage `json:"amount"`
-		Currency            string          `json:"currency"`
-		FXQuoteID           string          `json:"fx_quote_id"`
+		IdempotencyKey      string                        `json:"idempotency_key"`
+		SourceWalletID      string                        `json:"source_wallet_id"`
+		SourceWallet        string                        `json:"source_wallet"`
+		DestinationWalletID string                        `json:"destination_wallet_id"`
+		DestWallet          string                        `json:"dest_wallet"`
+		Amount              json.RawMessage               `json:"amount"`
+		Currency            string                        `json:"currency"`
+		FXQuoteID           string                        `json:"fx_quote_id"`
+		TravelRule          *compliance.TravelRulePayload `json:"travel_rule,omitempty"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		log.Printf("[TRACE] trace_id=%s step=http_json_decode_failed error=%v", traceID, err)
@@ -434,6 +470,12 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "source_wallet_id and destination_wallet_id are required", http.StatusBadRequest)
 		return
 	}
+
+	// REQ-BAAS-01: Resolve vIBAN destination
+	if v, err := g.getVIBANStore().GetVirtualIBAN(r.Context(), destWallet); err == nil && v != nil && v.Status == "ACTIVE" {
+		destWallet = v.WalletID
+	}
+
 	moneyObj, err := parseMoney(req.Amount, req.Currency)
 	if err != nil {
 		log.Printf("[TRACE] trace_id=%s step=http_amount_decode_failed error=%v", traceID, err)
@@ -445,6 +487,59 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	if transferCurrency == "" {
 		http.Error(w, "currency is required", http.StatusBadRequest)
 		return
+	}
+
+	// REQ-COMP-02: Real-time Sanctions & OFAC Screening
+	sanctionsEngine := g.getSanctionsEngine()
+	if req.TravelRule != nil {
+		if origMatch := sanctionsEngine.ScreenParty(req.TravelRule.Originator.LegalName, req.TravelRule.Originator.Country); origMatch.IsBlocked {
+			log.Printf("[COMPLIANCE] Sanctions BLOCK: originator %s matched %s (%s)", req.TravelRule.Originator.LegalName, origMatch.MatchedName, origMatch.SanctionProgram)
+			writeJSON(w, http.StatusForbidden, map[string]interface{}{
+				"error":             "transaction blocked: matched international sanctions screening list",
+				"sanctions_blocked": true,
+				"entity_id":         origMatch.EntityID,
+			})
+			return
+		}
+		if benefMatch := sanctionsEngine.ScreenParty(req.TravelRule.Beneficiary.LegalName, req.TravelRule.Beneficiary.Country); benefMatch.IsBlocked {
+			log.Printf("[COMPLIANCE] Sanctions BLOCK: beneficiary %s matched %s (%s)", req.TravelRule.Beneficiary.LegalName, benefMatch.MatchedName, benefMatch.SanctionProgram)
+			writeJSON(w, http.StatusForbidden, map[string]interface{}{
+				"error":             "transaction blocked: matched international sanctions screening list",
+				"sanctions_blocked": true,
+				"entity_id":         benefMatch.EntityID,
+			})
+			return
+		}
+	} else {
+		if sMatch := sanctionsEngine.ScreenParty(sourceWallet, ""); sMatch.IsBlocked {
+			writeJSON(w, http.StatusForbidden, map[string]interface{}{
+				"error":             "transaction blocked: matched international sanctions screening list",
+				"sanctions_blocked": true,
+				"entity_id":         sMatch.EntityID,
+			})
+			return
+		}
+		if dMatch := sanctionsEngine.ScreenParty(destWallet, ""); dMatch.IsBlocked {
+			writeJSON(w, http.StatusForbidden, map[string]interface{}{
+				"error":             "transaction blocked: matched international sanctions screening list",
+				"sanctions_blocked": true,
+				"entity_id":         dMatch.EntityID,
+			})
+			return
+		}
+	}
+
+	// REQ-COMP-01: FATF Recommendation 16 (Travel Rule)
+	amountFloat := float64(amountUnits) / 100.0
+	if compliance.RequiresTravelRule(amountFloat, transferCurrency) {
+		if err := compliance.ValidateTravelRule(amountFloat, transferCurrency, req.TravelRule); err != nil {
+			log.Printf("[COMPLIANCE] Travel Rule VIOLATION: amount=%.2f %s error=%v", amountFloat, transferCurrency, err)
+			writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+				"error":                 err.Error(),
+				"travel_rule_violation": true,
+			})
+			return
+		}
 	}
 	idempKey := strings.TrimSpace(req.IdempotencyKey)
 	if idempKey == "" {
@@ -944,6 +1039,10 @@ func (gw *Gateway) handleWalletSubroutes(w http.ResponseWriter, r *http.Request)
 			gw.handleGetBalance(w, r)
 			return
 		}
+		if action == "vibans" {
+			gw.handleWalletVIBANs(w, r, walletID)
+			return
+		}
 	}
 	// /api/v1/wallets/{id}
 	if len(parts) == 4 && parts[0] == "api" && parts[1] == "v1" && parts[2] == "wallets" && r.Method == http.MethodGet {
@@ -955,6 +1054,100 @@ func (gw *Gateway) handleWalletSubroutes(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	http.Error(w, "Not Found", http.StatusNotFound)
+}
+
+func (gw *Gateway) handleWalletVIBANs(w http.ResponseWriter, r *http.Request, walletID string) {
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		if err := gw.verifyWalletAccess(r.Context(), claims, walletID); err != nil {
+			writeAuthError(w, http.StatusForbidden, fmt.Sprintf(msgForbiddenFmt, err))
+			return
+		}
+	}
+
+	store := gw.getVIBANStore()
+	switch r.Method {
+	case http.MethodPost:
+		var req struct {
+			Country     string `json:"country"`
+			CountryCode string `json:"country_code"`
+			Currency    string `json:"currency"`
+			Label       string `json:"label"`
+		}
+		if r.Body != nil {
+			_ = json.NewDecoder(r.Body).Decode(&req)
+		}
+		country := req.Country
+		if country == "" {
+			country = req.CountryCode
+		}
+		if country == "" {
+			country = "GB"
+		}
+		if req.Currency == "" {
+			req.Currency = "GBP"
+		}
+		v, err := banking.GenerateVirtualIBAN(country, req.Currency, walletID, req.Label, time.Now().UnixNano())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := store.IssueVirtualIBAN(r.Context(), v); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		writeJSON(w, http.StatusCreated, v)
+
+	case http.MethodGet:
+		list, err := store.ListVirtualIBANs(r.Context(), walletID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"wallet_id": walletID,
+			"vibans":    list,
+			"count":     len(list),
+		})
+
+	case http.MethodDelete:
+		iban := strings.TrimSpace(r.URL.Query().Get("iban"))
+		if iban == "" {
+			http.Error(w, "missing 'iban' query parameter", http.StatusBadRequest)
+			return
+		}
+		if err := store.RevokeVirtualIBAN(r.Context(), iban); err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"message": "virtual IBAN revoked",
+			"iban":    iban,
+			"status":  "REVOKED",
+		})
+
+	default:
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+	}
+}
+
+func (gw *Gateway) handleVirtualIBANs(w http.ResponseWriter, r *http.Request) {
+	iban := strings.TrimSpace(r.URL.Query().Get("iban"))
+	if iban != "" {
+		v, err := gw.getVIBANStore().GetVirtualIBAN(r.Context(), iban)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, v)
+		return
+	}
+
+	walletID := strings.TrimSpace(r.URL.Query().Get("wallet_id"))
+	if walletID == "" {
+		http.Error(w, "missing 'wallet_id' or 'iban' parameter", http.StatusBadRequest)
+		return
+	}
+	gw.handleWalletVIBANs(w, r, walletID)
 }
 
 func (gw *Gateway) handleDepositFunds(w http.ResponseWriter, r *http.Request) {
@@ -1665,6 +1858,591 @@ func (g *Gateway) handleLedgerMerkle(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// REQ-GL-01 & REQ-GL-02: handleTrialBalance returns the multi-tier GAAP/IFRS Chart of Accounts balances.
+func (g *Gateway) handleTrialBalance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	claims, hasClaims := ClaimsFromContext(r.Context())
+	if hasClaims && claims != nil {
+		if !claims.HasRole(auth.RoleAdmin) && !claims.HasScope("ledger:admin") && !claims.HasScope("wallet:admin") {
+			writeAuthError(w, http.StatusForbidden, "Admin role required to view GAAP/IFRS trial balance")
+			return
+		}
+	}
+
+	asOf := strings.TrimSpace(r.URL.Query().Get("as_of"))
+	if asOf == "" {
+		asOf = strings.TrimSpace(r.URL.Query().Get("as_of_date"))
+	}
+	currency := strings.TrimSpace(r.URL.Query().Get("currency"))
+
+	correlation := observability.FromHTTPRequest(r)
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	callCtx = withOutgoingAuthContext(observability.WithOutgoingMetadata(callCtx, correlation))
+
+	resp, err := g.ledgerClient.GetTrialBalance(callCtx, &ledgerv1.GetTrialBalanceRequest{
+		AsOfDate: asOf,
+		Currency: currency,
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Trial balance query failure: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"is_balanced":       resp.IsBalanced,
+		"as_of":             resp.Timestamp,
+		"currency":          resp.Currency,
+		"total_assets":      resp.TotalAssets,
+		"total_liabilities": resp.TotalLiabilities,
+		"total_equity":      resp.TotalEquity,
+		"total_revenue":     resp.TotalRevenue,
+		"total_expenses":    resp.TotalExpenses,
+		"accounts":          resp.Accounts,
+	})
+}
+
+// REQ-GL-02: handleLedgerEOD executes the end-of-day cutoff, verifies trial balance and exports certified CAMT.053 XML.
+func (g *Gateway) handleLedgerEOD(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	claims, hasClaims := ClaimsFromContext(r.Context())
+	if hasClaims && claims != nil {
+		if !claims.HasRole(auth.RoleAdmin) && !claims.HasScope("ledger:admin") && !claims.HasScope("wallet:admin") {
+			writeAuthError(w, http.StatusForbidden, "Admin role required to execute End-of-Day cutoff and CAMT.053 reporting")
+			return
+		}
+	}
+
+	var req struct {
+		Date        string `json:"date"`
+		Currency    string `json:"currency"`
+		GeneratedBy string `json:"generated_by"`
+		PerformedBy string `json:"performed_by"`
+	}
+	if r.Body != nil {
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if len(body) > 0 {
+			_ = json.Unmarshal(body, &req)
+		}
+	}
+
+	if req.Date == "" {
+		req.Date = time.Now().UTC().Format("2006-01-02")
+	}
+	genBy := req.GeneratedBy
+	if genBy == "" {
+		genBy = req.PerformedBy
+	}
+	if genBy == "" && hasClaims && claims != nil {
+		genBy = claims.Subject
+	}
+	if genBy == "" {
+		genBy = "system-treasury-admin"
+	}
+
+	correlation := observability.FromHTTPRequest(r)
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	callCtx = withOutgoingAuthContext(observability.WithOutgoingMetadata(callCtx, correlation))
+
+	resp, err := g.ledgerClient.GenerateEODReport(callCtx, &ledgerv1.GenerateEODReportRequest{
+		Date:        req.Date,
+		Currency:    req.Currency,
+		GeneratedBy: genBy,
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("EOD cutoff generation failure: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"report_id":     resp.ReportId,
+		"date":          resp.Date,
+		"verified":      resp.Verified,
+		"trial_balance": resp.TrialBalance,
+		"camt053_xml":   resp.Camt053Xml,
+		"error_message": resp.ErrorMessage,
+	})
+}
+
+// REQ-ISO-01 & REQ-ISO-02: handleClearingISO20022 ingests pacs.008 credit transfers and returns pacs.002 payment status reports.
+func (g *Gateway) handleClearingISO20022(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to read request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	doc, err := iso20022.ParsePacs008(body)
+	if err != nil {
+		pacs002Xml, bErr := iso20022.BuildPacs002("UNKNOWN", "UNKNOWN", "RJCT", "FF01", fmt.Sprintf("Malformed ISO 20022 XML: %v", err))
+		if bErr != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(pacs002Xml)
+		return
+	}
+
+	msgID := doc.FIToFICstmrCdtTrf.GrpHdr.MsgId
+	if len(doc.FIToFICstmrCdtTrf.CdtTrfTxInf) == 0 {
+		pacs002Xml, _ := iso20022.BuildPacs002(msgID, "N/A", "RJCT", "FF01", "Missing CreditTransferTransactionInformation")
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(pacs002Xml)
+		return
+	}
+
+	txInf := doc.FIToFICstmrCdtTrf.CdtTrfTxInf[0]
+	txID := txInf.PmtId.TxId
+	if txID == "" {
+		txID = txInf.PmtId.EndToEndId
+	}
+
+	dbtrIBAN := txInf.DbtrAcct.Id.IBAN
+	if dbtrIBAN == "" {
+		dbtrIBAN = txInf.DbtrAcct.Id.Othr.Id
+	}
+	cdtrIBAN := txInf.CdtrAcct.Id.IBAN
+	if cdtrIBAN == "" {
+		cdtrIBAN = txInf.CdtrAcct.Id.Othr.Id
+	}
+
+	// Validate IBAN formats if provided
+	if dbtrIBAN != "" {
+		if err := banking.ValidateIBAN(dbtrIBAN); err != nil {
+			pacs002Xml, _ := iso20022.BuildPacs002(msgID, txID, "RJCT", "AC01", fmt.Sprintf("Debtor IBAN invalid: %v", err))
+			w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(pacs002Xml)
+			return
+		}
+	}
+	if cdtrIBAN != "" {
+		if err := banking.ValidateIBAN(cdtrIBAN); err != nil {
+			pacs002Xml, _ := iso20022.BuildPacs002(msgID, txID, "RJCT", "AC01", fmt.Sprintf("Creditor IBAN invalid: %v", err))
+			w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(pacs002Xml)
+			return
+		}
+	}
+
+	// Validate BICs
+	if txInf.DbtrAgt.FinInstnId.BICFI != "" {
+		if err := banking.ValidateBIC(txInf.DbtrAgt.FinInstnId.BICFI); err != nil {
+			pacs002Xml, _ := iso20022.BuildPacs002(msgID, txID, "RJCT", "AC04", fmt.Sprintf("Debtor Agent BIC invalid: %v", err))
+			w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(pacs002Xml)
+			return
+		}
+	}
+	if txInf.CdtrAgt.FinInstnId.BICFI != "" {
+		if err := banking.ValidateBIC(txInf.CdtrAgt.FinInstnId.BICFI); err != nil {
+			pacs002Xml, _ := iso20022.BuildPacs002(msgID, txID, "RJCT", "AC04", fmt.Sprintf("Creditor Agent BIC invalid: %v", err))
+			w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(pacs002Xml)
+			return
+		}
+	}
+
+	// REQ-BAAS-01: Resolve Creditor vIBAN if mapped
+	if v, err := g.getVIBANStore().GetVirtualIBAN(r.Context(), cdtrIBAN); err == nil && v != nil && v.Status == "ACTIVE" {
+		cdtrIBAN = v.WalletID
+	}
+
+	// REQ-COMP-02: Sanctions screening on Debtor and Creditor
+	sanctionsEngine := g.getSanctionsEngine()
+	if txInf.Dbtr.Nm != "" {
+		if res := sanctionsEngine.ScreenParty(txInf.Dbtr.Nm, ""); res.IsBlocked {
+			pacs002Xml, _ := iso20022.BuildPacs002(msgID, txID, "RJCT", "RR04", "Debtor matched international sanctions screening list")
+			w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(pacs002Xml)
+			return
+		}
+	}
+	if txInf.Cdtr.Nm != "" {
+		if res := sanctionsEngine.ScreenParty(txInf.Cdtr.Nm, ""); res.IsBlocked {
+			pacs002Xml, _ := iso20022.BuildPacs002(msgID, txID, "RJCT", "RR04", "Creditor matched international sanctions screening list")
+			w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(pacs002Xml)
+			return
+		}
+	}
+
+	currency := txInf.IntrBkSttlmAmt.Ccy
+	amountVal := txInf.IntrBkSttlmAmt.Value
+	if amountVal <= 0 {
+		pacs002Xml, _ := iso20022.BuildPacs002(msgID, txID, "RJCT", "AM04", "Settlement amount must be positive")
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(pacs002Xml)
+		return
+	}
+
+	units := int64(math.Round(amountVal * 100))
+
+	correlation := observability.FromHTTPRequest(r)
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	client, _ := g.getActiveWalletClient(ctx)
+
+	callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	callCtx = withOutgoingAuthContext(observability.WithOutgoingMetadata(callCtx, correlation))
+
+	transferReq := &walletv1.TransferFundsRequest{
+		IdempotencyKey:      msgID,
+		SourceWalletId:      dbtrIBAN,
+		DestinationWalletId: cdtrIBAN,
+		Amount: &walletv1.Money{
+			Currency: currency,
+			Units:    units,
+			Nanos:    0,
+		},
+	}
+
+	resp, err := client.TransferFunds(callCtx, transferReq)
+	if err != nil {
+		reasonCode := "AC01"
+		if st, ok := status.FromError(err); ok {
+			switch st.Code() {
+			case codes.FailedPrecondition, codes.ResourceExhausted:
+				reasonCode = "AM04"
+			case codes.NotFound, codes.InvalidArgument:
+				reasonCode = "AC01"
+			default:
+				reasonCode = "RR04"
+			}
+		}
+		pacs002Xml, _ := iso20022.BuildPacs002(msgID, txID, "RJCT", reasonCode, err.Error())
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(pacs002Xml)
+		return
+	}
+
+	if resp.Status != walletv1.TransferFundsResponse_SUCCESS {
+		reasonCode := "AM04"
+		if strings.Contains(strings.ToLower(resp.ErrorMessage), "not found") {
+			reasonCode = "AC01"
+		}
+		pacs002Xml, _ := iso20022.BuildPacs002(msgID, txID, "RJCT", reasonCode, resp.ErrorMessage)
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(pacs002Xml)
+		return
+	}
+
+	pacs002Xml, err := iso20022.BuildPacs002(msgID, resp.TransactionId, "ACTC", "", "")
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to generate pacs.002: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(pacs002Xml)
+}
+
+// REQ-OPEN-01: Open Banking PSD2 Consent Management Handlers
+func (g *Gateway) handleOpenBankingConsents(w http.ResponseWriter, r *http.Request) {
+	store := g.getConsentStore()
+	switch r.Method {
+	case http.MethodPost:
+		var req struct {
+			ClientTPPId string   `json:"client_tpp_id"`
+			WalletIDs   []string `json:"wallet_ids"`
+			Permissions []string `json:"permissions"`
+		}
+		if r.Body != nil {
+			_ = json.NewDecoder(r.Body).Decode(&req)
+		}
+		if req.ClientTPPId == "" {
+			req.ClientTPPId = "tpp-client-openbanking"
+		}
+		if len(req.Permissions) == 0 {
+			req.Permissions = []string{openbanking.PermReadAccountsDetail, openbanking.PermReadBalances}
+		}
+		consentID := fmt.Sprintf("consent-%s-%d", req.ClientTPPId, time.Now().UnixNano()%1000000)
+		consent := &openbanking.Consent{
+			ConsentID:   consentID,
+			ClientTPPId: req.ClientTPPId,
+			WalletIDs:   req.WalletIDs,
+			Permissions: req.Permissions,
+			Status:      openbanking.StatusAwaitingAuthorisation,
+			CreatedAt:   time.Now().UTC(),
+			ExpiresAt:   time.Now().UTC().Add(90 * 24 * time.Hour),
+		}
+		if err := store.SaveConsent(r.Context(), consent); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusCreated, consent)
+
+	case http.MethodGet:
+		consentID := strings.TrimSpace(r.URL.Query().Get("consent_id"))
+		if consentID == "" {
+			consentID = strings.TrimSpace(r.Header.Get("Consent-ID"))
+		}
+		if consentID == "" && strings.HasPrefix(r.URL.Path, "/api/v1/open-banking/consents/") {
+			consentID = strings.TrimPrefix(r.URL.Path, "/api/v1/open-banking/consents/")
+		}
+		if consentID == "" {
+			http.Error(w, "missing 'consent_id' parameter or 'Consent-ID' header", http.StatusBadRequest)
+			return
+		}
+		c, err := store.GetConsent(r.Context(), consentID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, c)
+
+	case http.MethodDelete:
+		consentID := strings.TrimSpace(r.URL.Query().Get("consent_id"))
+		if consentID == "" {
+			consentID = strings.TrimSpace(r.Header.Get("Consent-ID"))
+		}
+		if consentID == "" && strings.HasPrefix(r.URL.Path, "/api/v1/open-banking/consents/") {
+			consentID = strings.TrimPrefix(r.URL.Path, "/api/v1/open-banking/consents/")
+		}
+		if consentID == "" {
+			http.Error(w, "missing 'consent_id' parameter", http.StatusBadRequest)
+			return
+		}
+		_ = store.RevokeConsent(r.Context(), consentID, "")
+		writeJSON(w, http.StatusOK, map[string]string{
+			"message":    "open banking consent revoked",
+			"consent_id": consentID,
+			"status":     openbanking.StatusRevoked,
+		})
+
+	default:
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+	}
+}
+
+func (g *Gateway) handleOpenBankingConsentAuthorise(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ConsentID string `json:"consent_id"`
+		UserID    string `json:"user_id"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	if req.ConsentID == "" {
+		req.ConsentID = strings.TrimSpace(r.URL.Query().Get("consent_id"))
+	}
+	if req.UserID == "" {
+		if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+			req.UserID = claims.Subject
+		} else {
+			req.UserID = "customer-alice"
+		}
+	}
+	if req.ConsentID == "" {
+		http.Error(w, "missing consent_id", http.StatusBadRequest)
+		return
+	}
+
+	store := g.getConsentStore()
+	if err := store.AuthoriseConsent(r.Context(), req.ConsentID, req.UserID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	c, _ := store.GetConsent(r.Context(), req.ConsentID)
+	writeJSON(w, http.StatusOK, c)
+}
+
+func (g *Gateway) handleOpenBankingAccounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	consentID := strings.TrimSpace(r.Header.Get("Consent-ID"))
+	if consentID == "" {
+		consentID = strings.TrimSpace(r.URL.Query().Get("consent_id"))
+	}
+	c, err := g.getConsentStore().GetConsent(r.Context(), consentID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("invalid consent: %v", err), http.StatusUnauthorized)
+		return
+	}
+	if err := openbanking.ValidateConsentAccess(c, openbanking.PermReadAccountsDetail, ""); err != nil {
+		writeAuthError(w, http.StatusForbidden, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"Data": map[string]interface{}{
+			"Account": c.WalletIDs,
+		},
+		"ConsentID": consentID,
+		"Status":    "Authorised",
+	})
+}
+
+func (g *Gateway) handleOpenBankingBalances(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	consentID := strings.TrimSpace(r.Header.Get("Consent-ID"))
+	if consentID == "" {
+		consentID = strings.TrimSpace(r.URL.Query().Get("consent_id"))
+	}
+	walletID := strings.TrimSpace(r.URL.Query().Get("wallet_id"))
+
+	c, err := g.getConsentStore().GetConsent(r.Context(), consentID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("invalid consent: %v", err), http.StatusUnauthorized)
+		return
+	}
+	if err := openbanking.ValidateConsentAccess(c, openbanking.PermReadBalances, walletID); err != nil {
+		writeAuthError(w, http.StatusForbidden, err.Error())
+		return
+	}
+
+	if walletID == "" && len(c.WalletIDs) > 0 {
+		walletID = c.WalletIDs[0]
+	}
+
+	correlation := observability.FromHTTPRequest(r)
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	client, _ := g.getActiveWalletClient(ctx)
+
+	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	resp, err := client.GetBalance(callCtx, &walletv1.GetBalanceRequest{WalletId: walletID})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to get balance: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"Data": map[string]interface{}{
+			"Balance":  resp.Balances,
+			"WalletID": resp.WalletId,
+		},
+		"ConsentID": consentID,
+	})
+}
+
+func (g *Gateway) handleOpenBankingPayments(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req openbanking.DomesticPaymentInitiation
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid payment initiation body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	consentID := req.ConsentID
+	if consentID == "" {
+		consentID = strings.TrimSpace(r.Header.Get("Consent-ID"))
+	}
+	c, err := g.getConsentStore().GetConsent(r.Context(), consentID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("invalid consent: %v", err), http.StatusUnauthorized)
+		return
+	}
+	if err := openbanking.ValidateConsentAccess(c, openbanking.PermCreatePaymentInitiation, req.DebtorWalletID); err != nil {
+		writeAuthError(w, http.StatusForbidden, err.Error())
+		return
+	}
+
+	destWallet := req.CreditorWalletID
+	if destWallet == "" && req.CreditorIBAN != "" {
+		destWallet = req.CreditorIBAN
+	}
+	if v, err := g.getVIBANStore().GetVirtualIBAN(r.Context(), destWallet); err == nil && v != nil && v.Status == "ACTIVE" {
+		destWallet = v.WalletID
+	}
+
+	// Screen sanctions on debtor and creditor
+	sanctionsEngine := g.getSanctionsEngine()
+	if sMatch := sanctionsEngine.ScreenParty(req.DebtorWalletID, ""); sMatch.IsBlocked {
+		writeJSON(w, http.StatusForbidden, map[string]interface{}{
+			"error":             "payment blocked by sanctions screening",
+			"sanctions_blocked": true,
+		})
+		return
+	}
+	if dMatch := sanctionsEngine.ScreenParty(destWallet, ""); dMatch.IsBlocked {
+		writeJSON(w, http.StatusForbidden, map[string]interface{}{
+			"error":             "payment blocked by sanctions screening",
+			"sanctions_blocked": true,
+		})
+		return
+	}
+
+	correlation := observability.FromHTTPRequest(r)
+	ctx := observability.WithCorrelation(r.Context(), correlation)
+	client, _ := g.getActiveWalletClient(ctx)
+
+	callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	units := int64(math.Round(req.Amount * 100))
+	transferReq := &walletv1.TransferFundsRequest{
+		IdempotencyKey:      req.InstructionID,
+		SourceWalletId:      req.DebtorWalletID,
+		DestinationWalletId: destWallet,
+		Amount: &walletv1.Money{
+			Currency: req.Currency,
+			Units:    units,
+		},
+	}
+
+	resp, err := client.TransferFunds(callCtx, transferReq)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("payment transfer failure: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	req.PaymentStatus = "AcceptedSettlementInProcess"
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"Data": map[string]interface{}{
+			"DomesticPaymentId": resp.TransactionId,
+			"ConsentId":         consentID,
+			"Status":            req.PaymentStatus,
+			"Initiation":        req,
+		},
+	})
 }
 
 func (g *Gateway) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
@@ -2465,8 +3243,11 @@ func registerGatewayRoutes(mux *http.ServeMux, gw *Gateway) {
 	mux.HandleFunc("/api/v1/webhooks/test", gw.handleWebhookTest)
 	mux.HandleFunc("/api/v1/transfers", gw.handleTransfer)
 	mux.HandleFunc("/api/v1/ledger", gw.handleLedger)
+	mux.HandleFunc("/api/v1/ledger/trial-balance", gw.handleTrialBalance)
+	mux.HandleFunc("/api/v1/ledger/eod", gw.handleLedgerEOD)
 	mux.HandleFunc("/api/v1/ledger/merkle", gw.handleLedgerMerkle)
 	mux.HandleFunc("/api/v1/ledger/merkle/", gw.handleLedgerMerkle)
+	mux.HandleFunc("/api/v1/clearing/iso20022", gw.handleClearingISO20022)
 	mux.HandleFunc("/api/v1/fx/currencies", gw.handleFXCurrencies)
 	mux.HandleFunc("/api/v1/fx/rates", gw.handleFXRates)
 	mux.HandleFunc("/api/v1/fx/quotes", gw.handleFXQuotes)
@@ -2479,6 +3260,18 @@ func registerGatewayRoutes(mux *http.ServeMux, gw *Gateway) {
 	mux.HandleFunc("/api/v1/auth/logout", gw.handleLogout)
 	mux.HandleFunc("/api/v1/auth/backchannel-logout", gw.handleBackchannelLogout)
 	mux.HandleFunc("/api/v1/auth/token", gw.handleAuthToken)
+
+	// REQ-BAAS-01: Virtual IBANs (BaaS)
+	mux.HandleFunc("/api/v1/wallets/vibans", gw.handleVirtualIBANs)
+
+	// REQ-OPEN-01: Open Banking PSD2 endpoints
+	mux.HandleFunc("/api/v1/open-banking/consents", gw.handleOpenBankingConsents)
+	mux.HandleFunc("/api/v1/open-banking/consents/", gw.handleOpenBankingConsents)
+	mux.HandleFunc("/api/v1/open-banking/consents/authorise", gw.handleOpenBankingConsentAuthorise)
+	mux.HandleFunc("/api/v1/open-banking/accounts", gw.handleOpenBankingAccounts)
+	mux.HandleFunc("/api/v1/open-banking/balances", gw.handleOpenBankingBalances)
+	mux.HandleFunc("/api/v1/open-banking/payments", gw.handleOpenBankingPayments)
+
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "UP"})
 	})
@@ -2495,24 +3288,30 @@ func registerGatewayRoutes(mux *http.ServeMux, gw *Gateway) {
 
 func wrapGatewayMiddleware(handler http.Handler, gw *Gateway) http.Handler {
 	publicPaths := map[string]bool{
-		"/healthz":                          true,
-		"/readyz":                           true,
-		"/metrics":                          true,
-		"/swagger":                          true,
-		"/swagger/":                         true,
-		"/docs":                             true,
-		"/docs/":                            true,
-		"/api-docs/openapi.json":            true,
-		"/api/v1/auth/login":                true,
-		"/api/v1/auth/refresh":              true,
-		"/api/v1/auth/backchannel-logout":   true,
-		"/api/v1/cluster/status":            true,
-		"/api/v1/ledger/merkle":             true,
-		"/api/v1/ledger/merkle/latest":      true,
-		"/api/v1/ledger/merkle/checkpoints": true,
-		"/api/v1/ledger/merkle/proof":       true,
-		"/api/v1/fx/currencies":             true,
-		"/api/v1/fx/rates":                  true,
+		"/healthz":                                true,
+		"/readyz":                                 true,
+		"/metrics":                                true,
+		"/swagger":                                true,
+		"/swagger/":                               true,
+		"/docs":                                   true,
+		"/docs/":                                  true,
+		"/api-docs/openapi.json":                  true,
+		"/api/v1/auth/login":                      true,
+		"/api/v1/auth/refresh":                    true,
+		"/api/v1/auth/backchannel-logout":         true,
+		"/api/v1/cluster/status":                  true,
+		"/api/v1/ledger/merkle":                   true,
+		"/api/v1/ledger/merkle/latest":            true,
+		"/api/v1/ledger/merkle/checkpoints":       true,
+		"/api/v1/ledger/merkle/proof":             true,
+		"/api/v1/fx/currencies":                   true,
+		"/api/v1/fx/rates":                        true,
+		"/api/v1/clearing/iso20022":               true,
+		"/api/v1/open-banking/consents":           true,
+		"/api/v1/open-banking/consents/authorise": true,
+		"/api/v1/open-banking/accounts":           true,
+		"/api/v1/open-banking/balances":           true,
+		"/api/v1/open-banking/payments":           true,
 	}
 
 	if os.Getenv("ENABLE_DEV_TOKEN_ENDPOINT") == "true" {

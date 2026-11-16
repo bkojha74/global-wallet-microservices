@@ -1,0 +1,30 @@
+meta {
+  name: 05 - Issue Virtual IBAN
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{baseUrl}}/api/v1/wallets/{{aliceWallet}}/vibans
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{authToken}}
+}
+
+body:json {
+  {
+    "country_code": "GB",
+    "currency": "GBP",
+    "label": "Alice Treasury vIBAN"
+  }
+}
+
+assert {
+  res.status: eq 201
+  res.body.iban: isDefined
+  res.body.wallet_id: eq {{aliceWallet}}
+  res.body.status: eq ACTIVE
+}

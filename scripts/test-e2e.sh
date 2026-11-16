@@ -46,7 +46,7 @@ echo ""
 echo -e "\n6. Executing AI Fraud Transfer: Alice sends \$9,999,999 to Hacker (SHOULD BE BLOCKED)..."
 HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${BASE_URL}/api/v1/transfers" \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"idempotency_key":"tx-fraud-001","source_wallet_id":"alice","destination_wallet_id":"hacker-wallet-1","amount":999999900,"currency":"USD"}')
+  -d '{"idempotency_key":"tx-fraud-001","source_wallet_id":"alice","destination_wallet_id":"hacker-wallet-1","amount":999999900,"currency":"USD","travel_rule":{"originator":{"legal_name":"Alice Wonderland","account_number":"alice","national_id":"US-PASS-12345","country":"US"},"beneficiary":{"legal_name":"Unknown Hacker","account_number":"hacker-wallet-1","country":"US"}}}')
 
 if [ "$HTTP_STATUS" -eq 403 ]; then
   echo "AI Successfully Blocked the transaction (Received 403 Forbidden)"

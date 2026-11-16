@@ -1,0 +1,26 @@
+meta {
+  name: 01 - Get Ledger Audit Journal
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/api/v1/ledger?wallet_id={{aliceWallet}}&limit=10
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{authToken}}
+}
+
+assert {
+  res.status: eq 200
+  res.body.entries: isDefined
+}
+
+script:post-response {
+  if (res.getStatus() === 200 && res.getBody().entries && res.getBody().entries.length > 0) {
+    bru.setEnvVar("entryHash", res.getBody().entries[0].current_hash);
+  }
+}

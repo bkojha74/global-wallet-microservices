@@ -1,0 +1,44 @@
+meta {
+  name: 01 - Same-Currency Intra-Platform Transfer
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/api/v1/transfers
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{authToken}}
+}
+
+headers {
+  Content-Type: application/json
+  Idempotency-Key: txn_same_1001
+}
+
+body:json {
+  {
+    "source_wallet_id": "{{aliceWallet}}",
+    "destination_wallet_id": "{{bobWallet}}",
+    "amount": {
+      "units": 25000,
+      "currency": "USD"
+    },
+    "description": "Consulting services payment"
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq SUCCESS
+  res.body.transaction_id: isDefined
+}
+
+script:post-response {
+  if (res.getStatus() === 200) {
+    bru.setEnvVar("lastTxnId", res.getBody().transaction_id);
+  }
+}

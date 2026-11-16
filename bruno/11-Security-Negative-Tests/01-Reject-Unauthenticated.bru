@@ -1,0 +1,30 @@
+meta {
+  name: 01 - Negative: Reject Unauthenticated Request
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/api/v1/transfers
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "source_wallet_id": "alice_usd",
+    "destination_wallet_id": "bob_eur",
+    "amount": {
+      "units": 1000,
+      "currency": "USD"
+    }
+  }
+}
+
+assert {
+  res.status: eq 401
+}

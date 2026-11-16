@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Global Wallet Microservices API",
-    "version": "1.6.0",
+    "version": "1.12.0",
     "description": "High-performance, distributed multi-currency digital wallet and core banking platform with zero-trust security, real-time FX, GAAP double-entry ledger settlement, velocity controls, payment rails simulation, and partner webhooks.",
     "contact": {
       "name": "Global Wallet Engineering Team",
@@ -63,6 +63,18 @@
     {
       "name": "Cluster Management",
       "description": "Multi-region failover and distributed routing control"
+    },
+    {
+      "name": "Global Clearing Rails",
+      "description": "ISO 20022 financial messaging engine, IBAN/BIC validation, and institutional clearing settlements"
+    },
+    {
+      "name": "Banking-as-a-Service (BaaS) & vIBANs",
+      "description": "Dynamic virtual IBAN issuance (GB, DE, FR) and inbound clearing routing"
+    },
+    {
+      "name": "Open Banking PSD2",
+      "description": "Standardized AISP/PISP consent lifecycle, account reading, and domestic payment initiation"
     }
   ],
   "paths": {
@@ -777,6 +789,123 @@
         }
       }
     },
+    "/api/v1/ledger/trial-balance": {
+      "get": {
+        "tags": ["Ledger & Auditing"],
+        "summary": "Query GAAP/IFRS Trial Balance",
+        "description": "Calculates multi-tier chart of accounts balances and verifies ledger accounting equation (Assets = Liabilities + Equity + Revenue - Expenses). Admin role required.",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "currency",
+            "in": "query",
+            "required": false,
+            "description": "Optional ISO 4217 currency filter",
+            "schema": { "type": "string", "example": "USD" }
+          },
+          {
+            "name": "as_of",
+            "in": "query",
+            "required": false,
+            "description": "Optional cutoff date (YYYY-MM-DD)",
+            "schema": { "type": "string", "example": "2026-11-13" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Trial balance statement",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "is_balanced": { "type": "boolean" },
+                    "as_of": { "type": "string" },
+                    "currency": { "type": "string" },
+                    "total_assets": { "type": "integer" },
+                    "total_liabilities": { "type": "integer" },
+                    "total_equity": { "type": "integer" },
+                    "total_revenue": { "type": "integer" },
+                    "total_expenses": { "type": "integer" },
+                    "accounts": { "type": "array" }
+                  }
+                }
+              }
+            }
+          },
+          "403": { "description": "Forbidden - Admin role required" }
+        }
+      }
+    },
+    "/api/v1/ledger/eod": {
+      "post": {
+        "tags": ["Ledger & Auditing"],
+        "summary": "Execute End-of-Day Cutoff & CAMT.053 Report",
+        "description": "Performs institutional EOD cutoff, closes daily journals, validates trial balance parity, and generates certified ISO 20022 camt.053.001.08 bank statement XML. Admin role required.",
+        "security": [{ "BearerAuth": [] }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "date": { "type": "string", "example": "2026-11-13" },
+                  "currency": { "type": "string", "example": "USD" },
+                  "generated_by": { "type": "string", "example": "treasury-audit-admin" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "EOD report output with certified CAMT.053 XML",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "report_id": { "type": "string" },
+                    "date": { "type": "string" },
+                    "verified": { "type": "boolean" },
+                    "trial_balance": { "type": "object" },
+                    "camt053_xml": { "type": "string" },
+                    "error_message": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "403": { "description": "Forbidden - Admin role required" }
+        }
+      }
+    },
+    "/api/v1/clearing/iso20022": {
+      "post": {
+        "tags": ["Global Clearing Rails"],
+        "summary": "Ingest ISO 20022 Clearing Message (pacs.008)",
+        "description": "Ingests institutional ISO 20022 pacs.008.001.08 FI-to-FI credit transfer XML, executes ISO 13616 IBAN and ISO 9362 BIC validation, routes clearing settlement, and responds synchronously with ISO 20022 pacs.002.001.10 Payment Status Report (ACTC or RJCT).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/xml": {
+              "schema": { "type": "string" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ISO 20022 pacs.002.001.10 XML payment status report",
+            "content": {
+              "application/xml": {
+                "schema": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/fx/currencies": {
       "get": {
         "tags": ["Foreign Exchange (FX)"],
@@ -859,6 +988,209 @@
               }
             }
           }
+        }
+      }
+    },
+    "/api/v1/wallets/{id}/vibans": {
+      "post": {
+        "tags": ["Banking-as-a-Service (BaaS) & vIBANs"],
+        "summary": "Issue Virtual IBAN",
+        "description": "Generates a compliant ISO 13616 virtual IBAN for GB, DE, or FR mapped to the target wallet.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "country_code": { "type": "string", "example": "GB" },
+                  "currency": { "type": "string", "example": "GBP" },
+                  "label": { "type": "string", "example": "Treasury Inbound Pot" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "vIBAN generated successfully",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VirtualIBAN" } } }
+          }
+        }
+      },
+      "get": {
+        "tags": ["Banking-as-a-Service (BaaS) & vIBANs"],
+        "summary": "List Wallet Virtual IBANs",
+        "description": "Returns all virtual IBANs linked to this wallet.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of vIBANs",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VirtualIBANListResponse" } } }
+          }
+        }
+      },
+      "delete": {
+        "tags": ["Banking-as-a-Service (BaaS) & vIBANs"],
+        "summary": "Revoke Virtual IBAN",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "iban", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "vIBAN revoked successfully" }
+        }
+      }
+    },
+    "/api/v1/wallets/vibans": {
+      "get": {
+        "tags": ["Banking-as-a-Service (BaaS) & vIBANs"],
+        "summary": "Lookup Virtual IBAN",
+        "parameters": [
+          { "name": "iban", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Resolved vIBAN details",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VirtualIBAN" } } }
+          }
+        }
+      }
+    },
+    "/api/v1/open-banking/consents": {
+      "post": {
+        "tags": ["Open Banking PSD2"],
+        "summary": "Create Account Access & Payment Consent",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "client_tpp_id": { "type": "string", "example": "tpp-aggregator" },
+                  "wallet_ids": { "type": "array", "items": { "type": "string" } },
+                  "permissions": { "type": "array", "items": { "type": "string" } }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Consent created awaiting customer authorisation",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OpenBankingConsent" } } }
+          }
+        }
+      },
+      "get": {
+        "tags": ["Open Banking PSD2"],
+        "summary": "Get Consent Status",
+        "parameters": [
+          { "name": "consent_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "Consent-ID", "in": "header", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Consent status",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OpenBankingConsent" } } }
+          }
+        }
+      },
+      "delete": {
+        "tags": ["Open Banking PSD2"],
+        "summary": "Revoke Consent",
+        "parameters": [
+          { "name": "consent_id", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Consent revoked successfully" }
+        }
+      }
+    },
+    "/api/v1/open-banking/consents/authorise": {
+      "post": {
+        "tags": ["Open Banking PSD2"],
+        "summary": "Authorise Consent (SCA Customer Approval)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "consent_id": { "type": "string" },
+                  "user_id": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Authorised consent",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OpenBankingConsent" } } }
+          }
+        }
+      }
+    },
+    "/api/v1/open-banking/accounts": {
+      "get": {
+        "tags": ["Open Banking PSD2"],
+        "summary": "AISP - Read Authorized Account List",
+        "parameters": [
+          { "name": "Consent-ID", "in": "header", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Authorized accounts list" }
+        }
+      }
+    },
+    "/api/v1/open-banking/balances": {
+      "get": {
+        "tags": ["Open Banking PSD2"],
+        "summary": "AISP - Read Account Balances",
+        "parameters": [
+          { "name": "Consent-ID", "in": "header", "required": true, "schema": { "type": "string" } },
+          { "name": "wallet_id", "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Account balances" }
+        }
+      }
+    },
+    "/api/v1/open-banking/payments": {
+      "post": {
+        "tags": ["Open Banking PSD2"],
+        "summary": "PISP - Initiate Domestic Payment",
+        "parameters": [
+          { "name": "Consent-ID", "in": "header", "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "instruction_id": { "type": "string" },
+                  "consent_id": { "type": "string" },
+                  "debtor_wallet_id": { "type": "string" },
+                  "creditor_wallet_id": { "type": "string" },
+                  "amount": { "type": "number" },
+                  "currency": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Payment initiation accepted" }
         }
       }
     }
@@ -1241,6 +1573,57 @@
           "error": { "type": "string", "example": "invalid request parameters" },
           "error_message": { "type": "string", "example": "insufficient funds" },
           "status": { "type": "string", "example": "FAILED_INSUFFICIENT_FUNDS" }
+        }
+      },
+      "VirtualIBAN": {
+        "type": "object",
+        "properties": {
+          "iban": { "type": "string", "example": "GB74BARK20000012345678" },
+          "wallet_id": { "type": "string", "example": "alice_usd" },
+          "currency": { "type": "string", "example": "GBP" },
+          "country": { "type": "string", "example": "GB" },
+          "status": { "type": "string", "example": "ACTIVE" },
+          "label": { "type": "string", "example": "Treasury Pot" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "VirtualIBANListResponse": {
+        "type": "object",
+        "properties": {
+          "wallet_id": { "type": "string" },
+          "vibans": { "type": "array", "items": { "$ref": "#/components/schemas/VirtualIBAN" } },
+          "count": { "type": "integer" }
+        }
+      },
+      "OpenBankingConsent": {
+        "type": "object",
+        "properties": {
+          "consent_id": { "type": "string", "example": "consent-tpp-12345" },
+          "client_tpp_id": { "type": "string", "example": "fintech-app" },
+          "user_id": { "type": "string", "example": "alice" },
+          "wallet_ids": { "type": "array", "items": { "type": "string" } },
+          "permissions": { "type": "array", "items": { "type": "string" } },
+          "status": { "type": "string", "example": "AUTHORISED" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "expires_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "TravelRuleParty": {
+        "type": "object",
+        "properties": {
+          "legal_name": { "type": "string", "example": "Alice Corp LLC" },
+          "account_number": { "type": "string", "example": "alice_usd" },
+          "physical_address": { "type": "string", "example": "100 Main St, NY" },
+          "national_id": { "type": "string", "example": "US-EIN-998877" },
+          "country": { "type": "string", "example": "US" },
+          "bic": { "type": "string", "example": "BARCGB22" }
+        }
+      },
+      "TravelRulePayload": {
+        "type": "object",
+        "properties": {
+          "originator": { "$ref": "#/components/schemas/TravelRuleParty" },
+          "beneficiary": { "$ref": "#/components/schemas/TravelRuleParty" }
         }
       }
     }

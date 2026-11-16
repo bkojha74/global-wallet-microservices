@@ -1,0 +1,31 @@
+meta {
+  name: 06 - Generate EOD Cutoff and CAMT.053 Report
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{baseUrl}}/api/v1/ledger/eod
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{adminAuthToken}}
+}
+
+body:json {
+  {
+    "date": "2026-11-13",
+    "currency": "USD",
+    "generated_by": "treasury-audit-admin"
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.report_id: isDefined
+  res.body.verified: eq true
+  res.body.camt053_xml: isDefined
+}
+

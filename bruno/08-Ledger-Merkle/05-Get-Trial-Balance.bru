@@ -1,0 +1,23 @@
+meta {
+  name: 05 - Get GAAP/IFRS Trial Balance
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{baseUrl}}/api/v1/ledger/trial-balance?currency=USD
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{adminAuthToken}}
+}
+
+assert {
+  res.status: eq 200
+  res.body.is_balanced: eq true
+  res.body.currency: eq "USD"
+  res.body.accounts: isDefined
+}
+

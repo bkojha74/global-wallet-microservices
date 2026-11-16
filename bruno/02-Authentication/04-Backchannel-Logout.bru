@@ -1,0 +1,25 @@
+meta {
+  name: 04 - Keycloak Backchannel Logout
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/api/v1/auth/backchannel-logout
+  body: formUrlEncoded
+  auth: none
+}
+
+headers {
+  Content-Type: application/x-www-form-urlencoded
+}
+
+body:form-urlencoded {
+  logout_token: {{logoutToken}}
+}
+
+assert {
+  res.status: eq 200
+  res.headers["cache-control"]: eq no-store
+}
+

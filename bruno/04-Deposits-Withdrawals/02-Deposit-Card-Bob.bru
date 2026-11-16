@@ -1,0 +1,37 @@
+meta {
+  name: 02 - Inbound Deposit Card Bob
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/api/v1/wallets/deposit
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{adminToken}}
+}
+
+headers {
+  Content-Type: application/json
+  Idempotency-Key: dep_card_bob_1002
+}
+
+body:json {
+  {
+    "wallet_id": "{{bobWallet}}",
+    "amount": {
+      "units": 200000,
+      "currency": "EUR"
+    },
+    "rail": "CARD",
+    "reference": "Debit card instant top-up"
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq SUCCESS
+}

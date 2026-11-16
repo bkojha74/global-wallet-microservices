@@ -1,0 +1,21 @@
+meta {
+  name: 03 - Get Accounts via AISP
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{baseUrl}}/api/v1/open-banking/accounts
+  body: none
+  auth: none
+}
+
+headers {
+  Consent-ID: {{consentId}}
+}
+
+assert {
+  res.status: eq 200
+  res.body.Data.Account: isDefined
+  res.body.Status: eq Authorised
+}

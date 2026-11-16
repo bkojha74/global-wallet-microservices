@@ -1,0 +1,38 @@
+meta {
+  name: 03 - Idempotency Key Replay Transfer
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/api/v1/transfers
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{authToken}}
+}
+
+headers {
+  Content-Type: application/json
+  Idempotency-Key: txn_cross_1002
+}
+
+body:json {
+  {
+    "source_wallet_id": "{{aliceWallet}}",
+    "destination_wallet_id": "{{bobWallet}}",
+    "amount": {
+      "units": 15000,
+      "currency": "USD"
+    },
+    "destination_currency": "EUR",
+    "description": "Cross-currency vendor payment"
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq SUCCESS
+}

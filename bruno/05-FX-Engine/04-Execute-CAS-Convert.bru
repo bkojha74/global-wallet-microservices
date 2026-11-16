@@ -1,0 +1,30 @@
+meta {
+  name: 04 - Execute Atomic FX Conversion
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/api/v1/fx/convert
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{authToken}}
+}
+
+headers {
+  Content-Type: application/json
+  Idempotency-Key: fxc_convert_1004
+}
+
+body:json {
+  {
+    "quote_id": "{{quoteId}}"
+  }
+}
+
+assert {
+  res.status: in [200, 409]
+}

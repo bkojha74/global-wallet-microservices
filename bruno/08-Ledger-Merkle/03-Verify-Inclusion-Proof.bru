@@ -1,0 +1,15 @@
+meta {
+  name: 03 - Verify Merkle Inclusion Proof
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{baseUrl}}/api/v1/ledger/merkle/proof?entry_hash={{entryHash}}
+  body: none
+  auth: none
+}
+
+assert {
+  res.status: in [200, 400, 404]
+}

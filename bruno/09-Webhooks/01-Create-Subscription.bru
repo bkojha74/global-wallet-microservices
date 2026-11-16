@@ -1,0 +1,32 @@
+meta {
+  name: 01 - Register Webhook Subscription
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/api/v1/webhooks/subscriptions
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{authToken}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "target_url": "https://httpbin.org/post",
+    "secret": "whsec_super_secret_bruno_test_key_42",
+    "events": ["transfer.completed", "deposit.settled", "fraud.flagged"]
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq ACTIVE
+}

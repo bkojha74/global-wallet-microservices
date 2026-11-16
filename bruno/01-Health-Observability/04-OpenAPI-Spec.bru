@@ -1,0 +1,20 @@
+meta {
+  name: 04 - OpenAPI 3.0 Contract Specification
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/api-docs/openapi.json
+  body: none
+  auth: none
+}
+
+vars:pre-request {
+  baseUrl: http://localhost:8080
+}
+
+assert {
+  res.status: eq 200
+  res.body.openapi: eq 3.0.3
+}

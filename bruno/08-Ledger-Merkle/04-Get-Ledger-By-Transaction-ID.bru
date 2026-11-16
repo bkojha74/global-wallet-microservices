@@ -1,0 +1,21 @@
+meta {
+  name: 04 - Get Ledger By Transaction ID
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/api/v1/ledger?transaction_id={{lastTxnId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{authToken}}
+}
+
+assert {
+  res.status: eq 200
+  res.body.entries: isDefined
+}
+

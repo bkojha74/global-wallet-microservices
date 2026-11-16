@@ -1,0 +1,32 @@
+meta {
+  name: 05 - Initiate Domestic Payment via PISP
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{baseUrl}}/api/v1/open-banking/payments
+  body: json
+  auth: none
+}
+
+headers {
+  Consent-ID: {{consentId}}
+}
+
+body:json {
+  {
+    "instruction_id": "inst-openbanking-99901",
+    "consent_id": "{{consentId}}",
+    "debtor_wallet_id": "{{aliceWallet}}",
+    "creditor_wallet_id": "{{bobWallet}}",
+    "amount": 25.00,
+    "currency": "USD"
+  }
+}
+
+assert {
+  res.status: eq 201
+  res.body.Data.DomesticPaymentId: isDefined
+  res.body.Data.Status: eq AcceptedSettlementInProcess
+}

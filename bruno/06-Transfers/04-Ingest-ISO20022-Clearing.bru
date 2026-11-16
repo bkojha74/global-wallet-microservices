@@ -1,0 +1,64 @@
+meta {
+  name: 04 - Ingest ISO 20022 pacs.008 Clearing Transfer
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/api/v1/clearing/iso20022
+  body: xml
+  auth: none
+}
+
+headers {
+  Content-Type: application/xml
+}
+
+body:xml {
+  <?xml version="1.0" encoding="UTF-8"?>
+  <Document xmlns="urn:iso:std:iso:20022:tech:xsd:pacs.008.001.08">
+    <FIToFICstmrCdtTrf>
+      <GrpHdr>
+        <MsgId>MSG-BRUNO-CLEAR-001</MsgId>
+        <CreDtTm>2026-11-13T12:00:00Z</CreDtTm>
+        <NbOfTxs>1</NbOfTxs>
+        <SttlmInf>
+          <SttlmMtd>CLRG</SttlmMtd>
+        </SttlmInf>
+      </GrpHdr>
+      <CdtTrfTxInf>
+        <PmtId>
+          <EndToEndId>E2E-BRUNO-001</EndToEndId>
+          <TxId>TX-BRUNO-001</TxId>
+        </PmtId>
+        <IntrBkSttlmAmt Ccy="EUR">150.00</IntrBkSttlmAmt>
+        <DbtrAgt>
+          <FinInstnId>
+            <BICFI>BARCGB22XXX</BICFI>
+          </FinInstnId>
+        </DbtrAgt>
+        <CdtrAgt>
+          <FinInstnId>
+            <BICFI>DEUTDEDDFXX</BICFI>
+          </FinInstnId>
+        </CdtrAgt>
+        <DbtrAcct>
+          <Id>
+            <IBAN>GB29NWBK60161331926819</IBAN>
+          </Id>
+        </DbtrAcct>
+        <CdtrAcct>
+          <Id>
+            <IBAN>DE89370400440532013000</IBAN>
+          </Id>
+        </CdtrAcct>
+      </CdtTrfTxInf>
+    </FIToFICstmrCdtTrf>
+  </Document>
+}
+
+assert {
+  res.status: eq 200
+  res.headers["content-type"]: contains "application/xml"
+}
+

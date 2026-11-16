@@ -357,6 +357,16 @@ func decodeLedgerEntries(ctx context.Context, cursor *mongo.Cursor) []*ledgerv1.
 		if err := cursor.Decode(&doc); err != nil {
 			continue
 		}
+		glCode := ""
+		glCat := ""
+		if len(doc.Postings) > 0 {
+			glCode = doc.Postings[0].GLAccountCode
+			glCat = doc.Postings[0].GLAccountCategory
+		}
+		if glCode == "" {
+			glCode, _, glCat = MapAccountToGL(doc.SourceWalletID, doc.Currency)
+		}
+
 		entries = append(entries, &ledgerv1.LedgerEntry{
 			TransactionId:       doc.ID.Hex(),
 			IdempotencyKey:      doc.IdempotencyKey,
@@ -370,6 +380,8 @@ func decodeLedgerEntries(ctx context.Context, cursor *mongo.Cursor) []*ledgerv1.
 			DestinationCurrency: doc.DestinationCurrency,
 			ExchangeRate:        doc.ExchangeRate,
 			FxQuoteId:           doc.FXQuoteID,
+			GlAccountCode:       glCode,
+			GlAccountCategory:   glCat,
 		})
 	}
 	return entries

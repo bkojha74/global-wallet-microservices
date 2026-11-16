@@ -1,0 +1,16 @@
+meta {
+  name: 01 - Get Supported Currencies
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/api/v1/fx/currencies
+  body: none
+  auth: none
+}
+
+assert {
+  res.status: eq 200
+  res.body.currencies: isDefined
+}

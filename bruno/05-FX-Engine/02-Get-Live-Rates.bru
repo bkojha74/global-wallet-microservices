@@ -1,0 +1,17 @@
+meta {
+  name: 02 - Get Live FX Rates
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/api/v1/fx/rates?base=USD
+  body: none
+  auth: none
+}
+
+assert {
+  res.status: eq 200
+  res.body.rates: isDefined
+  res.body.base_currency: eq USD
+}
