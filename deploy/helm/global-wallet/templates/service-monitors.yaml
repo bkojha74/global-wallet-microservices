@@ -1,0 +1,86 @@
+{{- if .Values.serviceMonitors.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "global-wallet.fullname" . }}-api-gateway
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "global-wallet.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api-gateway
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api-gateway
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "global-wallet.fullname" . }}-wallet-primary
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "global-wallet.labels" . | nindent 4 }}
+    app.kubernetes.io/component: wallet-primary
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: wallet-primary
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "global-wallet.fullname" . }}-ledger-service
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "global-wallet.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ledger-service
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-service
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "global-wallet.fullname" . }}-auth-service
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "global-wallet.labels" . | nindent 4 }}
+    app.kubernetes.io/component: auth-service
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: auth-service
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "global-wallet.fullname" . }}-fx-service
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "global-wallet.labels" . | nindent 4 }}
+    app.kubernetes.io/component: fx-service
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fx-service
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+{{- end }}

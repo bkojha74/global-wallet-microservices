@@ -39,6 +39,7 @@ import (
 	"wallet-system/pkg/observability"
 	"wallet-system/pkg/openbanking"
 	"wallet-system/pkg/resilience"
+	"wallet-system/pkg/sharding"
 	"wallet-system/pkg/tlsutil"
 	"wallet-system/pkg/webhook"
 	authv1 "wallet-system/proto/auth"
@@ -69,6 +70,30 @@ type Gateway struct {
 	sanctionsEngine   *compliance.SanctionsEngine
 	vibanStore        banking.VirtualIBANStore
 	consentStore      openbanking.ConsentStore
+	stepUpMgr         *auth.StepUpManager
+	shardingRouter    *sharding.Router
+}
+
+func (g *Gateway) getStepUpManager() *auth.StepUpManager {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.stepUpMgr == nil {
+		secret := os.Getenv("JWT_SECRET")
+		if secret == "" {
+			secret = defaultJWTSecret
+		}
+		g.stepUpMgr = auth.NewStepUpManager(secret)
+	}
+	return g.stepUpMgr
+}
+
+func (g *Gateway) getShardingRouter() *sharding.Router {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.shardingRouter == nil {
+		g.shardingRouter = sharding.NewRouter()
+	}
+	return g.shardingRouter
 }
 
 func (g *Gateway) getSanctionsEngine() *compliance.SanctionsEngine {
@@ -537,6 +562,25 @@ func (g *Gateway) handleTransfer(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]interface{}{
 				"error":                 err.Error(),
 				"travel_rule_violation": true,
+			})
+			return
+		}
+	}
+
+	// REQ-SEC-05: FIDO2 / WebAuthn Step-Up MFA check
+	if (auth.IsStepUpRequired("transfer", amountFloat) && os.Getenv("STEPUP_ENFORCEMENT") == "true") || r.Header.Get("X-Require-StepUp") == "true" {
+		stepUpToken := r.Header.Get(auth.StepUpHeader)
+		if stepUpToken == "" {
+			writeJSON(w, http.StatusForbidden, map[string]interface{}{
+				"error":            "step-up MFA verification required for privileged mutation (missing X-StepUp-Token)",
+				"step_up_required": true,
+			})
+			return
+		}
+		if _, err := g.getStepUpManager().ValidateStepUpToken(stepUpToken); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]interface{}{
+				"error":            fmt.Sprintf("invalid or expired step-up token: %v", err),
+				"step_up_required": true,
 			})
 			return
 		}
@@ -2445,6 +2489,111 @@ func (g *Gateway) handleOpenBankingPayments(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+// REQ-SEC-05: FIDO2 / WebAuthn Step-Up MFA Endpoints
+
+func (g *Gateway) handleStepUpChallenge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		UserID string `json:"user_id"`
+		Action string `json:"action"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	userID := strings.TrimSpace(req.UserID)
+	if userID == "" {
+		if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+			userID = claims.Subject
+		}
+	}
+	if userID == "" {
+		userID = "client-user"
+	}
+	action := strings.TrimSpace(req.Action)
+	if action == "" {
+		action = "transfer"
+	}
+
+	challenge, err := g.getStepUpManager().CreateChallenge(userID, action)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to create step-up challenge: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, challenge)
+}
+
+func (g *Gateway) handleStepUpVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ChallengeID string `json:"challenge_id"`
+		Proof       string `json:"proof"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.ChallengeID) == "" {
+		http.Error(w, "challenge_id is required", http.StatusBadRequest)
+		return
+	}
+
+	tokenStr, err := g.getStepUpManager().VerifyChallenge(req.ChallengeID, req.Proof)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+			"error":   err.Error(),
+			"success": false,
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success":       true,
+		"step_up_token": tokenStr,
+		"token_type":    "Bearer",
+		"expires_in":    600,
+	})
+}
+
+// REQ-SCALE-01: Geo-Sharding Active-Active Regional Cluster Query Endpoints
+
+func (g *Gateway) handleShardingRegions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+	regions := g.getShardingRouter().ListRegions()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"regions": regions,
+		"count":   len(regions),
+	})
+}
+
+func (g *Gateway) handleShardingHome(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+	walletID := strings.TrimSpace(r.URL.Query().Get("wallet_id"))
+	if walletID == "" {
+		http.Error(w, "wallet_id query parameter is required", http.StatusBadRequest)
+		return
+	}
+	region, err := g.getShardingRouter().GetHomeRegion(walletID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"wallet_id":   walletID,
+		"home_region": region,
+	})
+}
+
 func (g *Gateway) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	correlation := observability.FromHTTPRequest(r)
 	ctx := observability.WithCorrelation(r.Context(), correlation)
@@ -3272,6 +3421,14 @@ func registerGatewayRoutes(mux *http.ServeMux, gw *Gateway) {
 	mux.HandleFunc("/api/v1/open-banking/balances", gw.handleOpenBankingBalances)
 	mux.HandleFunc("/api/v1/open-banking/payments", gw.handleOpenBankingPayments)
 
+	// REQ-SEC-05: FIDO2 / WebAuthn Step-Up MFA
+	mux.HandleFunc("/api/v1/auth/step-up/challenge", gw.handleStepUpChallenge)
+	mux.HandleFunc("/api/v1/auth/step-up/verify", gw.handleStepUpVerify)
+
+	// REQ-SCALE-01: Geo-Sharding Active-Active Regional Cluster
+	mux.HandleFunc("/api/v1/cluster/sharding/regions", gw.handleShardingRegions)
+	mux.HandleFunc("/api/v1/cluster/sharding/home", gw.handleShardingHome)
+
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "UP"})
 	})
@@ -3312,6 +3469,10 @@ func wrapGatewayMiddleware(handler http.Handler, gw *Gateway) http.Handler {
 		"/api/v1/open-banking/accounts":           true,
 		"/api/v1/open-banking/balances":           true,
 		"/api/v1/open-banking/payments":           true,
+		"/api/v1/auth/step-up/challenge":          true,
+		"/api/v1/auth/step-up/verify":             true,
+		"/api/v1/cluster/sharding/regions":        true,
+		"/api/v1/cluster/sharding/home":           true,
 	}
 
 	if os.Getenv("ENABLE_DEV_TOKEN_ENDPOINT") == "true" {
