@@ -12,6 +12,10 @@ podSecurityContext:
   fsGroup: 10001
   runAsNonRoot: true
 
+# Prometheus ServiceMonitors
+serviceMonitors:
+  enabled: false
+
 # Ingress Configuration
 ingress:
   enabled: true

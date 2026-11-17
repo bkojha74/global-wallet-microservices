@@ -501,6 +501,57 @@ try {
     Record-Test "06-OpenBanking-Revoke-Consent" "200 OK" "$code" $false $_.Message
 }
 
+# --- 15. Security & Zero-Trust (Step-Up MFA) ---
+$stepUpChallengeId = ""
+$stepUpNonce = ""
+try {
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/auth/step-up/challenge" -Method Post -ContentType "application/json" -Body '{"user_id":"alice","action":"transfer"}'
+    $stepUpChallengeId = $r.challenge_id
+    $stepUpNonce = $r.nonce
+    Record-Test "01-StepUp-Request-Challenge" "200 OK" "200" ($null -ne $stepUpChallengeId -and $stepUpNonce.Length -eq 64) "Challenge ID: $stepUpChallengeId"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "01-StepUp-Request-Challenge" "200 OK" "$code" $false $_.Message
+}
+
+$stepUpToken = ""
+try {
+    # Verify using simulated passkey biometric proof
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/auth/step-up/verify" -Method Post -ContentType "application/json" -Body "{`"challenge_id`":`"$stepUpChallengeId`",`"proof`":`"passkey-biometric-verified`"}"
+    $stepUpToken = $r.step_up_token
+    Record-Test "02-StepUp-Verify-Challenge" "200 OK" "200" ($r.success -eq $true -and $null -ne $stepUpToken) "Elevated token acquired"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "02-StepUp-Verify-Challenge" "200 OK" "$code" $false $_.Message
+}
+
+try {
+    $transferReq = '{"source_wallet_id":"alice_usd","destination_wallet_id":"bob_eur","amount":500,"currency":"USD"}'
+    $r = Invoke-WebRequest -Uri "$baseUrl/api/v1/transfers" -Method Post -ContentType "application/json" -Headers @{ "X-Require-StepUp" = "true" } -Body $transferReq -SkipHttpErrorCheck
+    $code = $r.StatusCode
+    Record-Test "03-StepUp-Protected-Mutation-Blocked" "403 Forbidden" "$code" ($code -eq 403) "Correctly blocked mutation without Step-Up header"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "03-StepUp-Protected-Mutation-Blocked" "403 Forbidden" "$code" ($code -eq 403) $_.Message
+}
+
+# --- 16. Active-Active Geo-Sharding ---
+try {
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/cluster/sharding/regions" -Method Get
+    Record-Test "01-Sharding-List-Regions" "200 OK" "200" ($r.count -ge 3 -and $r.regions.Length -ge 3) "Available regions: $($r.count)"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "01-Sharding-List-Regions" "200 OK" "$code" $false $_.Message
+}
+
+try {
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/cluster/sharding/home?wallet_id=alice_usd" -Method Get
+    Record-Test "02-Sharding-Get-Home-Region" "200 OK" "200" ($null -ne $r.home_region.region_id -and $r.home_region.is_healthy -eq $true) "Home Region: $($r.home_region.region_id)"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "02-Sharding-Get-Home-Region" "200 OK" "$code" $false $_.Message
+}
+
 Write-Host "`n=================== SUMMARY ===================" -ForegroundColor Cyan
 $passedCount = ($results | Where-Object { $_.Passed -eq $true }).Count
 $totalCount = $results.Count
