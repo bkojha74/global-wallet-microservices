@@ -1,0 +1,18 @@
+meta {
+  name: 01 - Get Home Region for Wallet
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/api/v1/cluster/sharding/home?wallet_id=wallet-test-001
+  body: none
+  auth: none
+}
+
+assert {
+  res.status: eq 200
+  res.body.wallet_id: eq wallet-test-001
+  res.body.home_region.region_id: isDefined
+  res.body.home_region.is_healthy: eq true
+}

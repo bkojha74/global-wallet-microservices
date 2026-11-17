@@ -1,0 +1,29 @@
+meta {
+  name: 03 - Protected Mutation Without Step-Up Token
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/api/v1/transfers
+  body: json
+  auth: none
+}
+
+headers {
+  X-Require-StepUp: true
+}
+
+body:json {
+  {
+    "source_wallet_id": "alice",
+    "destination_wallet_id": "bob",
+    "amount": 500,
+    "currency": "USD"
+  }
+}
+
+assert {
+  res.status: eq 403
+  res.body.step_up_required: eq true
+}

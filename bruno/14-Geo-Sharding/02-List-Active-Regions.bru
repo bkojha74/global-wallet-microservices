@@ -1,0 +1,17 @@
+meta {
+  name: 02 - List Active Geo-Sharding Regions
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/api/v1/cluster/sharding/regions
+  body: none
+  auth: none
+}
+
+assert {
+  res.status: eq 200
+  res.body.regions: isDefined
+  res.body.count: gte 3
+}

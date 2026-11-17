@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Global Wallet Microservices API",
-    "version": "1.12.0",
+    "version": "1.13.0",
     "description": "High-performance, distributed multi-currency digital wallet and core banking platform with zero-trust security, real-time FX, GAAP double-entry ledger settlement, velocity controls, payment rails simulation, and partner webhooks.",
     "contact": {
       "name": "Global Wallet Engineering Team",
@@ -1191,6 +1191,78 @@
         },
         "responses": {
           "201": { "description": "Payment initiation accepted" }
+        }
+      }
+    },
+    "/api/v1/auth/step-up/challenge": {
+      "post": {
+        "tags": ["Security & Step-Up MFA"],
+        "summary": "Request Ephemeral FIDO2 / WebAuthn Step-Up Challenge",
+        "description": "Issues a 32-byte cryptographically secure challenge nonce with 5-minute TTL.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "user_id": { "type": "string" },
+                  "action": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Cryptographic challenge created" }
+        }
+      }
+    },
+    "/api/v1/auth/step-up/verify": {
+      "post": {
+        "tags": ["Security & Step-Up MFA"],
+        "summary": "Verify Step-Up MFA Challenge Proof",
+        "description": "Validates client assertion, passkey biometric signature or TOTP proof, returning an elevated token.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["challenge_id", "proof"],
+                "properties": {
+                  "challenge_id": { "type": "string" },
+                  "proof": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Challenge successfully verified, elevated token issued" },
+          "401": { "description": "Invalid proof or expired challenge" }
+        }
+      }
+    },
+    "/api/v1/cluster/sharding/regions": {
+      "get": {
+        "tags": ["Active-Active Geo-Sharding"],
+        "summary": "List Active Geo-Distributed Regional Banking Clusters",
+        "responses": {
+          "200": { "description": "Active-active regional cluster topology" }
+        }
+      }
+    },
+    "/api/v1/cluster/sharding/home": {
+      "get": {
+        "tags": ["Active-Active Geo-Sharding"],
+        "summary": "Get Deterministic Home Region for Wallet",
+        "parameters": [
+          { "name": "wallet_id", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Home regional routing metadata" },
+          "400": { "description": "Missing wallet_id query parameter" }
         }
       }
     }

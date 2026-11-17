@@ -1,0 +1,96 @@
+# Production Environment Overlay
+env:
+  environment: "production"
+  logLevel: "warn"
+
+serviceMonitors:
+  enabled: true
+
+ingress:
+  host: wallet.globalbank.com
+  tls:
+    enabled: true
+    secretName: global-wallet-prod-tls
+
+apiGateway:
+  replicas: 4
+  service:
+    type: ClusterIP
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1024Mi
+
+authService:
+  replicas: 3
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1024Mi
+
+fxService:
+  replicas: 3
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1024Mi
+
+walletPrimary:
+  replicas: 4
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 2000m
+      memory: 2048Mi
+
+walletStandby:
+  replicas: 2
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1024Mi
+
+ledgerService:
+  replicas: 4
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1024Mi
+
+loggingService:
+  replicas: 2
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+mongodb:
+  persistence:
+    enabled: true
+    size: 50Gi
+
+redis:
+  master:
+    persistence:
+      enabled: true
+      size: 10Gi
