@@ -1,0 +1,18 @@
+meta {
+  name: 01 - Audit Point-In-Time Balance
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/api/v1/ledger/events?account_id=wallet_alice_us
+  body: none
+  auth: none
+}
+
+assert {
+  res.status: eq 200
+  res.body.account_id: isDefined
+  res.body.posted_balance: isDefined
+  res.body.available_balance: isDefined
+}

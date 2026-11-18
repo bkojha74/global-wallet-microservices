@@ -1,0 +1,24 @@
+meta {
+  name: 03 - Execute Automated Treasury Sweeps
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/api/v1/treasury/sweeps/execute
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "balances": {
+      "ops_card_clearing": 50000.00
+    }
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.executions: isDefined
+}
