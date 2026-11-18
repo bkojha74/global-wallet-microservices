@@ -1,0 +1,17 @@
+meta {
+  name: 01 - List Legal Banking Entities
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/api/v1/entities
+  body: none
+  auth: none
+}
+
+assert {
+  res.status: eq 200
+  res.body.entities: isDefined
+  res.body.count: gte 4
+}

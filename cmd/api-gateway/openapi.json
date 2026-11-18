@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Global Wallet Microservices API",
-    "version": "1.13.0",
+    "version": "1.14.0",
     "description": "High-performance, distributed multi-currency digital wallet and core banking platform with zero-trust security, real-time FX, GAAP double-entry ledger settlement, velocity controls, payment rails simulation, and partner webhooks.",
     "contact": {
       "name": "Global Wallet Engineering Team",
@@ -1263,6 +1263,125 @@
         "responses": {
           "200": { "description": "Home regional routing metadata" },
           "400": { "description": "Missing wallet_id query parameter" }
+        }
+      }
+    },
+    "/api/v1/entities": {
+      "get": {
+        "tags": ["Multi-Entity Banking"],
+        "summary": "List Legal Banking Corporate Entities",
+        "responses": {
+          "200": { "description": "List of regulated legal subsidiaries" }
+        }
+      }
+    },
+    "/api/v1/entities/settlement": {
+      "post": {
+        "tags": ["Multi-Entity Banking"],
+        "summary": "Coordinate 4-Legged Inter-Entity Omnibus Settlement",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["source_wallet", "target_wallet", "amount"],
+                "properties": {
+                  "transaction_id": { "type": "string" },
+                  "source_wallet": { "type": "string" },
+                  "target_wallet": { "type": "string" },
+                  "amount": { "type": "number" },
+                  "currency": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Cross-entity omnibus settlement completed" },
+          "400": { "description": "Invalid settlement parameters" }
+        }
+      }
+    },
+    "/api/v1/ledger/events": {
+      "get": {
+        "tags": ["CQRS Event Sourcing"],
+        "summary": "Point-in-Time Historical Balance Audit",
+        "parameters": [
+          { "name": "account_id", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "as_of", "in": "query", "required": false, "schema": { "type": "string", "format": "date-time" } }
+        ],
+        "responses": {
+          "200": { "description": "Point-in-time balance snapshot" },
+          "400": { "description": "Missing account_id parameter" }
+        }
+      }
+    },
+    "/api/v1/treasury/rules": {
+      "get": {
+        "tags": ["Corporate Treasury"],
+        "summary": "List Automated Liquidity Sweeping Rules",
+        "responses": {
+          "200": { "description": "Configured liquidity sweeping rules" }
+        }
+      },
+      "post": {
+        "tags": ["Corporate Treasury"],
+        "summary": "Register Automated Liquidity Sweeping Rule",
+        "responses": {
+          "201": { "description": "Sweep rule successfully configured" }
+        }
+      }
+    },
+    "/api/v1/treasury/sweeps/execute": {
+      "post": {
+        "tags": ["Corporate Treasury"],
+        "summary": "Execute Liquidity Sweeping Strategies (ZBA & Target Balancing)",
+        "responses": {
+          "200": { "description": "Sweep executions report" }
+        }
+      }
+    },
+    "/api/v1/treasury/safeguarding": {
+      "get": {
+        "tags": ["Corporate Treasury"],
+        "summary": "Calculate Regulatory Deposit Safeguarding Reserves",
+        "parameters": [
+          { "name": "customer_deposits", "in": "query", "required": false, "schema": { "type": "number" } },
+          { "name": "trustee_reserves", "in": "query", "required": false, "schema": { "type": "number" } }
+        ],
+        "responses": {
+          "200": { "description": "Trustee safeguarding coverage report" }
+        }
+      }
+    },
+    "/api/v1/compliance/sar/generate": {
+      "post": {
+        "tags": ["Compliance & AML"],
+        "summary": "Generate AI Suspicious Activity Report (FinCEN Form 111)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["subject_wallet_id"],
+                "properties": {
+                  "incident_id": { "type": "string" },
+                  "subject_wallet_id": { "type": "string" },
+                  "subject_legal_name": { "type": "string" },
+                  "subject_country": { "type": "string" },
+                  "alert_types": { "type": "array", "items": { "type": "string" } },
+                  "total_suspicious_volume": { "type": "number" },
+                  "currency": { "type": "string" },
+                  "risk_score": { "type": "number" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "FinCEN Form 111 XML and narrative dossier" }
         }
       }
     }

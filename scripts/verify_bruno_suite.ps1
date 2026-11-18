@@ -552,6 +552,41 @@ try {
     Record-Test "02-Sharding-Get-Home-Region" "200 OK" "$code" $false $_.Message
 }
 
+# --- 17. Multi-Entity Banking & Treasury Operations ---
+try {
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/entities" -Method Get
+    Record-Test "01-MultiEntity-List-Entities" "200 OK" "200" ($r.count -ge 4 -and $r.entities.Length -ge 4) "Entities: $($r.count)"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "01-MultiEntity-List-Entities" "200 OK" "$code" $false $_.Message
+}
+
+try {
+    $settleReq = '{"source_wallet":"alice_usd","target_wallet":"bob_eur","amount":500,"currency":"EUR"}'
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/entities/settlement" -Method Post -ContentType "application/json" -Body $settleReq
+    Record-Test "02-MultiEntity-Omnibus-Settlement" "200 OK" "200" ($r.is_cross_entity -eq $true -and $r.omnibus_postings.Length -eq 4) "Settled 4-leg omnibus"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "02-MultiEntity-Omnibus-Settlement" "200 OK" "$code" $false $_.Message
+}
+
+try {
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/treasury/safeguarding?customer_deposits=50000000&trustee_reserves=51000000" -Method Get
+    Record-Test "03-Treasury-Safeguarding-Report" "200 OK" "200" ($r.status -eq "COMPLIANT" -and $r.coverage_ratio -ge 1.0) "Coverage: $($r.coverage_ratio)"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "03-Treasury-Safeguarding-Report" "200 OK" "$code" $false $_.Message
+}
+
+# --- 18. CQRS Event Sourcing & Point-in-Time Auditing ---
+try {
+    $r = Invoke-RestMethod -Uri "$baseUrl/api/v1/ledger/events?account_id=alice_usd" -Method Get
+    Record-Test "01-CQRS-PointInTime-Balance" "200 OK" "200" ($null -ne $r.account_id -and $null -ne $r.available_balance) "Audit snapshot verified"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    Record-Test "01-CQRS-PointInTime-Balance" "200 OK" "$code" $false $_.Message
+}
+
 Write-Host "`n=================== SUMMARY ===================" -ForegroundColor Cyan
 $passedCount = ($results | Where-Object { $_.Passed -eq $true }).Count
 $totalCount = $results.Count
