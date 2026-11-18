@@ -1,0 +1,27 @@
+meta {
+  name: 02 - Cross-Entity Omnibus Settlement
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/api/v1/entities/settlement
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "source_wallet": "wallet_us_01",
+    "target_wallet": "wallet_eu_02",
+    "amount": 1000.00,
+    "currency": "EUR"
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.is_cross_entity: eq true
+  res.body.omnibus_postings: isDefined
+  res.body.status: eq SETTLED
+}
