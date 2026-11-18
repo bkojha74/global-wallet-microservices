@@ -2797,7 +2797,7 @@ func (g *Gateway) handleSafeguarding(w http.ResponseWriter, r *http.Request) {
 	depositsStr := r.URL.Query().Get("customer_deposits")
 	reservesStr := r.URL.Query().Get("trustee_reserves")
 
-	var deposits, reserves float64 = 50000000.00, 52000000.00
+	deposits, reserves := 50000000.00, 52000000.00
 	if depositsStr != "" {
 		if d, err := strconv.ParseFloat(depositsStr, 64); err == nil && d >= 0 {
 			deposits = d

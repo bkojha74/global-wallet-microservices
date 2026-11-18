@@ -138,7 +138,8 @@ func (e *TreasuryEngine) ExecuteSweeps(balances map[string]float64) ([]SweepExec
 		var direction string
 		var resultingBal float64
 
-		if rule.Type == SweepTypeZBA {
+		switch rule.Type {
+		case SweepTypeZBA:
 			// Zero Balance: Sweep entire positive balance to master
 			if currBal > 0 && currBal >= rule.MinTransferAmount {
 				transferAmt = currBal
@@ -148,7 +149,7 @@ func (e *TreasuryEngine) ExecuteSweeps(balances map[string]float64) ([]SweepExec
 				direction = "NO_OP"
 				resultingBal = currBal
 			}
-		} else if rule.Type == SweepTypeTargetBalance {
+		case SweepTypeTargetBalance:
 			diff := currBal - rule.TargetBalance
 			if diff > 0 && diff >= rule.MinTransferAmount {
 				// Excess cash over target balance -> sweep to master
