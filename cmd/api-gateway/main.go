@@ -30,17 +30,21 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 
+	"wallet-system/pkg/ai"
 	"wallet-system/pkg/auth"
 	"wallet-system/pkg/banking"
 	"wallet-system/pkg/compliance"
 	"wallet-system/pkg/coordinator"
 	"wallet-system/pkg/db"
+	"wallet-system/pkg/eventsourcing"
 	"wallet-system/pkg/iso20022"
+	"wallet-system/pkg/multientity"
 	"wallet-system/pkg/observability"
 	"wallet-system/pkg/openbanking"
 	"wallet-system/pkg/resilience"
 	"wallet-system/pkg/sharding"
 	"wallet-system/pkg/tlsutil"
+	"wallet-system/pkg/treasury"
 	"wallet-system/pkg/webhook"
 	authv1 "wallet-system/proto/auth"
 	fxv1 "wallet-system/proto/fx"
@@ -72,6 +76,56 @@ type Gateway struct {
 	consentStore      openbanking.ConsentStore
 	stepUpMgr         *auth.StepUpManager
 	shardingRouter    *sharding.Router
+	entityRegistry    *multientity.EntityRegistry
+	entitySettler     *multientity.InterEntitySettler
+	eventStore        *eventsourcing.EventStore
+	treasuryEngine    *treasury.TreasuryEngine
+	sarGenerator      *ai.SARNarrativeGenerator
+}
+
+func (g *Gateway) getEntityRegistry() *multientity.EntityRegistry {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.entityRegistry == nil {
+		g.entityRegistry = multientity.NewEntityRegistry()
+	}
+	return g.entityRegistry
+}
+
+func (g *Gateway) getEntitySettler() *multientity.InterEntitySettler {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.entitySettler == nil {
+		g.entitySettler = multientity.NewInterEntitySettler(g.getEntityRegistry())
+	}
+	return g.entitySettler
+}
+
+func (g *Gateway) getEventStore() *eventsourcing.EventStore {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.eventStore == nil {
+		g.eventStore = eventsourcing.NewEventStore()
+	}
+	return g.eventStore
+}
+
+func (g *Gateway) getTreasuryEngine() *treasury.TreasuryEngine {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.treasuryEngine == nil {
+		g.treasuryEngine = treasury.NewTreasuryEngine()
+	}
+	return g.treasuryEngine
+}
+
+func (g *Gateway) getSARGenerator() *ai.SARNarrativeGenerator {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.sarGenerator == nil {
+		g.sarGenerator = ai.NewSARNarrativeGenerator("Global Digital Core Banking Group")
+	}
+	return g.sarGenerator
 }
 
 func (g *Gateway) getStepUpManager() *auth.StepUpManager {
@@ -2594,6 +2648,195 @@ func (g *Gateway) handleShardingHome(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// REQ-CORE-01: Multi-Entity Tenant Partitioning & Inter-Entity Settlement Endpoints
+
+func (g *Gateway) handleListEntities(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+	entities := g.getEntityRegistry().ListEntities()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"entities": entities,
+		"count":    len(entities),
+	})
+}
+
+func (g *Gateway) handleCrossEntitySettlement(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		TransactionID string  `json:"transaction_id"`
+		SourceWallet  string  `json:"source_wallet"`
+		TargetWallet  string  `json:"target_wallet"`
+		Amount        float64 `json:"amount"`
+		Currency      string  `json:"currency"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.SourceWallet == "" || req.TargetWallet == "" || req.Amount <= 0 {
+		http.Error(w, "source_wallet, target_wallet, and positive amount are required", http.StatusBadRequest)
+		return
+	}
+	if req.TransactionID == "" {
+		req.TransactionID = fmt.Sprintf("tx-entity-%d", time.Now().UnixNano())
+	}
+	if req.Currency == "" {
+		req.Currency = "USD"
+	}
+
+	result, err := g.getEntitySettler().CoordinateCrossEntitySettlement(req.TransactionID, req.SourceWallet, req.TargetWallet, req.Amount, req.Currency)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+// REQ-EVENT-01: Distributed CQRS Event Sourcing & Point-in-Time Ledger Auditing
+
+func (g *Gateway) handleAuditEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+	accountID := strings.TrimSpace(r.URL.Query().Get("account_id"))
+	if accountID == "" {
+		http.Error(w, "account_id query parameter is required", http.StatusBadRequest)
+		return
+	}
+
+	asOfStr := strings.TrimSpace(r.URL.Query().Get("as_of"))
+	var cutoff time.Time
+	if asOfStr != "" {
+		parsed, err := time.Parse(time.RFC3339, asOfStr)
+		if err == nil {
+			cutoff = parsed
+		}
+	}
+
+	snapshot, err := g.getEventStore().ReconstructBalanceAt(accountID, cutoff)
+	if err != nil {
+		// If account not yet in event store, return default snapshot from wallet service
+		snapshot = &eventsourcing.BalanceSnapshot{
+			AccountID:        accountID,
+			Currency:         "USD",
+			PostedBalance:    0,
+			HeldBalance:      0,
+			AvailableBalance: 0,
+			AsOfTimestamp:    cutoff,
+			EventCount:       0,
+		}
+	}
+
+	writeJSON(w, http.StatusOK, snapshot)
+}
+
+// REQ-TREAS-01: Automated Treasury Sweeps & Safeguarding Reserves
+
+func (g *Gateway) handleTreasuryRules(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		rules := g.getTreasuryEngine().ListRules()
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"rules": rules,
+			"count": len(rules),
+		})
+	case http.MethodPost:
+		var rule treasury.SweepRule
+		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		if err := g.getTreasuryEngine().RegisterRule(rule); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusCreated, rule)
+	default:
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+	}
+}
+
+func (g *Gateway) handleExecuteSweeps(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Balances map[string]float64 `json:"balances"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.Balances == nil {
+		req.Balances = make(map[string]float64)
+	}
+
+	executions, err := g.getTreasuryEngine().ExecuteSweeps(req.Balances)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"executions": executions,
+		"count":      len(executions),
+		"timestamp":  time.Now().UTC(),
+	})
+}
+
+func (g *Gateway) handleSafeguarding(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+	depositsStr := r.URL.Query().Get("customer_deposits")
+	reservesStr := r.URL.Query().Get("trustee_reserves")
+
+	deposits, reserves := 50000000.00, 52000000.00
+	if depositsStr != "" {
+		if d, err := strconv.ParseFloat(depositsStr, 64); err == nil && d >= 0 {
+			deposits = d
+		}
+	}
+	if reservesStr != "" {
+		if res, err := strconv.ParseFloat(reservesStr, 64); err == nil && res >= 0 {
+			reserves = res
+		}
+	}
+
+	report := g.getTreasuryEngine().CalculateSafeguarding(deposits, reserves)
+	writeJSON(w, http.StatusOK, report)
+}
+
+// REQ-AI-03: AI Automated FinCEN SAR Narrative Dossier Generator
+
+func (g *Gateway) handleGenerateSAR(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+	var incident ai.SARIncident
+	if err := json.NewDecoder(r.Body).Decode(&incident); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if incident.SubjectWalletID == "" {
+		http.Error(w, "subject_wallet_id is required", http.StatusBadRequest)
+		return
+	}
+	if incident.IncidentID == "" {
+		incident.IncidentID = fmt.Sprintf("sar-%d", time.Now().Unix())
+	}
+
+	dossier := g.getSARGenerator().GenerateDossier(incident)
+	writeJSON(w, http.StatusOK, dossier)
+}
+
 func (g *Gateway) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	correlation := observability.FromHTTPRequest(r)
 	ctx := observability.WithCorrelation(r.Context(), correlation)
@@ -3429,6 +3672,21 @@ func registerGatewayRoutes(mux *http.ServeMux, gw *Gateway) {
 	mux.HandleFunc("/api/v1/cluster/sharding/regions", gw.handleShardingRegions)
 	mux.HandleFunc("/api/v1/cluster/sharding/home", gw.handleShardingHome)
 
+	// REQ-CORE-01: Multi-Entity Tenant Partitioning
+	mux.HandleFunc("/api/v1/entities", gw.handleListEntities)
+	mux.HandleFunc("/api/v1/entities/settlement", gw.handleCrossEntitySettlement)
+
+	// REQ-EVENT-01: Distributed CQRS Event Sourcing & Point-in-Time Auditing
+	mux.HandleFunc("/api/v1/ledger/events", gw.handleAuditEvents)
+
+	// REQ-TREAS-01: Automated Treasury Sweeps & Safeguarding
+	mux.HandleFunc("/api/v1/treasury/rules", gw.handleTreasuryRules)
+	mux.HandleFunc("/api/v1/treasury/sweeps/execute", gw.handleExecuteSweeps)
+	mux.HandleFunc("/api/v1/treasury/safeguarding", gw.handleSafeguarding)
+
+	// REQ-AI-03: AI Automated FinCEN SAR Filing
+	mux.HandleFunc("/api/v1/compliance/sar/generate", gw.handleGenerateSAR)
+
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "UP"})
 	})
@@ -3473,6 +3731,13 @@ func wrapGatewayMiddleware(handler http.Handler, gw *Gateway) http.Handler {
 		"/api/v1/auth/step-up/verify":             true,
 		"/api/v1/cluster/sharding/regions":        true,
 		"/api/v1/cluster/sharding/home":           true,
+		"/api/v1/entities":                        true,
+		"/api/v1/entities/settlement":             true,
+		"/api/v1/ledger/events":                   true,
+		"/api/v1/treasury/rules":                  true,
+		"/api/v1/treasury/sweeps/execute":         true,
+		"/api/v1/treasury/safeguarding":           true,
+		"/api/v1/compliance/sar/generate":         true,
 	}
 
 	if os.Getenv("ENABLE_DEV_TOKEN_ENDPOINT") == "true" {

@@ -1,0 +1,17 @@
+meta {
+  name: 04 - Get Regulatory Safeguarding Report
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/api/v1/treasury/safeguarding?customer_deposits=50000000&trustee_reserves=51000000
+  body: none
+  auth: none
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq COMPLIANT
+  res.body.coverage_ratio: gte 1.0
+}
